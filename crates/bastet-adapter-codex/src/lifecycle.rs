@@ -5,6 +5,8 @@ use bastet_core::{
 use serde_json::{json, Value};
 use thiserror::Error;
 
+use crate::app_server::AppServerNotification;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LifecycleError {
     #[error("Codex lifecycle event did not match the expected protocol")]
@@ -22,6 +24,77 @@ pub struct NormalizedCodexEvent {
 pub struct CodexEventNormalizer {
     run_id: RunId,
     next_sequence: u64,
+}
+
+pub struct CodexRunStream {
+    provider_turn_id: String,
+    normalizer: CodexEventNormalizer,
+    terminal: bool,
+}
+
+impl CodexRunStream {
+    pub fn new(run_id: RunId, provider_turn_id: impl Into<String>) -> Result<Self, LifecycleError> {
+        let provider_turn_id = provider_turn_id.into();
+        if provider_turn_id.trim().is_empty() {
+            return Err(LifecycleError::ProtocolDrift);
+        }
+        Ok(Self {
+            provider_turn_id,
+            normalizer: CodexEventNormalizer::new(run_id),
+            terminal: false,
+        })
+    }
+
+    pub fn ingest(
+        &mut self,
+        notification: &AppServerNotification,
+        occurred_at: &str,
+    ) -> Result<Option<NormalizedCodexEvent>, LifecycleError> {
+        if !matches!(
+            notification.method.as_str(),
+            "turn/started" | "turn/completed"
+        ) {
+            return Ok(None);
+        }
+        let provider_turn_id = required_string(turn(&notification.params)?, "id")?;
+        if provider_turn_id != self.provider_turn_id {
+            return Ok(None);
+        }
+        if self.terminal {
+            return Err(LifecycleError::ProtocolDrift);
+        }
+        let event = self.normalizer.normalize_notification(
+            &notification.method,
+            &notification.params,
+            occurred_at,
+        )?;
+        if notification.method == "turn/completed" {
+            self.terminal = true;
+        }
+        Ok(event)
+    }
+
+    pub fn cancellation_requested(
+        &mut self,
+        occurred_at: &str,
+    ) -> Result<NormalizedCodexEvent, LifecycleError> {
+        if self.terminal {
+            return Err(LifecycleError::ProtocolDrift);
+        }
+        self.normalizer.cancellation_requested(occurred_at)
+    }
+
+    pub fn recovery_started(
+        &mut self,
+        provider_thread_id: &str,
+        occurred_at: &str,
+    ) -> Result<NormalizedCodexEvent, LifecycleError> {
+        if self.terminal {
+            return Err(LifecycleError::ProtocolDrift);
+        }
+        self.normalizer
+            .recovery_started(provider_thread_id, occurred_at)
+    }
 }
 
 impl CodexEventNormalizer {
@@ -389,5 +462,66 @@ mod tests {
             ),
             Err(LifecycleError::ProtocolDrift)
         );
+    }
+
+    #[test]
+    fn run_stream_routes_only_the_target_turn_and_closes_at_completion() {
+        let run_id = RunId::from_bytes([9; 16]);
+        let mut stream = CodexRunStream::new(run_id, "turn_target").unwrap();
+        let other = AppServerNotification {
+            method: "turn/started".into(),
+            params: json!({"turn": {"id": "turn_other", "status": "inProgress"}}),
+        };
+        assert!(stream.ingest(&other, NOW).unwrap().is_none());
+
+        let started = AppServerNotification {
+            method: "turn/started".into(),
+            params: json!({"turn": {"id": "turn_target", "status": "inProgress"}}),
+        };
+        let completed = AppServerNotification {
+            method: "turn/completed".into(),
+            params: json!({"turn": {"id": "turn_target", "status": "completed"}}),
+        };
+        assert_eq!(
+            stream
+                .ingest(&started, NOW)
+                .unwrap()
+                .unwrap()
+                .event
+                .sequence,
+            1
+        );
+        assert_eq!(
+            stream.ingest(&completed, NOW).unwrap().unwrap().event.state,
+            NormalizedRunState::Succeeded
+        );
+        assert_eq!(
+            stream.ingest(&completed, NOW),
+            Err(LifecycleError::ProtocolDrift)
+        );
+    }
+
+    #[test]
+    fn run_stream_ignores_error_payload_and_waits_for_failed_completion() {
+        let mut stream = CodexRunStream::new(RunId::from_bytes([9; 16]), "turn_target").unwrap();
+        let error = AppServerNotification {
+            method: "error".into(),
+            params: json!({"error": {"message": "secret"}}),
+        };
+        assert!(stream.ingest(&error, NOW).unwrap().is_none());
+        let completed = AppServerNotification {
+            method: "turn/completed".into(),
+            params: json!({"turn": {
+                "id": "turn_target",
+                "status": "failed",
+                "error": {"message": "secret", "codexErrorInfo": "Unauthorized"}
+            }}),
+        };
+        let event = stream.ingest(&completed, NOW).unwrap().unwrap();
+        assert_eq!(
+            event.failure.unwrap().kind,
+            AdapterFailureKind::Authentication
+        );
+        assert!(!event.event.redacted_payload_json.contains("secret"));
     }
 }

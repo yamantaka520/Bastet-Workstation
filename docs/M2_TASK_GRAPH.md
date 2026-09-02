@@ -58,6 +58,8 @@ verification status; it does not add scope.
   validate workspace-write roots, retain only allowlisted response identifiers, and deliberately
   expose no danger-full-access policy. The stdio boundary now preserves ordered notifications that
   arrive while an RPC response is pending and exposes them only after initialization; malformed
-  notifications and unexpected server requests fail closed. No real thread or turn is launched by
-  these tests.
+  notifications and unexpected server requests fail closed. A run-scoped stream now routes only
+  the configured provider turn ID into lifecycle normalization, ignores unrelated item/turn/error
+  notifications, preserves event sequence, and closes authoritatively on `turn/completed`.
+  Duplicate terminal events fail closed. No real thread or turn is launched by these tests.
 - M2.4–M2.8: not started.

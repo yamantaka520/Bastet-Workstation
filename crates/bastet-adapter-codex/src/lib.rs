@@ -9,7 +9,7 @@ pub use app_server::{
     ModelCatalogPage, ModelDescriptor, ReasoningEffort, ThreadHandle, ThreadSandbox,
     ThreadStartRequest, TransportError, TurnHandle, TurnSandboxPolicy, TurnStartRequest,
 };
-pub use lifecycle::{CodexEventNormalizer, LifecycleError, NormalizedCodexEvent};
+pub use lifecycle::{CodexEventNormalizer, CodexRunStream, LifecycleError, NormalizedCodexEvent};
 pub use stdio::StdioTransport;
 
 use std::{

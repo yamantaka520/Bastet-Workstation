@@ -3,6 +3,8 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+use crate::lifecycle::{CodexRunStream, NormalizedCodexEvent};
+
 pub trait AppServerTransport {
     fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError>;
     fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError>;
@@ -292,6 +294,22 @@ impl<T: AppServerTransport> CodexAppServer<T> {
             .map_err(|_| AppServerError::Transport)
     }
 
+    pub fn next_run_event(
+        &mut self,
+        stream: &mut CodexRunStream,
+        occurred_at: &str,
+    ) -> Result<NormalizedCodexEvent, AppServerError> {
+        loop {
+            let notification = self.next_notification()?;
+            if let Some(event) = stream
+                .ingest(&notification, occurred_at)
+                .map_err(|_| AppServerError::ProtocolDrift)?
+            {
+                return Ok(event);
+            }
+        }
+    }
+
     fn require_initialized(&self) -> Result<(), AppServerError> {
         if self.initialized {
             Ok(())
@@ -490,6 +508,14 @@ mod tests {
         })
     }
 
+    fn fixture_absolute_path() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\workspace\project")
+        } else {
+            PathBuf::from("/workspace/project")
+        }
+    }
+
     #[test]
     fn initialization_is_required_and_uses_stable_client_identity() {
         let mut server = CodexAppServer::new(FixtureTransport::default());
@@ -568,6 +594,7 @@ mod tests {
 
     #[test]
     fn thread_start_and_resume_use_allowlisted_protocol_fields() {
+        let cwd = fixture_absolute_path();
         let mut server = initialized_server_with([
             json!({ "thread": { "id": "thr_1", "sessionId": "session_1", "preview": "discard" } }),
             json!({ "thread": { "id": "thr_1", "ephemeral": false } }),
@@ -575,7 +602,7 @@ mod tests {
         let started = server
             .start_thread(ThreadStartRequest {
                 model: "gpt-fixture".into(),
-                cwd: PathBuf::from("/workspace/project"),
+                cwd: cwd.clone(),
                 approval_policy: ApprovalPolicy::Never,
                 sandbox: ThreadSandbox::WorkspaceWrite,
             })
@@ -590,7 +617,7 @@ mod tests {
             transport.requests[1].1,
             json!({
                 "model": "gpt-fixture",
-                "cwd": "/workspace/project",
+                "cwd": cwd,
                 "approvalPolicy": "never",
                 "sandbox": "workspaceWrite",
                 "serviceName": "bastet_workstation"
@@ -604,6 +631,7 @@ mod tests {
 
     #[test]
     fn turn_start_and_interrupt_use_typed_policy_and_exact_ids() {
+        let cwd = fixture_absolute_path();
         let mut server = initialized_server_with([
             json!({ "turn": { "id": "turn_1", "status": "inProgress", "items": [] } }),
             json!({}),
@@ -612,10 +640,10 @@ mod tests {
             .start_turn(TurnStartRequest {
                 thread_id: "thr_1".into(),
                 prompt: "Run tests".into(),
-                cwd: PathBuf::from("/workspace/project"),
+                cwd: cwd.clone(),
                 approval_policy: ApprovalPolicy::UnlessTrusted,
                 sandbox_policy: TurnSandboxPolicy::WorkspaceWrite {
-                    writable_roots: vec![PathBuf::from("/workspace/project")],
+                    writable_roots: vec![cwd.clone()],
                     network_access: false,
                 },
                 model: Some("gpt-fixture".into()),
@@ -631,7 +659,7 @@ mod tests {
             transport.requests[1].1["sandboxPolicy"],
             json!({
                 "type": "workspaceWrite",
-                "writableRoots": ["/workspace/project"],
+                "writableRoots": [cwd],
                 "networkAccess": false
             })
         );
@@ -667,7 +695,7 @@ mod tests {
             server.start_turn(TurnStartRequest {
                 thread_id: "thr_1".into(),
                 prompt: "Run tests".into(),
-                cwd: PathBuf::from("/workspace/project"),
+                cwd: fixture_absolute_path(),
                 approval_policy: ApprovalPolicy::Never,
                 sandbox_policy: TurnSandboxPolicy::WorkspaceWrite {
                     writable_roots: vec![PathBuf::from("relative/project")],
@@ -688,7 +716,7 @@ mod tests {
             .start_turn(TurnStartRequest {
                 thread_id: "thr_1".into(),
                 prompt: "Inspect status".into(),
-                cwd: PathBuf::from("/workspace/project"),
+                cwd: fixture_absolute_path(),
                 approval_policy: ApprovalPolicy::Never,
                 sandbox_policy: TurnSandboxPolicy::ReadOnly,
                 model: None,
@@ -736,5 +764,48 @@ mod tests {
         );
         server.initialize().unwrap();
         assert_eq!(server.next_notification().unwrap(), notification);
+    }
+
+    #[test]
+    fn run_events_skip_unrelated_notifications_and_keep_stream_sequence() {
+        let notifications = [
+            AppServerNotification {
+                method: "item/started".into(),
+                params: json!({"item": {"id": "item_1"}}),
+            },
+            AppServerNotification {
+                method: "turn/started".into(),
+                params: json!({"turn": {"id": "turn_other", "status": "inProgress"}}),
+            },
+            AppServerNotification {
+                method: "turn/started".into(),
+                params: json!({"turn": {"id": "turn_target", "status": "inProgress"}}),
+            },
+            AppServerNotification {
+                method: "turn/completed".into(),
+                params: json!({"turn": {"id": "turn_target", "status": "completed"}}),
+            },
+        ];
+        let transport = FixtureTransport {
+            responses: VecDeque::from([Ok(json!({}))]),
+            incoming_notifications: notifications.into_iter().map(Ok).collect(),
+            ..FixtureTransport::default()
+        };
+        let mut server = CodexAppServer::new(transport);
+        server.initialize().unwrap();
+        let mut stream =
+            CodexRunStream::new(bastet_core::RunId::from_bytes([4; 16]), "turn_target").unwrap();
+        let started = server
+            .next_run_event(&mut stream, "2026-09-03T00:00:00Z")
+            .unwrap();
+        let completed = server
+            .next_run_event(&mut stream, "2026-09-03T00:00:01Z")
+            .unwrap();
+        assert_eq!(started.event.sequence, 1);
+        assert_eq!(completed.event.sequence, 2);
+        assert_eq!(
+            completed.event.state,
+            bastet_core::NormalizedRunState::Succeeded
+        );
     }
 }
