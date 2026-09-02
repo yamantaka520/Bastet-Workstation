@@ -86,5 +86,9 @@ verification status; it does not add scope.
   initializes a second process, emits locally measured Recovering evidence, and resumes the saved
   `thread.id` with identical thread/session identifiers. An observed negative control confirms a
   newly started thread with no completed turn is not yet resumable through a new process. The
-  isolated root remains empty throughout.
+  isolated root remains empty throughout. A fourth canary validates a bounded real write in a
+  separate non-repository root using `workspaceWrite`, one explicit writable root,
+  `approvalPolicy=never`, and `networkAccess=false`. It requires exactly one `receipt.txt` with
+  exact fixture content, a successful terminal, and at least one redacted write receipt that
+  contains neither the path nor content. The temporary evidence file is removed after verification.
 - M2.4–M2.8: not started.
