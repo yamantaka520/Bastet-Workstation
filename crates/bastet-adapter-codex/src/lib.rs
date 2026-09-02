@@ -7,7 +7,7 @@ use std::{
     process::Command,
 };
 
-use bastet_core::EvidenceClass;
+use bastet_core::{AdapterCapabilities, AdapterOperation, EvidenceClass};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -59,6 +59,23 @@ pub struct DoctorReport {
     pub codex_version: String,
     pub overall_status: String,
     pub check_count: usize,
+    pub evidence_class: EvidenceClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthenticationMethod {
+    ChatGpt,
+    ApiKey,
+    AccessToken,
+    WorkloadIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthenticationStatus {
+    pub adapter_kind: String,
+    pub authenticated: bool,
+    pub method: Option<AuthenticationMethod>,
     pub evidence_class: EvidenceClass,
 }
 
@@ -154,6 +171,52 @@ impl<R: CommandRunner> CodexAdapter<R> {
             check_count: wire.checks.len(),
             evidence_class: EvidenceClass::ProviderReported,
         })
+    }
+
+    pub fn authentication_status(&self) -> Result<AuthenticationStatus, CodexAdapterError> {
+        self.discover()?;
+        let output = self
+            .runner
+            .run(&self.executable, &["login", "status"])
+            .map_err(CodexAdapterError::Spawn)?;
+        let stdout = std::str::from_utf8(&output.stdout)
+            .map_err(|_| CodexAdapterError::NonUtf8Output)?
+            .trim();
+        let stderr = std::str::from_utf8(&output.stderr)
+            .map_err(|_| CodexAdapterError::NonUtf8Output)?
+            .trim();
+        let method = match stdout {
+            "Logged in using ChatGPT" => Some(AuthenticationMethod::ChatGpt),
+            "Logged in using an API key" => Some(AuthenticationMethod::ApiKey),
+            "Logged in using an access token" => Some(AuthenticationMethod::AccessToken),
+            "Logged in using workload identity" => Some(AuthenticationMethod::WorkloadIdentity),
+            _ if !output.success && (stdout == "Not logged in" || stderr == "Not logged in") => {
+                None
+            }
+            _ => return Err(CodexAdapterError::ProtocolDrift),
+        };
+        Ok(AuthenticationStatus {
+            adapter_kind: ADAPTER_KIND.into(),
+            authenticated: method.is_some(),
+            method,
+            evidence_class: EvidenceClass::ProviderReported,
+        })
+    }
+
+    pub fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities {
+            operations: vec![
+                AdapterOperation::Discover,
+                AdapterOperation::Version,
+                AdapterOperation::Doctor,
+                AdapterOperation::InspectAuthentication,
+            ],
+            reasoning_controls: Vec::new(),
+            supports_read_only: false,
+            supports_write: false,
+            supports_resume: false,
+            supports_structured_events: false,
+        }
     }
 }
 
@@ -294,5 +357,58 @@ mod tests {
         let path = std::env::join_paths([directory.path()]).unwrap();
         assert_eq!(find_on_path(Some(&path)), Some(executable));
         assert_eq!(find_on_path(None), None);
+    }
+
+    #[test]
+    fn authentication_status_retains_only_the_login_method() {
+        let (_directory, executable) = executable();
+        let runner = FixtureRunner::new(vec![output("Logged in using ChatGPT\n")]);
+        let adapter = CodexAdapter::with_runner(executable, runner);
+        let status = adapter.authentication_status().unwrap();
+        assert!(status.authenticated);
+        assert_eq!(status.method, Some(AuthenticationMethod::ChatGpt));
+        assert_eq!(
+            adapter.runner.calls.into_inner(),
+            vec![vec!["login", "status"]]
+        );
+    }
+
+    #[test]
+    fn logged_out_status_is_not_treated_as_command_failure() {
+        let (_directory, executable) = executable();
+        let runner = FixtureRunner::new(vec![CommandOutput {
+            success: false,
+            stdout: Vec::new(),
+            stderr: b"Not logged in\n".to_vec(),
+        }]);
+        let adapter = CodexAdapter::with_runner(executable, runner);
+        let status = adapter.authentication_status().unwrap();
+        assert!(!status.authenticated);
+        assert_eq!(status.method, None);
+    }
+
+    #[test]
+    fn unknown_authentication_output_fails_closed() {
+        let (_directory, executable) = executable();
+        let runner = FixtureRunner::new(vec![output("user@example.test")]);
+        let adapter = CodexAdapter::with_runner(executable, runner);
+        assert!(matches!(
+            adapter.authentication_status(),
+            Err(CodexAdapterError::ProtocolDrift)
+        ));
+    }
+
+    #[test]
+    fn capabilities_do_not_claim_unimplemented_execution() {
+        let adapter = CodexAdapter::new("codex");
+        let capabilities = adapter.capabilities();
+        assert!(capabilities
+            .operations
+            .contains(&AdapterOperation::InspectAuthentication));
+        assert!(!capabilities.operations.contains(&AdapterOperation::Start));
+        assert!(!capabilities.supports_read_only);
+        assert!(!capabilities.supports_write);
+        assert!(!capabilities.supports_resume);
+        assert!(!capabilities.supports_structured_events);
     }
 }

@@ -13,6 +13,7 @@ pub enum AdapterOperation {
     Version,
     Doctor,
     Authenticate,
+    InspectAuthentication,
     ListModels,
     Start,
     Attach,

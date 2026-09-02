@@ -44,6 +44,7 @@ verification status; it does not add scope.
   and invalid cost evidence. Commits `8a179df`, `69b34e3`, and `a336135` passed GitHub Actions
   runs `33668014153`, `33668299526`, and `33669295915` respectively.
 - M2.3 Codex CLI reference adapter: in progress with a read-only discovery/version/doctor process
-  boundary; authentication, execution, session lifecycle, and conformance integration remain
-  pending.
+  boundary, sanitized authentication-status parsing, and a capability declaration that does not
+  claim unimplemented execution. Interactive authentication, execution, session lifecycle, and
+  conformance integration remain pending.
 - M2.4–M2.8: not started.
