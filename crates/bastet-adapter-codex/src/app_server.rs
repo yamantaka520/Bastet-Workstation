@@ -39,7 +39,7 @@ pub enum ApprovalPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "kebab-case")]
 pub enum ThreadSandbox {
     ReadOnly,
     WorkspaceWrite,
@@ -207,8 +207,7 @@ impl<T: AppServerTransport> CodexAppServer<T> {
                     "model": request.model,
                     "cwd": request.cwd,
                     "approvalPolicy": request.approval_policy,
-                    "sandbox": request.sandbox,
-                    "serviceName": "bastet_workstation"
+                    "sandbox": request.sandbox
                 }),
             )
             .map_err(|_| AppServerError::Transport)?;
@@ -619,8 +618,7 @@ mod tests {
                 "model": "gpt-fixture",
                 "cwd": cwd,
                 "approvalPolicy": "never",
-                "sandbox": "workspaceWrite",
-                "serviceName": "bastet_workstation"
+                "sandbox": "workspace-write"
             })
         );
         assert_eq!(

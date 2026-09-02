@@ -69,5 +69,13 @@ verification status; it does not add scope.
   the production lifecycle and evidence normalizers, including locally measured timeout and
   transport-loss terminals. Its fixture-only capability target is intentionally separate from the
   production adapter declaration, which continues to withhold Start, Cancel, resume, write, and
-  structured-event claims until real execution coverage is complete.
+  structured-event claims until real execution coverage is complete. An explicitly invoked,
+  ignored real-stdio canary now covers one `thread/start` + `turn/start` success path using an
+  isolated empty root, `approvalPolicy=never`, and read-only sandboxing at both levels. It verifies
+  Running -> Succeeded normalization, provider token evidence without invented currency, no write
+  receipt, and an empty root before and after execution. The canary exposed and fixed a protocol
+  mismatch: `thread/start.sandbox` uses kebab-case (`read-only` / `workspace-write`), while
+  `turn/start.sandboxPolicy.type` uses camelCase. The successful canary does not establish real
+  cancel, resume, write, failure, or crash coverage, so production execution capabilities remain
+  withheld.
 - M2.4–M2.8: not started.
