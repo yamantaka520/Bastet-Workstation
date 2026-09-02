@@ -86,6 +86,7 @@ pub struct ConformanceFinding {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioResult {
     pub scenario: ConformanceScenario,
+    pub run_id: RunId,
     pub passed: bool,
     pub findings: Vec<ConformanceFinding>,
 }
@@ -94,6 +95,7 @@ pub struct ScenarioResult {
 pub struct ConformanceReport {
     pub contract_version: u32,
     pub adapter_kind: String,
+    pub capabilities: AdapterCapabilities,
     pub passed: bool,
     pub results: Vec<ScenarioResult>,
 }
@@ -128,6 +130,7 @@ pub fn run_required_suite(adapter: &mut impl ConformanceAdapter) -> ConformanceR
     ConformanceReport {
         contract_version: AGENT_ADAPTER_CONTRACT_VERSION,
         adapter_kind,
+        capabilities,
         passed: results.iter().all(|result| result.passed),
         results,
     }
@@ -153,6 +156,7 @@ fn validate_observation(
     validate_scenario(case, capabilities, observation, &mut findings);
     ScenarioResult {
         scenario: case.scenario,
+        run_id: case.run_id,
         passed: findings.is_empty(),
         findings,
     }
@@ -179,16 +183,24 @@ fn validate_events(
             previous.is_none_or(|value| event.sequence > value) && sequences.insert(event.sequence);
         let payload_is_json =
             serde_json::from_str::<serde_json::Value>(&event.redacted_payload_json).is_ok();
+        let metadata_is_valid = !event.event_type.trim().is_empty()
+            && !event.occurred_at.trim().is_empty()
+            && event.evidence_class != EvidenceClass::Unknown
+            && event
+                .provider_event_id
+                .as_ref()
+                .is_none_or(|value| !value.trim().is_empty());
         if event.contract_version != AGENT_ADAPTER_CONTRACT_VERSION
             || event.run_id != case.run_id
             || !sequence_is_valid
             || !payload_is_json
+            || !metadata_is_valid
         {
             finding(
                 findings,
                 case.scenario,
                 FindingKind::InvalidEvent,
-                "event version, run identity, sequence, or JSON payload is invalid",
+                "event version, run identity, sequence, evidence, metadata, or JSON payload is invalid",
             );
             break;
         }
@@ -261,7 +273,12 @@ fn validate_scenario(
             require_operation(AdapterOperation::Start, capabilities, case, findings);
             require_capability(capabilities.supports_write, case, findings);
             require_state(NormalizedRunState::Succeeded, case, observation, findings);
-            if observation.write_receipts.is_empty() {
+            if observation.write_receipts.is_empty()
+                || observation
+                    .write_receipts
+                    .iter()
+                    .any(|receipt| receipt.trim().is_empty())
+            {
                 finding(
                     findings,
                     case.scenario,
@@ -361,7 +378,7 @@ fn valid_cost(cost: Option<&CostEvidence>) -> bool {
                 && cost
                     .currency
                     .as_ref()
-                    .is_some_and(|value| !value.is_empty())
+                    .is_some_and(|value| !value.trim().is_empty())
         }
         None => cost.currency.is_none(),
     }
@@ -420,7 +437,15 @@ fn require_failure(
     observation: &ConformanceObservation,
     findings: &mut Vec<ConformanceFinding>,
 ) {
-    if observation.failure.as_ref().map(|failure| failure.kind) != Some(expected) {
+    let failure_is_valid = observation.failure.as_ref().is_some_and(|failure| {
+        failure.kind == expected
+            && !failure.message_key.trim().is_empty()
+            && failure
+                .provider_code
+                .as_ref()
+                .is_none_or(|value| !value.trim().is_empty())
+    });
+    if !failure_is_valid {
         finding(
             findings,
             case.scenario,
@@ -454,6 +479,9 @@ mod tests {
         omit_required_operations: bool,
         structured_events: bool,
         omit_cancelling_state: bool,
+        unknown_event_evidence: bool,
+        blank_write_receipt: bool,
+        blank_failure_key: bool,
     }
 
     impl FixtureAdapter {
@@ -465,6 +493,9 @@ mod tests {
                 omit_required_operations: false,
                 structured_events: true,
                 omit_cancelling_state: false,
+                unknown_event_evidence: false,
+                blank_write_receipt: false,
+                blank_failure_key: false,
             }
         }
     }
@@ -549,7 +580,11 @@ mod tests {
                     state,
                     event_type: format!("fixture.{state:?}").to_lowercase(),
                     occurred_at: format!("2026-09-03T00:00:0{index}Z"),
-                    evidence_class: EvidenceClass::LocallyMeasured,
+                    evidence_class: if self.unknown_event_evidence {
+                        EvidenceClass::Unknown
+                    } else {
+                        EvidenceClass::LocallyMeasured
+                    },
                     provider_event_id: None,
                     redacted_payload_json: if self.leak_secret {
                         format!("{{\"output\":\"{SECRET_SENTINEL}\"}}")
@@ -559,6 +594,7 @@ mod tests {
                 })
                 .collect();
             let write_receipts = match case.scenario {
+                ConformanceScenario::Write if self.blank_write_receipt => vec![" ".into()],
                 ConformanceScenario::Write => vec!["fixture-write-receipt".into()],
                 ConformanceScenario::ReadOnly if self.read_only_writes => {
                     vec!["unexpected-write".into()]
@@ -578,7 +614,12 @@ mod tests {
                 scenario: case.scenario,
                 events,
                 final_state,
-                failure,
+                failure: failure.map(|mut failure| {
+                    if self.blank_failure_key {
+                        failure.message_key.clear();
+                    }
+                    failure
+                }),
                 write_receipts,
                 cost,
             }
@@ -714,5 +755,56 @@ mod tests {
             finding.kind == FindingKind::InvalidFinalState
                 && finding.detail == "cancel scenario never entered cancelling"
         }));
+    }
+
+    #[test]
+    fn unknown_event_evidence_is_rejected() {
+        let mut adapter = FixtureAdapter::valid();
+        adapter.unknown_event_evidence = true;
+        let report = run_required_suite(&mut adapter);
+        assert!(!report.passed);
+        assert!(report.results.iter().all(|result| {
+            result
+                .findings
+                .iter()
+                .any(|finding| finding.kind == FindingKind::InvalidEvent)
+        }));
+    }
+
+    #[test]
+    fn blank_write_receipt_is_rejected() {
+        let mut adapter = FixtureAdapter::valid();
+        adapter.blank_write_receipt = true;
+        let report = run_required_suite(&mut adapter);
+        let result = report
+            .results
+            .iter()
+            .find(|result| result.scenario == ConformanceScenario::Write)
+            .unwrap();
+        assert_eq!(result.findings[0].kind, FindingKind::MissingWriteReceipt);
+    }
+
+    #[test]
+    fn blank_failure_key_is_rejected() {
+        let mut adapter = FixtureAdapter::valid();
+        adapter.blank_failure_key = true;
+        let report = run_required_suite(&mut adapter);
+        for scenario in [
+            ConformanceScenario::Cancel,
+            ConformanceScenario::Timeout,
+            ConformanceScenario::AuthenticationFailure,
+            ConformanceScenario::QuotaFailure,
+            ConformanceScenario::Crash,
+        ] {
+            let result = report
+                .results
+                .iter()
+                .find(|result| result.scenario == scenario)
+                .unwrap();
+            assert!(result
+                .findings
+                .iter()
+                .any(|finding| finding.kind == FindingKind::InvalidFailure));
+        }
     }
 }

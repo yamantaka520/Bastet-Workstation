@@ -36,9 +36,10 @@ verification status; it does not add scope.
   Session, and Run relationships fail closed on duplicate IDs, missing references, provider
   mismatch, invalid policy layers, empty provenance, and invalid run timing.
 - M2.1 overall: complete; GitHub Actions run `33667253868` passed for `af72129`.
-- M2.2 deterministic conformance harness: in progress; the side-effect-free local fixture now
-  exercises all ten required scenarios from stable case IDs and produces byte-for-byte replayable
-  reports. It fails closed on malformed events, undeclared capabilities or operations, missing
-  cancel/recovery transitions, secret leakage, unauthorized writes, normalized failures, and
-  invalid cost evidence. Reference adapter integration remains pending.
+- M2.2 deterministic conformance harness: complete locally; the side-effect-free fixture exercises
+  all ten required scenarios from stable case IDs and produces byte-for-byte replayable reports
+  containing the case Run ID and adapter capability snapshot. It fails closed on malformed or
+  unknown-evidence events, undeclared capabilities or operations, missing cancel/recovery
+  transitions, secret leakage, unauthorized or unevidenced writes, malformed normalized failures,
+  and invalid cost evidence. Awaiting commit and remote CI.
 - M2.3–M2.8: not started.
