@@ -14,6 +14,10 @@ macro_rules! stable_id {
                 Self(Uuid::new_v4())
             }
 
+            pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+                Self(Uuid::from_bytes(bytes))
+            }
+
             pub fn value(self) -> Uuid {
                 self.0
             }
@@ -200,5 +204,11 @@ mod tests {
             serde_json::from_str::<AgentInstanceId>(&encoded).unwrap(),
             id
         );
+    }
+
+    #[test]
+    fn stable_ids_can_be_rebuilt_from_fixture_bytes() {
+        let bytes = [0x2a; 16];
+        assert_eq!(RunId::from_bytes(bytes).value(), Uuid::from_bytes(bytes));
     }
 }

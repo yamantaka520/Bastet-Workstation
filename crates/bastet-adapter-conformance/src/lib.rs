@@ -39,14 +39,14 @@ pub enum ConformanceScenario {
     CostEvidence,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConformanceCase {
     pub scenario: ConformanceScenario,
     pub run_id: RunId,
     pub secret_sentinels: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConformanceObservation {
     pub scenario: ConformanceScenario,
     pub events: Vec<NormalizedAdapterEvent>,
@@ -98,19 +98,31 @@ pub struct ConformanceReport {
     pub results: Vec<ScenarioResult>,
 }
 
+pub fn required_cases() -> Vec<ConformanceCase> {
+    REQUIRED_SCENARIOS
+        .into_iter()
+        .enumerate()
+        .map(|(index, scenario)| {
+            let mut bytes = [0u8; 16];
+            bytes[..15].copy_from_slice(b"BASTET-M2-CASE!");
+            bytes[15] = index as u8;
+            ConformanceCase {
+                scenario,
+                run_id: RunId::from_bytes(bytes),
+                secret_sentinels: vec![SECRET_SENTINEL.into()],
+            }
+        })
+        .collect()
+}
+
 pub fn run_required_suite(adapter: &mut impl ConformanceAdapter) -> ConformanceReport {
     let capabilities = adapter.capabilities();
     let adapter_kind = adapter.adapter_kind().to_owned();
-    let results = REQUIRED_SCENARIOS
-        .into_iter()
-        .map(|scenario| {
-            let case = ConformanceCase {
-                scenario,
-                run_id: RunId::new(),
-                secret_sentinels: vec![SECRET_SENTINEL.into()],
-            };
-            let observation = adapter.run_case(&case);
-            validate_observation(&case, &capabilities, &observation)
+    let results = required_cases()
+        .iter()
+        .map(|case| {
+            let observation = adapter.run_case(case);
+            validate_observation(case, &capabilities, &observation)
         })
         .collect::<Vec<_>>();
     ConformanceReport {
@@ -589,6 +601,32 @@ mod tests {
         assert!(report.passed);
         assert_eq!(report.results.len(), REQUIRED_SCENARIOS.len());
         assert!(report.results.iter().all(|result| result.passed));
+    }
+
+    #[test]
+    fn required_cases_are_stable_and_unique() {
+        let first = required_cases();
+        let second = required_cases();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), REQUIRED_SCENARIOS.len());
+        assert_eq!(
+            first
+                .iter()
+                .map(|case| case.run_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            REQUIRED_SCENARIOS.len()
+        );
+    }
+
+    #[test]
+    fn reports_are_byte_for_byte_replayable() {
+        let first = run_required_suite(&mut FixtureAdapter::valid());
+        let second = run_required_suite(&mut FixtureAdapter::valid());
+        assert_eq!(
+            serde_json::to_vec(&first).unwrap(),
+            serde_json::to_vec(&second).unwrap()
+        );
     }
 
     #[test]

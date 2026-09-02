@@ -11,6 +11,3 @@ repository.workspace = true
 bastet-core = { path = "../bastet-core" }
 serde.workspace = true
 serde_json.workspace = true
-
-[dev-dependencies]
-uuid.workspace = true

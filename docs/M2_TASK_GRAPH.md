@@ -37,8 +37,8 @@ verification status; it does not add scope.
   mismatch, invalid policy layers, empty provenance, and invalid run timing.
 - M2.1 overall: complete; GitHub Actions run `33667253868` passed for `af72129`.
 - M2.2 deterministic conformance harness: in progress; the side-effect-free local fixture now
-  exercises all ten required scenarios and fails closed on malformed events, undeclared
-  capabilities or operations, missing cancel/recovery transitions, secret leakage, unauthorized
-  writes, normalized failures, and invalid cost evidence. Reference adapter integration remains
-  pending.
+  exercises all ten required scenarios from stable case IDs and produces byte-for-byte replayable
+  reports. It fails closed on malformed events, undeclared capabilities or operations, missing
+  cancel/recovery transitions, secret leakage, unauthorized writes, normalized failures, and
+  invalid cost evidence. Reference adapter integration remains pending.
 - M2.3–M2.8: not started.
