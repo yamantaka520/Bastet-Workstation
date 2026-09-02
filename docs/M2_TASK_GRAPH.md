@@ -41,5 +41,9 @@ verification status; it does not add scope.
   containing the case Run ID and adapter capability snapshot. It fails closed on malformed or
   unknown-evidence events, undeclared capabilities or operations, missing cancel/recovery
   transitions, secret leakage, unauthorized or unevidenced writes, malformed normalized failures,
-  and invalid cost evidence. Awaiting commit and remote CI.
-- M2.3–M2.8: not started.
+  and invalid cost evidence. Commits `8a179df`, `69b34e3`, and `a336135` passed GitHub Actions
+  runs `33668014153`, `33668299526`, and `33669295915` respectively.
+- M2.3 Codex CLI reference adapter: in progress with a read-only discovery/version/doctor process
+  boundary; authentication, execution, session lifecycle, and conformance integration remain
+  pending.
+- M2.4–M2.8: not started.

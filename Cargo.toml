@@ -2,6 +2,7 @@
 members = [
   "apps/desktop/src-tauri",
   "crates/bastet-adapter-conformance",
+  "crates/bastet-adapter-codex",
   "crates/bastet-client",
   "crates/bastet-core",
   "crates/bastet-daemon",
