@@ -45,6 +45,8 @@ verification status; it does not add scope.
   runs `33668014153`, `33668299526`, and `33669295915` respectively.
 - M2.3 Codex CLI reference adapter: in progress with a read-only discovery/version/doctor process
   boundary, sanitized authentication-status parsing, and a capability declaration that does not
-  claim unimplemented execution. Interactive authentication, execution, session lifecycle, and
-  conformance integration remain pending.
+  claim unimplemented execution. A fixture-backed app-server JSON-RPC boundary now enforces the
+  required initialize/initialized handshake and strictly normalizes `model/list` model, modality,
+  default, and reasoning-effort data. The real stdio transport, interactive authentication,
+  execution, session lifecycle, and conformance integration remain pending.
 - M2.4–M2.8: not started.

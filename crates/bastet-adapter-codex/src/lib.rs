@@ -1,5 +1,12 @@
 //! Codex CLI discovery and read-only health boundary.
 
+mod app_server;
+
+pub use app_server::{
+    AppServerError, AppServerTransport, CodexAppServer, ModelCatalogPage, ModelDescriptor,
+    ReasoningEffort, TransportError,
+};
+
 use std::{
     ffi::OsStr,
     io,
