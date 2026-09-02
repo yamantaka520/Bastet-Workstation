@@ -186,3 +186,74 @@ fn installed_codex_interrupts_a_read_only_turn_over_stdio() {
 
     assert_eq!(std::fs::read_dir(&probe_root).unwrap().count(), 0);
 }
+
+#[test]
+#[ignore = "requires explicit Codex CLI and isolated empty root; persists and resumes one real read-only thread"]
+fn installed_codex_resumes_a_read_only_thread_over_new_stdio_process() {
+    let executable = PathBuf::from(
+        std::env::var_os("BASTET_CODEX_BINARY").expect("BASTET_CODEX_BINARY must be set"),
+    );
+    let probe_root = PathBuf::from(
+        std::env::var_os("BASTET_CODEX_PROBE_ROOT").expect("BASTET_CODEX_PROBE_ROOT must be set"),
+    );
+    assert!(probe_root.is_absolute());
+    assert!(probe_root.is_dir());
+    assert_eq!(std::fs::read_dir(&probe_root).unwrap().count(), 0);
+
+    let first_transport = StdioTransport::spawn(&executable, Duration::from_secs(60)).unwrap();
+    let mut first_server = CodexAppServer::new(first_transport);
+    first_server.initialize().unwrap();
+    let page = first_server.list_models(None, 20).unwrap();
+    let model = page
+        .models
+        .iter()
+        .find(|model| model.is_default)
+        .or_else(|| page.models.first())
+        .expect("Codex must report at least one visible model");
+    let original = first_server
+        .start_thread(ThreadStartRequest {
+            model: model.model.clone(),
+            cwd: probe_root.clone(),
+            approval_policy: ApprovalPolicy::Never,
+            sandbox: ThreadSandbox::ReadOnly,
+        })
+        .unwrap();
+    let first_turn = first_server
+        .start_turn(TurnStartRequest {
+            thread_id: original.thread_id.clone(),
+            prompt: "Reply with exactly BASTET_RESUME_READY. Do not call tools.".into(),
+            cwd: probe_root.clone(),
+            approval_policy: ApprovalPolicy::Never,
+            sandbox_policy: TurnSandboxPolicy::ReadOnly,
+            model: Some(model.model.clone()),
+            effort: model.default_reasoning_effort.clone(),
+        })
+        .unwrap();
+    let mut first_stream =
+        CodexRunStream::new(RunId::from_bytes([44; 16]), &first_turn.turn_id).unwrap();
+    loop {
+        let event = first_server
+            .next_run_event(&mut first_stream, "2026-09-03T00:00:00Z")
+            .unwrap();
+        match event.event.state {
+            NormalizedRunState::Running => {}
+            NormalizedRunState::Succeeded => break,
+            state => panic!("resume setup turn ended in unexpected state: {state:?}"),
+        }
+    }
+    first_server.into_transport().close();
+
+    let second_transport = StdioTransport::spawn(&executable, Duration::from_secs(60)).unwrap();
+    let mut second_server = CodexAppServer::new(second_transport);
+    second_server.initialize().unwrap();
+    let mut stream = CodexRunStream::new(RunId::from_bytes([45; 16]), "resume_probe").unwrap();
+    let recovering = stream
+        .recovery_started(&original.thread_id, "2026-09-03T00:00:00Z")
+        .unwrap();
+    assert_eq!(recovering.event.state, NormalizedRunState::Recovering);
+    assert_eq!(recovering.event.sequence, 1);
+    let resumed = second_server.resume_thread(&original.thread_id).unwrap();
+    assert_eq!(resumed.thread_id, original.thread_id);
+    assert_eq!(resumed.session_id, original.session_id);
+    assert_eq!(std::fs::read_dir(&probe_root).unwrap().count(), 0);
+}

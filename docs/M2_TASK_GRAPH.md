@@ -80,6 +80,11 @@ verification status; it does not add scope.
   requires the provider terminal to normalize as Cancelled with the Cancelled failure kind; its
   isolated root also remains empty. This ordering avoids an observed race when interruption is
   requested before the client consumes `turn/started`. The successful canaries do not establish
-  real resume, write, failure, or crash coverage, so production execution capabilities remain
-  withheld.
+  real write, failure, or crash coverage, so production execution capabilities remain withheld.
+  A third canary establishes the minimum persisted-session resume path without changing the
+  original read-only policy: it completes one small turn, closes the first app-server process,
+  initializes a second process, emits locally measured Recovering evidence, and resumes the saved
+  `thread.id` with identical thread/session identifiers. An observed negative control confirms a
+  newly started thread with no completed turn is not yet resumable through a new process. The
+  isolated root remains empty throughout.
 - M2.4–M2.8: not started.
