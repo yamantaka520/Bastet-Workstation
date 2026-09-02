@@ -1,0 +1,10 @@
+version = 1
+SPDX-PackageName = "Bastet-Workstation"
+SPDX-PackageSupplier = "Person: Manfred Hsu"
+SPDX-PackageDownloadLocation = "https://github.com/yamantaka520/Bastet-Workstation"
+
+[[annotations]]
+path = ["**"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Manfred Hsu"
+SPDX-License-Identifier = "Apache-2.0"

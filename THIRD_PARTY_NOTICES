@@ -1,0 +1,7 @@
+# Third-Party Notices
+
+Bastet Workstation M0 contains no bundled runtime dependencies, third-party binaries, fonts, audio, Pet assets, room assets, role definitions, or Skill packages.
+
+Future additions must record at least the component or asset name, version, source, copyright holder, license, modifications, and redistribution or attribution requirements before distribution. Generated assets must also record model/provider provenance and declared usage rights.
+
+This file is an inventory baseline and must be updated whenever third-party material is added or removed.
