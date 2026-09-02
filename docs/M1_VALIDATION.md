@@ -7,13 +7,13 @@ This document records evidence for M1 without replacing the milestone definition
 
 | Check | Local macOS evidence (2026-09-03) | Remote platform evidence |
 |---|---|---|
-| React shell | 4 Vitest tests passed; production Vite build passed | [Run 33657840319](https://github.com/yamantaka520/Bastet-Workstation/actions/runs/33657840319): pass |
-| Rust protocol, daemon, client, desktop | 13 workspace tests passed | Initial run exposed missing generated sidecar before Clippy; workflow fix awaiting rerun |
-| Static analysis | `cargo fmt --check` and Clippy with `-D warnings` passed | Initial run exposed missing generated sidecar before Clippy; workflow fix awaiting rerun |
-| Dependency audit | `pnpm audit --audit-level high`: no known vulnerabilities | Pending CI |
-| M0 regression | Validator passed 13 required files and 7 ADRs; Python tests 3/3 | [Run 33657840319](https://github.com/yamantaka520/Bastet-Workstation/actions/runs/33657840319): all 6 OS/Python jobs passed |
-| Target-specific sidecar build | `pnpm tauri build --debug --bundles app` passed | Initial run proved the sidecar must be prepared before Cargo checks; workflow fix awaiting rerun |
-| Compiled daemon smoke harness | Real binary passed suspend/resume, graceful restart, identity retention, forced kill, and crash recovery | Configured for Linux, macOS, and Windows; pending CI run |
+| React shell | 4 Vitest tests passed; production Vite build passed | [Run 33661058474](https://github.com/yamantaka520/Bastet-Workstation/actions/runs/33661058474): pass |
+| Rust protocol, daemon, client, desktop | 13 workspace tests passed | [Run 33661058474](https://github.com/yamantaka520/Bastet-Workstation/actions/runs/33661058474): Linux, macOS, and Windows passed |
+| Static analysis | `cargo fmt --check` and Clippy with `-D warnings` passed | [Run 33661058474](https://github.com/yamantaka520/Bastet-Workstation/actions/runs/33661058474): Linux, macOS, and Windows passed |
+| Dependency audit | `pnpm audit --audit-level high`: no known vulnerabilities | Local-only check; not configured as a remote job |
+| M0 regression | Validator passed 13 required files and 7 ADRs; Python tests 3/3 | [Run 33661058474](https://github.com/yamantaka520/Bastet-Workstation/actions/runs/33661058474): all 6 OS/Python jobs passed |
+| Target-specific sidecar build | `pnpm tauri build --debug --bundles app` passed | [Run 33661058474](https://github.com/yamantaka520/Bastet-Workstation/actions/runs/33661058474): Linux, macOS, and Windows passed |
+| Compiled daemon smoke harness | Real binary passed suspend/resume, graceful restart, identity retention, forced kill, and crash recovery | [Run 33661058474](https://github.com/yamantaka520/Bastet-Workstation/actions/runs/33661058474): Linux, macOS, and Windows passed |
 
 ## Local macOS smoke evidence
 
@@ -34,12 +34,9 @@ This document records evidence for M1 without replacing the milestone definition
 | Simulated sleep/wake | Real loopback daemon transitioned `ready` revision 1 → `suspended` revision 2, rejected ordinary checkpoint with HTTP 409, resumed to `ready` revision 3, then shut down with checkpoint revision 4 | Pass |
 | Physical sleep/wake | First run exposed that generic Tauri `RunEvent::Resumed` did not handle macOS system wake. After installing native `NSWorkspaceWillSleepNotification` and `NSWorkspaceDidWakeNotification` observers, the bundled app transitioned the same daemon identity from revision 32 `ready` → 33 `suspended` → 34 `ready`, with durable reasons `desktop preparing for system sleep` and `desktop resumed after system wake` | Pass |
 | Signed distribution | Debug app is unsigned and fails strict `codesign` verification | Pending release work |
-| Tray-menu explicit quit | Tray and Cmd+Q share the now-verified durable-exit handler; direct tray click not yet captured | Pending manual smoke |
+| Tray-menu explicit quit | Direct tray Quit exited the desktop with code 0, closed the listener, and advanced the same daemon identity from revision 37 `ready` to revision 38 `stopping`; checkpoint reason was `explicit desktop quit` and the final event was `daemon.shutdown_requested` | Pass |
 
-## Remaining M1 gate
+## Remaining release validation
 
-- Run cold-start, upgrade, crash, sleep/wake, and daemon reconnect smoke tests on macOS,
-  Windows, and Linux reference environments.
-- Capture a direct tray-menu quit smoke result.
-- Validate signed distribution artifacts when release signing is authorized.
-- Push the CI-ordering and native macOS power-observer fix, then require all remote jobs to pass.
+- Validate signed distribution artifacts during authorized release work; signing is not part of the
+  M1 gate in `MASTER_PLAN.md`.
