@@ -1,5 +1,8 @@
 mod supervisor;
 
+#[cfg(target_os = "macos")]
+mod macos_power;
+
 use bastet_client::DaemonClient;
 use bastet_protocol::{CheckpointReceipt, DaemonLifecycle, DaemonSnapshot, PROTOCOL_VERSION};
 use serde::Serialize;
@@ -47,7 +50,17 @@ async fn checkpoint_for_quit(client: &DaemonClient) -> Result<CheckpointReceipt,
 
 #[tauri::command]
 async fn prepare_for_sleep(client: State<'_, DaemonClient>) -> Result<CheckpointReceipt, String> {
+    suspend_if_ready(&client).await
+}
+
+async fn suspend_if_ready(client: &DaemonClient) -> Result<CheckpointReceipt, String> {
     let snapshot = client.snapshot().await.map_err(|error| error.to_string())?;
+    if snapshot.lifecycle != DaemonLifecycle::Ready {
+        return Err(format!(
+            "daemon must be ready before suspend (currently {:?})",
+            snapshot.lifecycle
+        ));
+    }
     client
         .suspend(snapshot.revision, "desktop preparing for system sleep")
         .await
@@ -80,6 +93,20 @@ fn request_resume(app: AppHandle) {
             }
             Err(error) => {
                 let _ = app.emit("daemon-resume-failed", error);
+            }
+        }
+    });
+}
+
+fn request_suspend(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let client = app.state::<DaemonClient>().inner().clone();
+        match suspend_if_ready(&client).await {
+            Ok(receipt) => {
+                let _ = app.emit("daemon-suspended-for-sleep", receipt);
+            }
+            Err(error) => {
+                let _ = app.emit("daemon-suspend-failed", error);
             }
         }
     });
@@ -133,6 +160,8 @@ pub fn run() {
         .setup(|app| {
             let supervisor = DaemonSupervisor::new(&app.path().app_local_data_dir()?)?;
             app.manage(supervisor.clone());
+            #[cfg(target_os = "macos")]
+            macos_power::install(app.handle().clone());
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let client = app_handle.state::<DaemonClient>().inner().clone();
