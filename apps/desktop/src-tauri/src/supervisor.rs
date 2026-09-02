@@ -24,21 +24,27 @@ struct Inner {
     diagnostics_dir: PathBuf,
     listen: String,
     shutting_down: AtomicBool,
+    exit_authorized: AtomicBool,
 }
 
 impl DaemonSupervisor {
     pub fn new(data_dir: &Path) -> Result<Self, String> {
+        Self::new_with_executable(data_dir, daemon_executable()?)
+    }
+
+    fn new_with_executable(data_dir: &Path, executable: PathBuf) -> Result<Self, String> {
         fs::create_dir_all(data_dir).map_err(|error| error.to_string())?;
         let diagnostics_dir = data_dir.join("diagnostics");
         fs::create_dir_all(&diagnostics_dir).map_err(|error| error.to_string())?;
         Ok(Self {
             inner: Arc::new(Inner {
                 child: Mutex::new(None),
-                executable: daemon_executable()?,
+                executable,
                 database: data_dir.join("bastet-workstation.db"),
                 diagnostics_dir,
                 listen: env::var("BASTET_LISTEN").unwrap_or_else(|_| "127.0.0.1:17841".to_owned()),
                 shutting_down: AtomicBool::new(false),
+                exit_authorized: AtomicBool::new(false),
             }),
         })
     }
@@ -61,8 +67,23 @@ impl DaemonSupervisor {
         Err("daemon did not become ready within three seconds; inspect diagnostics".into())
     }
 
-    pub fn request_shutdown(&self) {
-        self.inner.shutting_down.store(true, Ordering::Release);
+    pub fn begin_shutdown(&self) -> bool {
+        self.inner
+            .shutting_down
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn cancel_shutdown(&self) {
+        self.inner.shutting_down.store(false, Ordering::Release);
+    }
+
+    pub fn authorize_exit(&self) {
+        self.inner.exit_authorized.store(true, Ordering::Release);
+    }
+
+    pub fn exit_authorized(&self) -> bool {
+        self.inner.exit_authorized.load(Ordering::Acquire)
     }
 
     pub fn is_shutting_down(&self) -> bool {
@@ -128,7 +149,11 @@ fn diagnostic_log(path: &Path) -> Result<File, String> {
 }
 
 fn daemon_executable() -> Result<PathBuf, String> {
-    if let Some(path) = env::var_os("BASTET_DAEMON_BIN") {
+    daemon_executable_from(env::var_os("BASTET_DAEMON_BIN"))
+}
+
+fn daemon_executable_from(explicit: Option<std::ffi::OsString>) -> Result<PathBuf, String> {
+    if let Some(path) = explicit {
         return Ok(PathBuf::from(path));
     }
     let current = env::current_exe().map_err(|error| error.to_string())?;
@@ -153,16 +178,29 @@ mod tests {
 
     #[test]
     fn explicit_daemon_path_has_priority() {
-        let key = "BASTET_DAEMON_BIN";
-        let original = env::var_os(key);
-        env::set_var(key, "/tmp/bastet-explicit-daemon");
         assert_eq!(
-            daemon_executable().unwrap(),
+            daemon_executable_from(Some("/tmp/bastet-explicit-daemon".into())).unwrap(),
             PathBuf::from("/tmp/bastet-explicit-daemon")
         );
-        match original {
-            Some(value) => env::set_var(key, value),
-            None => env::remove_var(key),
-        }
+    }
+
+    #[test]
+    fn shutdown_gate_is_single_owner_and_can_recover_after_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let supervisor = DaemonSupervisor::new_with_executable(
+            directory.path(),
+            directory.path().join("missing-daemon"),
+        )
+        .unwrap();
+
+        assert!(supervisor.begin_shutdown());
+        assert!(!supervisor.exit_authorized());
+        supervisor.authorize_exit();
+        assert!(supervisor.exit_authorized());
+        assert!(!supervisor.begin_shutdown());
+        assert!(supervisor.is_shutting_down());
+        supervisor.cancel_shutdown();
+        assert!(!supervisor.is_shutting_down());
+        assert!(supervisor.begin_shutdown());
     }
 }

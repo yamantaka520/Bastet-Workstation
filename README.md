@@ -24,6 +24,7 @@ pnpm build
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 pnpm tauri build --debug --bundles app
+python3 scripts/smoke_m1.py
 ```
 
 ## Project policies

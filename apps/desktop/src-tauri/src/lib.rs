@@ -5,7 +5,7 @@ use bastet_protocol::{CheckpointReceipt, DaemonLifecycle, DaemonSnapshot, PROTOC
 use serde::Serialize;
 use supervisor::DaemonSupervisor;
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{Menu, MenuItem, Submenu},
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager, State, WindowEvent,
 };
@@ -86,15 +86,20 @@ fn request_resume(app: AppHandle) {
 }
 
 fn request_checkpointed_exit(app: AppHandle) {
+    let supervisor = app.state::<DaemonSupervisor>().inner().clone();
+    if !supervisor.begin_shutdown() {
+        return;
+    }
     tauri::async_runtime::spawn(async move {
-        app.state::<DaemonSupervisor>().request_shutdown();
         let client = app.state::<DaemonClient>().inner().clone();
         match checkpoint_for_quit(&client).await {
             Ok(receipt) => {
                 let _ = app.emit("daemon-checkpointed-for-quit", &receipt);
+                supervisor.authorize_exit();
                 app.exit(0);
             }
             Err(error) => {
+                supervisor.cancel_shutdown();
                 let _ = app.emit("quit-checkpoint-failed", error);
             }
         }
@@ -109,6 +114,22 @@ pub fn run() {
             None,
         ))
         .manage(DaemonClient::from_env())
+        .menu(|app| {
+            let quit = MenuItem::with_id(
+                app,
+                "app-quit",
+                "Quit Bastet Workstation",
+                true,
+                Some("CmdOrCtrl+Q"),
+            )?;
+            let application = Submenu::with_items(app, "Bastet Workstation", true, &[&quit])?;
+            Menu::with_items(app, &[&application])
+        })
+        .on_menu_event(|app, event| {
+            if event.id().as_ref() == "app-quit" {
+                request_checkpointed_exit(app.clone());
+            }
+        })
         .setup(|app| {
             let supervisor = DaemonSupervisor::new(&app.path().app_local_data_dir()?)?;
             app.manage(supervisor.clone());
@@ -118,9 +139,6 @@ pub fn run() {
                 loop {
                     if let Err(error) = supervisor.ensure_running(&client).await {
                         let _ = app_handle.emit("daemon-supervision-failed", error);
-                    }
-                    if supervisor.is_shutting_down() {
-                        break;
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
@@ -165,10 +183,15 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building Bastet Workstation")
-        .run(|app, event| {
-            if matches!(event, tauri::RunEvent::Resumed) {
-                request_resume(app.clone());
+        .run(|app, event| match event {
+            tauri::RunEvent::Resumed => request_resume(app.clone()),
+            tauri::RunEvent::ExitRequested { api, .. }
+                if !app.state::<DaemonSupervisor>().exit_authorized() =>
+            {
+                api.prevent_exit();
+                request_checkpointed_exit(app.clone());
             }
+            _ => {}
         });
 }
 

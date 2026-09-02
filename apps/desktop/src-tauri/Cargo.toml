@@ -21,3 +21,6 @@ serde.workspace = true
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2.5.1"
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

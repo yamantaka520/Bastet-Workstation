@@ -68,6 +68,9 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - uses: Swatinem/rust-cache@v2
       - run: pnpm install --frozen-lockfile
       - run: cargo fmt --all -- --check
@@ -75,3 +78,5 @@ jobs:
       - run: cargo test --workspace --locked
       - name: Build desktop with target-specific daemon sidecar
         run: pnpm tauri build --debug --no-bundle
+      - name: Smoke compiled daemon lifecycle and recovery
+        run: python scripts/smoke_m1.py
