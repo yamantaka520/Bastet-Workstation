@@ -75,7 +75,11 @@ verification status; it does not add scope.
   Running -> Succeeded normalization, provider token evidence without invented currency, no write
   receipt, and an empty root before and after execution. The canary exposed and fixed a protocol
   mismatch: `thread/start.sandbox` uses kebab-case (`read-only` / `workspace-write`), while
-  `turn/start.sandboxPolicy.type` uses camelCase. The successful canary does not establish real
-  cancel, resume, write, failure, or crash coverage, so production execution capabilities remain
+  `turn/start.sandboxPolicy.type` uses camelCase. A second explicit real-stdio canary waits for the
+  provider Running event, records the local Cancelling transition, sends `turn/interrupt`, and
+  requires the provider terminal to normalize as Cancelled with the Cancelled failure kind; its
+  isolated root also remains empty. This ordering avoids an observed race when interruption is
+  requested before the client consumes `turn/started`. The successful canaries do not establish
+  real resume, write, failure, or crash coverage, so production execution capabilities remain
   withheld.
 - M2.4–M2.8: not started.
