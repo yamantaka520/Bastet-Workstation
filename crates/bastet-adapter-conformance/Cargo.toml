@@ -1,0 +1,16 @@
+[package]
+name = "bastet-adapter-conformance"
+description = "Deterministic conformance harness for Bastet Workstation Agent adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bastet-core = { path = "../bastet-core" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

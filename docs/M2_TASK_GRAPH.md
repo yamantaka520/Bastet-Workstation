@@ -32,8 +32,13 @@ verification status; it does not add scope.
 - M2.1a contract primitives: committed as `774d075`; typed IDs, durable metadata, opaque
   credential references, policy inheritance, and versioned normalized adapter wire types have
   passing tests.
-- M2.1b concrete entity relationships and validation: complete locally; Project, Role, Session,
-  and Run relationships fail closed on duplicate IDs, missing references, provider mismatch,
-  invalid policy layers, empty provenance, and invalid run timing.
-- M2.1 overall: complete locally; awaiting commit and remote CI for M2.1b.
-- M2.2–M2.8: not started.
+- M2.1b concrete entity relationships and validation: committed as `af72129`; Project, Role,
+  Session, and Run relationships fail closed on duplicate IDs, missing references, provider
+  mismatch, invalid policy layers, empty provenance, and invalid run timing.
+- M2.1 overall: complete; GitHub Actions run `33667253868` passed for `af72129`.
+- M2.2 deterministic conformance harness: in progress; the side-effect-free local fixture now
+  exercises all ten required scenarios and fails closed on malformed events, undeclared
+  capabilities or operations, missing cancel/recovery transitions, secret leakage, unauthorized
+  writes, normalized failures, and invalid cost evidence. Reference adapter integration remains
+  pending.
+- M2.3–M2.8: not started.
