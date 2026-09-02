@@ -1,6 +1,7 @@
 //! Codex CLI discovery and read-only health boundary.
 
 mod app_server;
+mod evidence;
 mod lifecycle;
 mod stdio;
 
@@ -9,6 +10,7 @@ pub use app_server::{
     ModelCatalogPage, ModelDescriptor, ReasoningEffort, ThreadHandle, ThreadSandbox,
     ThreadStartRequest, TransportError, TurnHandle, TurnSandboxPolicy, TurnStartRequest,
 };
+pub use evidence::{CodexRunEvidence, CodexRunEvidenceUpdate, EvidenceError};
 pub use lifecycle::{CodexEventNormalizer, CodexRunStream, LifecycleError, NormalizedCodexEvent};
 pub use stdio::StdioTransport;
 

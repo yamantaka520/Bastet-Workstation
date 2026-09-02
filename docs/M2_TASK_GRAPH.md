@@ -61,5 +61,9 @@ verification status; it does not add scope.
   notifications and unexpected server requests fail closed. A run-scoped stream now routes only
   the configured provider turn ID into lifecycle normalization, ignores unrelated item/turn/error
   notifications, preserves event sequence, and closes authoritatively on `turn/completed`.
-  Duplicate terminal events fail closed. No real thread or turn is launched by these tests.
+  Duplicate terminal events fail closed. Run-scoped evidence normalization now converts non-empty
+  `turn/diff/updated` into a redacted write receipt and `thread/tokenUsage/updated.tokenUsage.last`
+  into provider-reported input/output token evidence. Raw diffs are discarded, and no currency or
+  amount is invented when the provider does not report one. No real thread or turn is launched by
+  these tests.
 - M2.4–M2.8: not started.
