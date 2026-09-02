@@ -8,6 +8,8 @@ M0 is committed locally. Development is now in **M1: desktop and daemon foundati
 
 [`docs/MASTER_PLAN.md`](docs/MASTER_PLAN.md) is the single authority for product scope, architecture, milestones, gates, and accepted decisions. Architecture decisions under [`docs/adr`](docs/adr) record the M0 baseline without replacing that plan.
 
+Current M1 test evidence and explicitly pending gates are tracked in [`docs/M1_VALIDATION.md`](docs/M1_VALIDATION.md).
+
 ## M0 checks
 
 Run the dependency-free baseline validation:
@@ -21,6 +23,7 @@ pnpm test
 pnpm build
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
+pnpm tauri build --debug --bundles app
 ```
 
 ## Project policies

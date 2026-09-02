@@ -28,6 +28,8 @@ pub enum StoreError {
     Database(#[from] rusqlite::Error),
     #[error("state revision conflict: expected {expected}, actual {actual}")]
     RevisionConflict { expected: u64, actual: u64 },
+    #[error("database schema version {actual} is newer than supported version {supported}")]
+    UnsupportedSchemaVersion { actual: u32, supported: u32 },
     #[error("store mutex was poisoned")]
     Poisoned,
 }
@@ -126,24 +128,7 @@ impl Store {
         let mut connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_migrations (
-                version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS daemon_state (
-                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                daemon_id TEXT NOT NULL, revision INTEGER NOT NULL, lifecycle TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS event_journal (
-                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id TEXT NOT NULL UNIQUE, protocol_version INTEGER NOT NULL,
-                event_type TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_json TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS checkpoints (
-                checkpoint_id TEXT PRIMARY KEY, revision INTEGER NOT NULL,
-                event_sequence INTEGER NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL);",
-        )?;
-        connection.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
-            params![SCHEMA_VERSION, timestamp()],
-        )?;
+        apply_migrations(&mut connection)?;
         let initialized = connection.execute(
             "INSERT OR IGNORE INTO daemon_state(singleton, daemon_id, revision, lifecycle)
              VALUES (1, ?1, 0, 'starting')",
@@ -327,6 +312,45 @@ impl Store {
     }
 }
 
+fn apply_migrations(connection: &mut Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
+    )?;
+    let current: u32 = connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    if current > SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchemaVersion {
+            actual: current,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    if current < 1 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS daemon_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                daemon_id TEXT NOT NULL, revision INTEGER NOT NULL, lifecycle TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS event_journal (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE, protocol_version INTEGER NOT NULL,
+                event_type TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_json TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS checkpoints (
+                checkpoint_id TEXT PRIMARY KEY, revision INTEGER NOT NULL,
+                event_sequence INTEGER NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL);",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?1)",
+            [timestamp()],
+        )?;
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
 pub fn has_checkpoint_for_revision(store: &Store, revision: u64) -> Result<bool, StoreError> {
     Ok(store
         .connection()?
@@ -399,6 +423,71 @@ mod tests {
         let store = Store::open(directory.path().join("bastet.db")).unwrap();
         assert_eq!(store.journal_mode().unwrap().to_lowercase(), "wal");
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn upgrades_v0_fixture_without_replacing_existing_identity() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("v0.db");
+        let daemon_id = Uuid::new_v4();
+        let fixture = Connection::open(&path).unwrap();
+        fixture
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+                 CREATE TABLE daemon_state (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    daemon_id TEXT NOT NULL, revision INTEGER NOT NULL, lifecycle TEXT NOT NULL);
+                 CREATE TABLE event_journal (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE, protocol_version INTEGER NOT NULL,
+                    event_type TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_json TEXT NOT NULL);",
+            )
+            .unwrap();
+        fixture
+            .execute(
+                "INSERT INTO daemon_state(singleton, daemon_id, revision, lifecycle)
+                 VALUES (1, ?1, 41, 'ready')",
+                [daemon_id.to_string()],
+            )
+            .unwrap();
+        drop(fixture);
+
+        let upgraded = Store::open(&path).unwrap();
+        let snapshot = upgraded.snapshot().unwrap();
+        assert_eq!(upgraded.schema_version().unwrap(), 1);
+        assert_eq!(snapshot.daemon_id, daemon_id);
+        assert_eq!(snapshot.revision, 42);
+        assert_eq!(snapshot.lifecycle, DaemonLifecycle::Recovering);
+        upgraded
+            .checkpoint(CheckpointCommand {
+                expected_revision: 42,
+                reason: "post-upgrade fixture".into(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn refuses_database_from_a_newer_schema() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("future.db");
+        let fixture = Connection::open(&path).unwrap();
+        fixture
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+                 INSERT INTO schema_migrations(version, applied_at) VALUES (99, 'future');",
+            )
+            .unwrap();
+        drop(fixture);
+
+        assert!(matches!(
+            Store::open(&path),
+            Err(StoreError::UnsupportedSchemaVersion {
+                actual: 99,
+                supported: 1
+            })
+        ));
     }
 
     #[test]

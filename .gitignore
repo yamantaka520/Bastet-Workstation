@@ -16,6 +16,7 @@ __pycache__/
 target/
 node_modules/
 dist/
+apps/desktop/src-tauri/binaries/
 *.tsbuildinfo
 
 # Local data and credentials

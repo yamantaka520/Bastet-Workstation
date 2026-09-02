@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm build && pnpm prepare:sidecar",
     "frontendDist": "../../../dist"
   },
   "app": {
@@ -23,5 +23,8 @@
       "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'"
     }
   },
-  "bundle": { "active": false }
+  "bundle": {
+    "active": true,
+    "externalBin": ["binaries/bastet-daemon"]
+  }
 }
