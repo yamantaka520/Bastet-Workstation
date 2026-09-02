@@ -98,6 +98,7 @@ fn request_resume(app: AppHandle) {
     });
 }
 
+#[cfg(target_os = "macos")]
 fn request_suspend(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let client = app.state::<DaemonClient>().inner().clone();
