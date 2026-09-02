@@ -56,5 +56,8 @@ verification status; it does not add scope.
   cancellation and recovery transitions. Strongly typed fixture-only request boundaries now cover
   `thread/start`, `thread/resume`, `turn/start`, and `turn/interrupt`; they require absolute paths,
   validate workspace-write roots, retain only allowlisted response identifiers, and deliberately
-  expose no danger-full-access policy. No real thread or turn is launched by these tests.
+  expose no danger-full-access policy. The stdio boundary now preserves ordered notifications that
+  arrive while an RPC response is pending and exposes them only after initialization; malformed
+  notifications and unexpected server requests fail closed. No real thread or turn is launched by
+  these tests.
 - M2.4–M2.8: not started.

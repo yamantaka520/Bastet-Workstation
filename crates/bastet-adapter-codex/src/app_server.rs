@@ -6,6 +6,13 @@ use thiserror::Error;
 pub trait AppServerTransport {
     fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError>;
     fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError>;
+    fn next_notification(&mut self) -> Result<AppServerNotification, TransportError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppServerNotification {
+    pub method: String,
+    pub params: Value,
 }
 
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
@@ -278,6 +285,13 @@ impl<T: AppServerTransport> CodexAppServer<T> {
         Ok(())
     }
 
+    pub fn next_notification(&mut self) -> Result<AppServerNotification, AppServerError> {
+        self.require_initialized()?;
+        self.transport
+            .next_notification()
+            .map_err(|_| AppServerError::Transport)
+    }
+
     fn require_initialized(&self) -> Result<(), AppServerError> {
         if self.initialized {
             Ok(())
@@ -425,6 +439,7 @@ mod tests {
     #[derive(Default)]
     struct FixtureTransport {
         responses: VecDeque<Result<Value, TransportError>>,
+        incoming_notifications: VecDeque<Result<AppServerNotification, TransportError>>,
         requests: Vec<(String, Value)>,
         notifications: Vec<(String, Value)>,
     }
@@ -438,6 +453,10 @@ mod tests {
         fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
             self.notifications.push((method.into(), params));
             Ok(())
+        }
+
+        fn next_notification(&mut self) -> Result<AppServerNotification, TransportError> {
+            self.incoming_notifications.pop_front().unwrap()
         }
     }
 
@@ -697,5 +716,25 @@ mod tests {
             server.interrupt_turn("thr_1", "turn_1"),
             Err(AppServerError::ProtocolDrift)
         );
+    }
+
+    #[test]
+    fn notifications_are_available_only_after_initialization() {
+        let notification = AppServerNotification {
+            method: "turn/started".into(),
+            params: json!({ "turn": { "id": "turn_1", "status": "inProgress" } }),
+        };
+        let transport = FixtureTransport {
+            responses: VecDeque::from([Ok(json!({}))]),
+            incoming_notifications: VecDeque::from([Ok(notification.clone())]),
+            ..FixtureTransport::default()
+        };
+        let mut server = CodexAppServer::new(transport);
+        assert_eq!(
+            server.next_notification(),
+            Err(AppServerError::NotInitialized)
+        );
+        server.initialize().unwrap();
+        assert_eq!(server.next_notification().unwrap(), notification);
     }
 }

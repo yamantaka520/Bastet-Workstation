@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     io::{BufRead, BufReader, Write},
     path::Path,
     process::{Child, ChildStdin, Command, Stdio},
@@ -9,12 +10,13 @@ use std::{
 
 use serde_json::{json, Value};
 
-use crate::{AppServerTransport, TransportError};
+use crate::{AppServerNotification, AppServerTransport, TransportError};
 
 pub struct StdioTransport {
     child: Child,
     stdin: Option<ChildStdin>,
     responses: Receiver<Result<Value, TransportError>>,
+    pending_notifications: VecDeque<AppServerNotification>,
     reader: Option<JoinHandle<()>>,
     next_request_id: u64,
     timeout: Duration,
@@ -50,6 +52,7 @@ impl StdioTransport {
             child,
             stdin: Some(stdin),
             responses,
+            pending_notifications: VecDeque::new(),
             reader: Some(reader),
             next_request_id: 0,
             timeout,
@@ -81,6 +84,16 @@ impl StdioTransport {
         stdin.write_all(b"\n").map_err(|_| TransportError)?;
         stdin.flush().map_err(|_| TransportError)
     }
+
+    fn receive_message(&self, deadline: Instant) -> Result<Value, TransportError> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(TransportError)?;
+        match self.responses.recv_timeout(remaining) {
+            Ok(message) => message,
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => Err(TransportError),
+        }
+    }
 }
 
 impl AppServerTransport for StdioTransport {
@@ -94,24 +107,39 @@ impl AppServerTransport for StdioTransport {
         }))?;
         let deadline = Instant::now() + self.timeout;
         loop {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or(TransportError)?;
-            let message = match self.responses.recv_timeout(remaining) {
-                Ok(message) => message?,
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
-                    return Err(TransportError)
-                }
-            };
-            match decode_response(message, request_id)? {
-                ResponseDisposition::Notification => continue,
-                ResponseDisposition::Result(result) => return Ok(result),
+            let message = self.receive_message(deadline)?;
+            if let Some(result) =
+                route_request_message(message, request_id, &mut self.pending_notifications)?
+            {
+                return Ok(result);
             }
         }
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
         self.write_message(&json!({"method": method, "params": params}))
+    }
+
+    fn next_notification(&mut self) -> Result<AppServerNotification, TransportError> {
+        if let Some(notification) = self.pending_notifications.pop_front() {
+            return Ok(notification);
+        }
+        let message = self.receive_message(Instant::now() + self.timeout)?;
+        decode_notification(message)
+    }
+}
+
+fn route_request_message(
+    message: Value,
+    expected_id: u64,
+    pending_notifications: &mut VecDeque<AppServerNotification>,
+) -> Result<Option<Value>, TransportError> {
+    match decode_response(message, expected_id)? {
+        ResponseDisposition::Notification(notification) => {
+            pending_notifications.push_back(notification);
+            Ok(None)
+        }
+        ResponseDisposition::Result(result) => Ok(Some(result)),
     }
 }
 
@@ -122,7 +150,7 @@ impl Drop for StdioTransport {
 }
 
 enum ResponseDisposition {
-    Notification,
+    Notification(AppServerNotification),
     Result(Value),
 }
 
@@ -131,11 +159,7 @@ fn decode_response(
     expected_id: u64,
 ) -> Result<ResponseDisposition, TransportError> {
     let Some(id) = message.get("id") else {
-        return if message.get("method").and_then(Value::as_str).is_some() {
-            Ok(ResponseDisposition::Notification)
-        } else {
-            Err(TransportError)
-        };
+        return decode_notification(message).map(ResponseDisposition::Notification);
     };
     if id.as_u64() != Some(expected_id) {
         return Err(TransportError);
@@ -150,6 +174,22 @@ fn decode_response(
         .ok_or(TransportError)
 }
 
+fn decode_notification(message: Value) -> Result<AppServerNotification, TransportError> {
+    if message.get("id").is_some() {
+        return Err(TransportError);
+    }
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(TransportError)?;
+    let params = message.get("params").cloned().ok_or(TransportError)?;
+    Ok(AppServerNotification {
+        method: method.into(),
+        params,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,16 +199,44 @@ mod tests {
         let response = decode_response(json!({"id": 7, "result": {"ok": true}}), 7).unwrap();
         match response {
             ResponseDisposition::Result(value) => assert_eq!(value["ok"], true),
-            ResponseDisposition::Notification => panic!("expected response"),
+            ResponseDisposition::Notification(_) => panic!("expected response"),
         }
     }
 
     #[test]
     fn notifications_can_be_skipped_while_waiting() {
-        assert!(matches!(
-            decode_response(json!({"method": "server/notice", "params": {}}), 7).unwrap(),
-            ResponseDisposition::Notification
-        ));
+        let disposition =
+            decode_response(json!({"method": "server/notice", "params": {}}), 7).unwrap();
+        assert_eq!(
+            match disposition {
+                ResponseDisposition::Notification(notification) => notification,
+                ResponseDisposition::Result(_) => panic!("expected notification"),
+            },
+            AppServerNotification {
+                method: "server/notice".into(),
+                params: json!({})
+            }
+        );
+    }
+
+    #[test]
+    fn notifications_seen_before_a_response_are_preserved_in_order() {
+        let mut pending = VecDeque::new();
+        assert_eq!(
+            route_request_message(
+                json!({"method": "turn/started", "params": {"turn": {"id": "turn_1"}}}),
+                7,
+                &mut pending,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            route_request_message(json!({"id": 7, "result": {"ok": true}}), 7, &mut pending)
+                .unwrap(),
+            Some(json!({"ok": true}))
+        );
+        assert_eq!(pending.pop_front().unwrap().method, "turn/started");
     }
 
     #[test]
@@ -179,5 +247,8 @@ mod tests {
             7
         )
         .is_err());
+        assert!(decode_notification(json!({"method": "", "params": {}})).is_err());
+        assert!(decode_notification(json!({"method": "turn/started"})).is_err());
+        assert!(decode_notification(json!({"id": 3, "method": "approval"})).is_err());
     }
 }
