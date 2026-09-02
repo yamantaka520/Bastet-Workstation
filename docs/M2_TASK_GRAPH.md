@@ -29,8 +29,11 @@ verification status; it does not add scope.
 
 ## Status
 
-- M2.1a contract primitives: complete locally; typed IDs, durable metadata, opaque credential
-  references, policy inheritance, and versioned normalized adapter wire types have passing tests.
-- M2.1b concrete entity relationships and validation: not started.
-- M2.1 overall: in progress.
+- M2.1a contract primitives: committed as `774d075`; typed IDs, durable metadata, opaque
+  credential references, policy inheritance, and versioned normalized adapter wire types have
+  passing tests.
+- M2.1b concrete entity relationships and validation: complete locally; Project, Role, Session,
+  and Run relationships fail closed on duplicate IDs, missing references, provider mismatch,
+  invalid policy layers, empty provenance, and invalid run timing.
+- M2.1 overall: complete locally; awaiting commit and remote CI for M2.1b.
 - M2.2–M2.8: not started.

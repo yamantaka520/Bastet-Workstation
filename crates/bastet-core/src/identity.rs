@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::{NormalizedRunState, ScopedPolicy};
+
 macro_rules! stable_id {
     ($name:ident) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -115,6 +117,40 @@ pub struct AgentInstance {
     pub agent_provider_id: AgentProviderId,
     pub account_id: Option<AccountId>,
     pub default_model_id: Option<ModelId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Project {
+    pub metadata: EntityMetadata<ProjectId>,
+    pub name: String,
+    pub workspace_root: String,
+    pub policy: ScopedPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Role {
+    pub metadata: EntityMetadata<RoleId>,
+    pub name: String,
+    pub responsibilities: Vec<String>,
+    pub policy: ScopedPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Session {
+    pub metadata: EntityMetadata<SessionId>,
+    pub agent_instance_id: AgentInstanceId,
+    pub project_id: ProjectId,
+    pub provider_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Run {
+    pub metadata: EntityMetadata<RunId>,
+    pub session_id: SessionId,
+    pub model_id: ModelId,
+    pub state: NormalizedRunState,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
 }
 
 #[cfg(test)]
