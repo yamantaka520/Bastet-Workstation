@@ -29,9 +29,10 @@ This document records evidence for M1 without replacing the milestone definition
 | macOS app bundle | `.app/Contents/MacOS` contains `bastet-desktop` and `bastet-daemon`; bundled sidecar reached revision 13 `ready` | Pass |
 | Close to tray | Closing the main window hid it while daemon health remained `ready` | Pass |
 | Opt-in auto-start | UI exposed an unchecked auto-start control | Pass |
+| Simulated sleep/wake | Real loopback daemon transitioned `ready` revision 1 → `suspended` revision 2, rejected ordinary checkpoint with HTTP 409, resumed to `ready` revision 3, then shut down with checkpoint revision 4 | Pass |
 | Signed distribution | Debug app is unsigned and fails strict `codesign` verification | Pending release work |
 | Tray-menu explicit quit | Backend path is covered by shutdown integration tests; direct tray click not yet captured | Pending manual smoke |
-| Sleep/wake | Not run because putting the active workstation to sleep is disruptive | Pending explicit manual smoke |
+| Physical sleep/wake | Not run because putting the active workstation to sleep is disruptive; protocol and Tauri resume path are covered by simulation | Pending explicit manual smoke |
 
 ## Remaining M1 gate
 

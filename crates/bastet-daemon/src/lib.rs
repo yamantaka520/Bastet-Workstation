@@ -30,6 +30,11 @@ pub enum StoreError {
     RevisionConflict { expected: u64, actual: u64 },
     #[error("database schema version {actual} is newer than supported version {supported}")]
     UnsupportedSchemaVersion { actual: u32, supported: u32 },
+    #[error("invalid daemon lifecycle: expected {expected}, actual {actual}")]
+    InvalidLifecycle {
+        expected: &'static str,
+        actual: String,
+    },
     #[error("store mutex was poisoned")]
     Poisoned,
 }
@@ -64,6 +69,8 @@ fn build_router(store: Store, shutdown_signal: Option<watch::Sender<bool>>) -> R
         .route("/v1/health", get(health))
         .route("/v1/events", get(events))
         .route("/v1/checkpoints", post(checkpoint))
+        .route("/v1/power/suspend", post(suspend))
+        .route("/v1/power/resume", post(resume))
         .route("/v1/shutdown", post(shutdown))
         .with_state(AppState {
             store,
@@ -100,6 +107,20 @@ async fn shutdown(
     Ok(Json(receipt))
 }
 
+async fn suspend(
+    State(state): State<AppState>,
+    Json(command): Json<CheckpointCommand>,
+) -> Result<Json<CheckpointReceipt>, ApiError> {
+    Ok(Json(state.store.suspend(command)?))
+}
+
+async fn resume(
+    State(state): State<AppState>,
+    Json(command): Json<CheckpointCommand>,
+) -> Result<Json<EventEnvelope>, ApiError> {
+    Ok(Json(state.store.resume(command)?))
+}
+
 struct ApiError(StoreError);
 
 impl From<StoreError> for ApiError {
@@ -110,7 +131,10 @@ impl From<StoreError> for ApiError {
 
 impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let status = if matches!(self.0, StoreError::RevisionConflict { .. }) {
+        let status = if matches!(
+            self.0,
+            StoreError::RevisionConflict { .. } | StoreError::InvalidLifecycle { .. }
+        ) {
             StatusCode::CONFLICT
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
@@ -189,35 +213,92 @@ impl Store {
     }
 
     pub fn checkpoint(&self, command: CheckpointCommand) -> Result<CheckpointReceipt, StoreError> {
-        self.persist_checkpoint(command, DaemonLifecycle::Ready, "daemon.checkpointed")
+        self.persist_checkpoint(
+            command,
+            Some("ready"),
+            DaemonLifecycle::Ready,
+            "daemon.checkpointed",
+        )
     }
 
     pub fn shutdown(&self, command: CheckpointCommand) -> Result<CheckpointReceipt, StoreError> {
         self.persist_checkpoint(
             command,
+            None,
             DaemonLifecycle::Stopping,
             "daemon.shutdown_requested",
         )
     }
 
-    fn persist_checkpoint(
-        &self,
-        command: CheckpointCommand,
-        final_lifecycle: DaemonLifecycle,
-        event_type: &str,
-    ) -> Result<CheckpointReceipt, StoreError> {
+    pub fn suspend(&self, command: CheckpointCommand) -> Result<CheckpointReceipt, StoreError> {
+        self.persist_checkpoint(
+            command,
+            Some("ready"),
+            DaemonLifecycle::Suspended,
+            "daemon.suspended",
+        )
+    }
+
+    pub fn resume(&self, command: CheckpointCommand) -> Result<EventEnvelope, StoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let actual: u64 = transaction.query_row(
-            "SELECT revision FROM daemon_state WHERE singleton = 1",
+        let (actual, lifecycle): (u64, String) = transaction.query_row(
+            "SELECT revision, lifecycle FROM daemon_state WHERE singleton = 1",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         if actual != command.expected_revision {
             return Err(StoreError::RevisionConflict {
                 expected: command.expected_revision,
                 actual,
             });
+        }
+        if lifecycle != "suspended" {
+            return Err(StoreError::InvalidLifecycle {
+                expected: "suspended",
+                actual: lifecycle,
+            });
+        }
+        transaction.execute(
+            "UPDATE daemon_state SET revision = ?1, lifecycle = 'ready' WHERE singleton = 1",
+            [actual + 1],
+        )?;
+        let event = insert_event(
+            &transaction,
+            "daemon.resumed",
+            &serde_json::json!({"reason": command.reason}).to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(event)
+    }
+
+    fn persist_checkpoint(
+        &self,
+        command: CheckpointCommand,
+        required_lifecycle: Option<&'static str>,
+        final_lifecycle: DaemonLifecycle,
+        event_type: &str,
+    ) -> Result<CheckpointReceipt, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (actual, lifecycle): (u64, String) = transaction.query_row(
+            "SELECT revision, lifecycle FROM daemon_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if actual != command.expected_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: command.expected_revision,
+                actual,
+            });
+        }
+        if let Some(expected) = required_lifecycle {
+            if lifecycle != expected {
+                return Err(StoreError::InvalidLifecycle {
+                    expected,
+                    actual: lifecycle,
+                });
+            }
         }
         let revision = actual + 1;
         transaction.execute(
@@ -389,6 +470,7 @@ fn lifecycle_name(value: &DaemonLifecycle) -> &'static str {
         DaemonLifecycle::Starting => "starting",
         DaemonLifecycle::Ready => "ready",
         DaemonLifecycle::Checkpointing => "checkpointing",
+        DaemonLifecycle::Suspended => "suspended",
         DaemonLifecycle::Stopping => "stopping",
         DaemonLifecycle::Recovering => "recovering",
     }
@@ -398,6 +480,7 @@ fn parse_lifecycle(value: &str) -> DaemonLifecycle {
     match value {
         "ready" => DaemonLifecycle::Ready,
         "checkpointing" => DaemonLifecycle::Checkpointing,
+        "suspended" => DaemonLifecycle::Suspended,
         "stopping" => DaemonLifecycle::Stopping,
         "recovering" => DaemonLifecycle::Recovering,
         _ => DaemonLifecycle::Starting,
@@ -459,9 +542,10 @@ mod tests {
         assert_eq!(snapshot.daemon_id, daemon_id);
         assert_eq!(snapshot.revision, 42);
         assert_eq!(snapshot.lifecycle, DaemonLifecycle::Recovering);
+        upgraded.mark_ready().unwrap();
         upgraded
             .checkpoint(CheckpointCommand {
-                expected_revision: 42,
+                expected_revision: 43,
                 reason: "post-upgrade fixture".into(),
             })
             .unwrap();
@@ -558,6 +642,45 @@ mod tests {
             events.last().unwrap().event_type,
             "daemon.shutdown_requested"
         );
+    }
+
+    #[test]
+    fn suspend_checkpoints_before_resume_advances_state() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("bastet.db")).unwrap();
+        store.mark_ready().unwrap();
+        let receipt = store
+            .suspend(CheckpointCommand {
+                expected_revision: 1,
+                reason: "simulated system sleep".into(),
+            })
+            .unwrap();
+        assert!(has_checkpoint_for_revision(&store, receipt.revision).unwrap());
+        assert_eq!(
+            store.snapshot().unwrap().lifecycle,
+            DaemonLifecycle::Suspended
+        );
+        assert!(matches!(
+            store.checkpoint(CheckpointCommand {
+                expected_revision: receipt.revision,
+                reason: "must not admit work while suspended".into(),
+            }),
+            Err(StoreError::InvalidLifecycle {
+                expected: "ready",
+                ..
+            })
+        ));
+
+        let resumed = store
+            .resume(CheckpointCommand {
+                expected_revision: receipt.revision,
+                reason: "simulated system wake".into(),
+            })
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(snapshot.revision, receipt.revision + 1);
+        assert_eq!(snapshot.lifecycle, DaemonLifecycle::Ready);
+        assert_eq!(resumed.event_type, "daemon.resumed");
     }
 
     #[test]

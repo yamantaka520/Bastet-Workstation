@@ -1,7 +1,7 @@
 mod supervisor;
 
 use bastet_client::DaemonClient;
-use bastet_protocol::{CheckpointReceipt, DaemonSnapshot, PROTOCOL_VERSION};
+use bastet_protocol::{CheckpointReceipt, DaemonLifecycle, DaemonSnapshot, PROTOCOL_VERSION};
 use serde::Serialize;
 use supervisor::DaemonSupervisor;
 use tauri::{
@@ -43,6 +43,46 @@ async fn checkpoint_for_quit(client: &DaemonClient) -> Result<CheckpointReceipt,
         .shutdown(snapshot.revision, "explicit desktop quit")
         .await
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn prepare_for_sleep(client: State<'_, DaemonClient>) -> Result<CheckpointReceipt, String> {
+    let snapshot = client.snapshot().await.map_err(|error| error.to_string())?;
+    client
+        .suspend(snapshot.revision, "desktop preparing for system sleep")
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn resume_if_suspended(client: &DaemonClient) -> Result<DaemonSnapshot, String> {
+    let snapshot = client.snapshot().await.map_err(|error| error.to_string())?;
+    if snapshot.lifecycle == DaemonLifecycle::Suspended {
+        client
+            .resume(snapshot.revision, "desktop resumed after system wake")
+            .await
+            .map_err(|error| error.to_string())?;
+        return client.snapshot().await.map_err(|error| error.to_string());
+    }
+    Ok(snapshot)
+}
+
+#[tauri::command]
+async fn resume_after_wake(client: State<'_, DaemonClient>) -> Result<DaemonSnapshot, String> {
+    resume_if_suspended(&client).await
+}
+
+fn request_resume(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let client = app.state::<DaemonClient>().inner().clone();
+        match resume_if_suspended(&client).await {
+            Ok(snapshot) => {
+                let _ = app.emit("daemon-resumed-after-wake", snapshot);
+            }
+            Err(error) => {
+                let _ = app.emit("daemon-resume-failed", error);
+            }
+        }
+    });
 }
 
 fn request_checkpointed_exit(app: AppHandle) {
@@ -117,9 +157,19 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .invoke_handler(tauri::generate_handler![bootstrap_state, daemon_snapshot])
-        .run(tauri::generate_context!())
-        .expect("error while running Bastet Workstation");
+        .invoke_handler(tauri::generate_handler![
+            bootstrap_state,
+            daemon_snapshot,
+            prepare_for_sleep,
+            resume_after_wake
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building Bastet Workstation")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Resumed) {
+                request_resume(app.clone());
+            }
+        });
 }
 
 #[cfg(test)]

@@ -1,6 +1,8 @@
 use std::{env, time::Duration};
 
-use bastet_protocol::{CheckpointCommand, CheckpointReceipt, DaemonSnapshot, PROTOCOL_VERSION};
+use bastet_protocol::{
+    CheckpointCommand, CheckpointReceipt, DaemonSnapshot, EventEnvelope, PROTOCOL_VERSION,
+};
 use thiserror::Error;
 
 #[derive(Clone)]
@@ -89,6 +91,58 @@ impl DaemonClient {
         require_protocol(receipt.protocol_version)?;
         Ok(receipt)
     }
+
+    pub async fn suspend(
+        &self,
+        expected_revision: u64,
+        reason: impl Into<String>,
+    ) -> Result<CheckpointReceipt, ClientError> {
+        self.post_checkpoint("/v1/power/suspend", expected_revision, reason)
+            .await
+    }
+
+    pub async fn resume(
+        &self,
+        expected_revision: u64,
+        reason: impl Into<String>,
+    ) -> Result<EventEnvelope, ClientError> {
+        let event = self
+            .http
+            .post(format!("{}/v1/power/resume", self.base_url))
+            .json(&CheckpointCommand {
+                expected_revision,
+                reason: reason.into(),
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<EventEnvelope>()
+            .await?;
+        require_protocol(event.protocol_version)?;
+        Ok(event)
+    }
+
+    async fn post_checkpoint(
+        &self,
+        path: &str,
+        expected_revision: u64,
+        reason: impl Into<String>,
+    ) -> Result<CheckpointReceipt, ClientError> {
+        let receipt = self
+            .http
+            .post(format!("{}{path}", self.base_url))
+            .json(&CheckpointCommand {
+                expected_revision,
+                reason: reason.into(),
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<CheckpointReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
 }
 
 fn require_protocol(actual: u32) -> Result<(), ClientError> {
@@ -135,11 +189,36 @@ mod tests {
         assert_eq!(receipt.revision, initial.revision + 1);
         assert_eq!(client.snapshot().await.unwrap().revision, receipt.revision);
         assert_eq!(store.events_after(0).unwrap().len(), 2);
-        let shutdown = client
-            .shutdown(receipt.revision, "client integration shutdown")
+        let suspended = client
+            .suspend(receipt.revision, "integration simulated sleep")
             .await
             .unwrap();
-        assert_eq!(shutdown.revision, receipt.revision + 1);
+        assert_eq!(
+            client.snapshot().await.unwrap().lifecycle,
+            bastet_protocol::DaemonLifecycle::Suspended
+        );
+        let rejected = client
+            .checkpoint(suspended.revision, "must be rejected while suspended")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            rejected,
+            ClientError::Request(ref error)
+                if error.status() == Some(reqwest::StatusCode::CONFLICT)
+        ));
+        client
+            .resume(suspended.revision, "integration simulated wake")
+            .await
+            .unwrap();
+        assert_eq!(
+            client.snapshot().await.unwrap().lifecycle,
+            bastet_protocol::DaemonLifecycle::Ready
+        );
+        let shutdown = client
+            .shutdown(suspended.revision + 1, "client integration shutdown")
+            .await
+            .unwrap();
+        assert_eq!(shutdown.revision, suspended.revision + 2);
         tokio::time::timeout(Duration::from_secs(2), server)
             .await
             .expect("server must stop after durable shutdown receipt")

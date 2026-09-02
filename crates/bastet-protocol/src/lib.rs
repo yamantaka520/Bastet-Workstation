@@ -11,6 +11,7 @@ pub enum DaemonLifecycle {
     Starting,
     Ready,
     Checkpointing,
+    Suspended,
     Stopping,
     Recovering,
 }
@@ -55,5 +56,9 @@ mod tests {
     fn protocol_serializes_stable_snake_case_states() {
         let json = serde_json::to_string(&DaemonLifecycle::Checkpointing).unwrap();
         assert_eq!(json, "\"checkpointing\"");
+        assert_eq!(
+            serde_json::to_string(&DaemonLifecycle::Suspended).unwrap(),
+            "\"suspended\""
+        );
     }
 }
