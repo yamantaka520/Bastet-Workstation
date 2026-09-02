@@ -16,6 +16,7 @@ __pycache__/
 target/
 node_modules/
 dist/
+*.tsbuildinfo
 
 # Local data and credentials
 *.db

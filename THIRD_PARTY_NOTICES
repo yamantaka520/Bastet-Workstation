@@ -1,6 +1,38 @@
 # Third-Party Notices
 
-Bastet Workstation M0 contains no bundled runtime dependencies, third-party binaries, fonts, audio, Pet assets, room assets, role definitions, or Skill packages.
+Bastet Workstation M0 contained no runtime dependencies. M1 introduces the following direct source dependencies; exact transitive versions and integrity hashes are locked in Cargo.lock and pnpm-lock.yaml.
+
+## Rust direct dependencies
+
+| Component | Version | Source | License |
+|---|---:|---|---|
+| Tauri / tauri-build | 2.11.5 / 2.6.3 | https://github.com/tauri-apps/tauri | Apache-2.0 OR MIT |
+| tauri-plugin-autostart | 2.5.1 | https://github.com/tauri-apps/plugins-workspace | Apache-2.0 OR MIT |
+| anyhow | 1.0.104 | https://crates.io/crates/anyhow | Apache-2.0 OR MIT |
+| axum | 0.8.9 | https://crates.io/crates/axum | MIT |
+| rusqlite | 0.37.0 | https://crates.io/crates/rusqlite | MIT |
+| reqwest | 0.13.4 | https://crates.io/crates/reqwest | Apache-2.0 OR MIT |
+| serde / serde_json | 1.0.229 / 1.0.151 | https://github.com/serde-rs/serde | Apache-2.0 OR MIT |
+| thiserror | 2.0.20 | https://crates.io/crates/thiserror | Apache-2.0 OR MIT |
+| tokio | 1.53.1 | https://github.com/tokio-rs/tokio | MIT |
+| uuid | 1.26.0 | https://github.com/uuid-rs/uuid | Apache-2.0 OR MIT |
+| tempfile (development) | 3.27.0 | https://crates.io/crates/tempfile | Apache-2.0 OR MIT |
+
+## JavaScript direct dependencies
+
+| Component | Version | Source | License |
+|---|---:|---|---|
+| @tauri-apps/api / cli | 2.11.1 / 2.11.4 | https://github.com/tauri-apps/tauri | Apache-2.0 OR MIT |
+| @tauri-apps/plugin-autostart | 2.5.1 | https://github.com/tauri-apps/plugins-workspace | Apache-2.0 OR MIT |
+| React / React DOM | 19.2.8 | https://github.com/facebook/react | MIT |
+| Vite / plugin-react | 7.3.6 / 5.2.0 | https://github.com/vitejs/vite | MIT |
+| Vitest | 3.2.7 | https://github.com/vitest-dev/vitest | MIT |
+| TypeScript | 5.9.3 | https://github.com/microsoft/TypeScript | Apache-2.0 |
+| Testing Library react / jest-dom | 16.3.3 / 6.9.1 | https://github.com/testing-library | MIT |
+| jsdom | 26.1.0 | https://github.com/jsdom/jsdom | MIT |
+| React type definitions | 19.2.18 / 19.2.5 | https://github.com/DefinitelyTyped/DefinitelyTyped | MIT |
+
+No third-party Agent binaries, fonts, audio, Pet assets, room assets, role definitions, or Skill packages are bundled at this stage.
 
 Future additions must record at least the component or asset name, version, source, copyright holder, license, modifications, and redistribution or attribution requirements before distribution. Generated assets must also record model/provider provenance and declared usage rights.
 

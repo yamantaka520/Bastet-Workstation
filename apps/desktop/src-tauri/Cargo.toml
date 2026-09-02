@@ -1,0 +1,23 @@
+[package]
+name = "bastet-desktop"
+description = "Tauri desktop shell for Bastet Workstation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "bastet_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+bastet-client = { path = "../../../crates/bastet-client" }
+bastet-protocol = { path = "../../../crates/bastet-protocol" }
+serde.workspace = true
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-autostart = "2.5.1"
+tokio.workspace = true

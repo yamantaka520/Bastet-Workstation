@@ -20,6 +20,9 @@ REQUIRED_FILES = (
     "docs/MASTER_PLAN.md",
     "docs/adr/README.md",
     ".github/workflows/ci.yml",
+    "Cargo.toml",
+    "package.json",
+    "rust-toolchain.toml",
 )
 ADR_FILES = tuple(f"docs/adr/{number:04d}-{slug}.md" for number, slug in (
     (1, "product-scope-and-mvp"),

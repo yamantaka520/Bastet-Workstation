@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">Bastet Workstation M1 placeholder icon</title>
+  <rect width="512" height="512" rx="112" fill="#162016"/>
+  <path d="M128 112h116c82 0 140 41 140 105 0 38-21 68-58 85 48 15 74 49 74 94H288c0-28-20-44-58-44h-10v44H128V112zm92 86v72h20c34 0 52-13 52-36s-18-36-52-36h-20z" fill="#f2f0e8"/>
+  <circle cx="365" cy="144" r="32" fill="#b9d36a"/>
+</svg>

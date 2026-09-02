@@ -22,7 +22,8 @@ class M0BaselineTests(unittest.TestCase):
             for relative in (
                 "README.md", "LICENSE", "NOTICE", "THIRD_PARTY_NOTICES",
                 "CONTRIBUTING.md", "SECURITY.md", "REUSE.toml", "docs/MASTER_PLAN.md",
-                "docs/adr/README.md", ".github/workflows/ci.yml",
+                "docs/adr/README.md", ".github/workflows/ci.yml", "Cargo.toml",
+                "package.json", "rust-toolchain.toml",
             ):
                 path = root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)

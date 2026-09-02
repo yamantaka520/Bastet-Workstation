@@ -1,0 +1,19 @@
+[package]
+name = "bastet-client"
+description = "Versioned loopback client for the Bastet Workstation daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bastet-protocol = { path = "../bastet-protocol" }
+reqwest.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+bastet-daemon = { path = "../bastet-daemon" }
+tempfile.workspace = true
+tokio.workspace = true

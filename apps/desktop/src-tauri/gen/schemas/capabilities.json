@@ -1,0 +1,1 @@
+{"main":{"identifier":"main","description":"Minimal permissions for the Bastet Workstation main window","local":true,"windows":["main"],"permissions":["core:default","autostart:allow-enable","autostart:allow-disable","autostart:allow-is-enabled"],"platforms":["linux","macOS","windows"]}}
