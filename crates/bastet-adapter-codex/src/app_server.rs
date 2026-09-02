@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub trait AppServerTransport {
@@ -19,6 +20,62 @@ pub enum AppServerError {
     NotInitialized,
     #[error("Codex app-server output did not match the expected protocol")]
     ProtocolDrift,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ApprovalPolicy {
+    Never,
+    UnlessTrusted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ThreadSandbox {
+    ReadOnly,
+    WorkspaceWrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum TurnSandboxPolicy {
+    ReadOnly,
+    WorkspaceWrite {
+        #[serde(rename = "writableRoots")]
+        writable_roots: Vec<PathBuf>,
+        #[serde(rename = "networkAccess")]
+        network_access: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadStartRequest {
+    pub model: String,
+    pub cwd: PathBuf,
+    pub approval_policy: ApprovalPolicy,
+    pub sandbox: ThreadSandbox,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnStartRequest {
+    pub thread_id: String,
+    pub prompt: String,
+    pub cwd: PathBuf,
+    pub approval_policy: ApprovalPolicy,
+    pub sandbox_policy: TurnSandboxPolicy,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadHandle {
+    pub thread_id: String,
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnHandle {
+    pub turn_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,9 +183,177 @@ impl<T: AppServerTransport> CodexAppServer<T> {
         })
     }
 
+    pub fn start_thread(
+        &mut self,
+        request: ThreadStartRequest,
+    ) -> Result<ThreadHandle, AppServerError> {
+        self.require_initialized()?;
+        require_text(&request.model)?;
+        require_absolute(&request.cwd)?;
+        let result = self
+            .transport
+            .request(
+                "thread/start",
+                json!({
+                    "model": request.model,
+                    "cwd": request.cwd,
+                    "approvalPolicy": request.approval_policy,
+                    "sandbox": request.sandbox,
+                    "serviceName": "bastet_workstation"
+                }),
+            )
+            .map_err(|_| AppServerError::Transport)?;
+        parse_thread_handle(result)
+    }
+
+    pub fn resume_thread(&mut self, thread_id: &str) -> Result<ThreadHandle, AppServerError> {
+        self.require_initialized()?;
+        require_text(thread_id)?;
+        let result = self
+            .transport
+            .request("thread/resume", json!({ "threadId": thread_id }))
+            .map_err(|_| AppServerError::Transport)?;
+        parse_thread_handle(result)
+    }
+
+    pub fn start_turn(&mut self, request: TurnStartRequest) -> Result<TurnHandle, AppServerError> {
+        self.require_initialized()?;
+        require_text(&request.thread_id)?;
+        require_text(&request.prompt)?;
+        require_absolute(&request.cwd)?;
+        validate_sandbox_policy(&request.sandbox_policy)?;
+        if request
+            .model
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+            || request
+                .effort
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(AppServerError::ProtocolDrift);
+        }
+        let mut params = json!({
+            "threadId": request.thread_id,
+            "input": [{ "type": "text", "text": request.prompt }],
+            "cwd": request.cwd,
+            "approvalPolicy": request.approval_policy,
+            "sandboxPolicy": request.sandbox_policy
+        });
+        let object = params
+            .as_object_mut()
+            .expect("turn parameters are an object");
+        if let Some(model) = request.model {
+            object.insert("model".into(), Value::String(model));
+        }
+        if let Some(effort) = request.effort {
+            object.insert("effort".into(), Value::String(effort));
+        }
+        let result = self
+            .transport
+            .request("turn/start", params)
+            .map_err(|_| AppServerError::Transport)?;
+        let wire: TurnResultWire =
+            serde_json::from_value(result).map_err(|_| AppServerError::ProtocolDrift)?;
+        require_text(&wire.turn.id)?;
+        Ok(TurnHandle {
+            turn_id: wire.turn.id,
+        })
+    }
+
+    pub fn interrupt_turn(&mut self, thread_id: &str, turn_id: &str) -> Result<(), AppServerError> {
+        self.require_initialized()?;
+        require_text(thread_id)?;
+        require_text(turn_id)?;
+        let result = self
+            .transport
+            .request(
+                "turn/interrupt",
+                json!({ "threadId": thread_id, "turnId": turn_id }),
+            )
+            .map_err(|_| AppServerError::Transport)?;
+        if result.as_object().is_none_or(|object| !object.is_empty()) {
+            return Err(AppServerError::ProtocolDrift);
+        }
+        Ok(())
+    }
+
+    fn require_initialized(&self) -> Result<(), AppServerError> {
+        if self.initialized {
+            Ok(())
+        } else {
+            Err(AppServerError::NotInitialized)
+        }
+    }
+
     pub fn into_transport(self) -> T {
         self.transport
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadResultWire {
+    thread: ThreadWire,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadWire {
+    id: String,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TurnResultWire {
+    turn: TurnWire,
+}
+
+#[derive(Debug, Deserialize)]
+struct TurnWire {
+    id: String,
+}
+
+fn parse_thread_handle(result: Value) -> Result<ThreadHandle, AppServerError> {
+    let wire: ThreadResultWire =
+        serde_json::from_value(result).map_err(|_| AppServerError::ProtocolDrift)?;
+    require_text(&wire.thread.id)?;
+    if wire
+        .thread
+        .session_id
+        .as_ref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(AppServerError::ProtocolDrift);
+    }
+    Ok(ThreadHandle {
+        thread_id: wire.thread.id,
+        session_id: wire.thread.session_id,
+    })
+}
+
+fn require_text(value: &str) -> Result<(), AppServerError> {
+    if value.trim().is_empty() {
+        Err(AppServerError::ProtocolDrift)
+    } else {
+        Ok(())
+    }
+}
+
+fn require_absolute(path: &Path) -> Result<(), AppServerError> {
+    if path.is_absolute() {
+        Ok(())
+    } else {
+        Err(AppServerError::ProtocolDrift)
+    }
+}
+
+fn validate_sandbox_policy(policy: &TurnSandboxPolicy) -> Result<(), AppServerError> {
+    if let TurnSandboxPolicy::WorkspaceWrite { writable_roots, .. } = policy {
+        if writable_roots.is_empty() || writable_roots.iter().any(|path| !path.is_absolute()) {
+            return Err(AppServerError::ProtocolDrift);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -305,6 +530,171 @@ mod tests {
         server.initialize().unwrap();
         assert_eq!(
             server.list_models(None, 20),
+            Err(AppServerError::ProtocolDrift)
+        );
+    }
+
+    fn initialized_server_with(
+        responses: impl IntoIterator<Item = Value>,
+    ) -> CodexAppServer<FixtureTransport> {
+        let mut queue = VecDeque::from([Ok(json!({}))]);
+        queue.extend(responses.into_iter().map(Ok));
+        let mut server = CodexAppServer::new(FixtureTransport {
+            responses: queue,
+            ..FixtureTransport::default()
+        });
+        server.initialize().unwrap();
+        server
+    }
+
+    #[test]
+    fn thread_start_and_resume_use_allowlisted_protocol_fields() {
+        let mut server = initialized_server_with([
+            json!({ "thread": { "id": "thr_1", "sessionId": "session_1", "preview": "discard" } }),
+            json!({ "thread": { "id": "thr_1", "ephemeral": false } }),
+        ]);
+        let started = server
+            .start_thread(ThreadStartRequest {
+                model: "gpt-fixture".into(),
+                cwd: PathBuf::from("/workspace/project"),
+                approval_policy: ApprovalPolicy::Never,
+                sandbox: ThreadSandbox::WorkspaceWrite,
+            })
+            .unwrap();
+        assert_eq!(started.session_id.as_deref(), Some("session_1"));
+        let resumed = server.resume_thread("thr_1").unwrap();
+        assert_eq!(resumed.thread_id, "thr_1");
+
+        let transport = server.into_transport();
+        assert_eq!(transport.requests[1].0, "thread/start");
+        assert_eq!(
+            transport.requests[1].1,
+            json!({
+                "model": "gpt-fixture",
+                "cwd": "/workspace/project",
+                "approvalPolicy": "never",
+                "sandbox": "workspaceWrite",
+                "serviceName": "bastet_workstation"
+            })
+        );
+        assert_eq!(
+            transport.requests[2],
+            ("thread/resume".into(), json!({ "threadId": "thr_1" }))
+        );
+    }
+
+    #[test]
+    fn turn_start_and_interrupt_use_typed_policy_and_exact_ids() {
+        let mut server = initialized_server_with([
+            json!({ "turn": { "id": "turn_1", "status": "inProgress", "items": [] } }),
+            json!({}),
+        ]);
+        let turn = server
+            .start_turn(TurnStartRequest {
+                thread_id: "thr_1".into(),
+                prompt: "Run tests".into(),
+                cwd: PathBuf::from("/workspace/project"),
+                approval_policy: ApprovalPolicy::UnlessTrusted,
+                sandbox_policy: TurnSandboxPolicy::WorkspaceWrite {
+                    writable_roots: vec![PathBuf::from("/workspace/project")],
+                    network_access: false,
+                },
+                model: Some("gpt-fixture".into()),
+                effort: Some("medium".into()),
+            })
+            .unwrap();
+        assert_eq!(turn.turn_id, "turn_1");
+        server.interrupt_turn("thr_1", "turn_1").unwrap();
+
+        let transport = server.into_transport();
+        assert_eq!(transport.requests[1].0, "turn/start");
+        assert_eq!(
+            transport.requests[1].1["sandboxPolicy"],
+            json!({
+                "type": "workspaceWrite",
+                "writableRoots": ["/workspace/project"],
+                "networkAccess": false
+            })
+        );
+        assert_eq!(
+            transport.requests[1].1["input"],
+            json!([{ "type": "text", "text": "Run tests" }])
+        );
+        assert_eq!(
+            transport.requests[2],
+            (
+                "turn/interrupt".into(),
+                json!({
+                    "threadId": "thr_1",
+                    "turnId": "turn_1"
+                })
+            )
+        );
+    }
+
+    #[test]
+    fn unsafe_or_ambiguous_requests_fail_before_transport() {
+        let mut server = initialized_server_with([]);
+        assert_eq!(
+            server.start_thread(ThreadStartRequest {
+                model: "gpt-fixture".into(),
+                cwd: PathBuf::from("relative/project"),
+                approval_policy: ApprovalPolicy::Never,
+                sandbox: ThreadSandbox::ReadOnly,
+            }),
+            Err(AppServerError::ProtocolDrift)
+        );
+        assert_eq!(
+            server.start_turn(TurnStartRequest {
+                thread_id: "thr_1".into(),
+                prompt: "Run tests".into(),
+                cwd: PathBuf::from("/workspace/project"),
+                approval_policy: ApprovalPolicy::Never,
+                sandbox_policy: TurnSandboxPolicy::WorkspaceWrite {
+                    writable_roots: vec![PathBuf::from("relative/project")],
+                    network_access: false,
+                },
+                model: None,
+                effort: None,
+            }),
+            Err(AppServerError::ProtocolDrift)
+        );
+        assert_eq!(server.into_transport().requests.len(), 1);
+    }
+
+    #[test]
+    fn omitted_turn_overrides_are_not_serialized_as_null() {
+        let mut server = initialized_server_with([json!({ "turn": { "id": "turn_1" } })]);
+        server
+            .start_turn(TurnStartRequest {
+                thread_id: "thr_1".into(),
+                prompt: "Inspect status".into(),
+                cwd: PathBuf::from("/workspace/project"),
+                approval_policy: ApprovalPolicy::Never,
+                sandbox_policy: TurnSandboxPolicy::ReadOnly,
+                model: None,
+                effort: None,
+            })
+            .unwrap();
+        let transport = server.into_transport();
+        let params = transport.requests[1].1.as_object().unwrap();
+        assert!(!params.contains_key("model"));
+        assert!(!params.contains_key("effort"));
+        assert_eq!(params["sandboxPolicy"], json!({ "type": "readOnly" }));
+    }
+
+    #[test]
+    fn malformed_handles_and_interrupt_acknowledgements_fail_closed() {
+        let mut server = initialized_server_with([
+            json!({ "thread": { "id": "" } }),
+            json!({ "unexpected": true }),
+        ]);
+        assert_eq!(
+            server.resume_thread("thr_1"),
+            Err(AppServerError::ProtocolDrift)
+        );
+        assert_eq!(
+            server.interrupt_turn("thr_1", "turn_1"),
             Err(AppServerError::ProtocolDrift)
         );
     }

@@ -53,5 +53,8 @@ verification status; it does not add scope.
   so the adapter now declares `ListModels`. Interactive authentication, execution, session
   lifecycle, and conformance integration remain pending. Fixture-only lifecycle normalization is
   in progress for provider-reported turn start/completion/failure plus locally measured
-  cancellation and recovery transitions; no real thread or turn is launched by these tests.
+  cancellation and recovery transitions. Strongly typed fixture-only request boundaries now cover
+  `thread/start`, `thread/resume`, `turn/start`, and `turn/interrupt`; they require absolute paths,
+  validate workspace-write roots, retain only allowlisted response identifiers, and deliberately
+  expose no danger-full-access policy. No real thread or turn is launched by these tests.
 - M2.4–M2.8: not started.

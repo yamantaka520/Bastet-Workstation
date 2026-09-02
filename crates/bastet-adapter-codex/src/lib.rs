@@ -5,8 +5,9 @@ mod lifecycle;
 mod stdio;
 
 pub use app_server::{
-    AppServerError, AppServerTransport, CodexAppServer, ModelCatalogPage, ModelDescriptor,
-    ReasoningEffort, TransportError,
+    AppServerError, AppServerTransport, ApprovalPolicy, CodexAppServer, ModelCatalogPage,
+    ModelDescriptor, ReasoningEffort, ThreadHandle, ThreadSandbox, ThreadStartRequest,
+    TransportError, TurnHandle, TurnSandboxPolicy, TurnStartRequest,
 };
 pub use lifecycle::{CodexEventNormalizer, LifecycleError, NormalizedCodexEvent};
 pub use stdio::StdioTransport;
