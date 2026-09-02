@@ -51,5 +51,7 @@ verification status; it does not add scope.
   notifications while awaiting a response, rejects mismatched/error responses, and closes or kills
   its child within a deadline. An installed Codex CLI passed a real handshake and model-list probe,
   so the adapter now declares `ListModels`. Interactive authentication, execution, session
-  lifecycle, and conformance integration remain pending.
+  lifecycle, and conformance integration remain pending. Fixture-only lifecycle normalization is
+  in progress for provider-reported turn start/completion/failure plus locally measured
+  cancellation and recovery transitions; no real thread or turn is launched by these tests.
 - M2.4–M2.8: not started.

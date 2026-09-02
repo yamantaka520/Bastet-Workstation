@@ -1,12 +1,14 @@
 //! Codex CLI discovery and read-only health boundary.
 
 mod app_server;
+mod lifecycle;
 mod stdio;
 
 pub use app_server::{
     AppServerError, AppServerTransport, CodexAppServer, ModelCatalogPage, ModelDescriptor,
     ReasoningEffort, TransportError,
 };
+pub use lifecycle::{CodexEventNormalizer, LifecycleError, NormalizedCodexEvent};
 pub use stdio::StdioTransport;
 
 use std::{
