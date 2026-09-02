@@ -95,6 +95,65 @@ impl CodexRunStream {
         self.normalizer
             .recovery_started(provider_thread_id, occurred_at)
     }
+
+    pub fn deadline_exceeded(
+        &mut self,
+        occurred_at: &str,
+    ) -> Result<NormalizedCodexEvent, LifecycleError> {
+        self.local_terminal(
+            NormalizedRunState::Failed,
+            "codex.deadline_exceeded",
+            occurred_at,
+            AdapterFailureKind::Timeout,
+            "codex.failure.timeout",
+            true,
+        )
+    }
+
+    pub fn transport_lost(
+        &mut self,
+        occurred_at: &str,
+    ) -> Result<NormalizedCodexEvent, LifecycleError> {
+        self.local_terminal(
+            NormalizedRunState::Uncertain,
+            "codex.transport_lost",
+            occurred_at,
+            AdapterFailureKind::Crashed,
+            "codex.failure.transport_lost",
+            true,
+        )
+    }
+
+    fn local_terminal(
+        &mut self,
+        state: NormalizedRunState,
+        event_type: &str,
+        occurred_at: &str,
+        failure_kind: AdapterFailureKind,
+        message_key: &str,
+        retryable: bool,
+    ) -> Result<NormalizedCodexEvent, LifecycleError> {
+        if self.terminal {
+            return Err(LifecycleError::ProtocolDrift);
+        }
+        let event = self.normalizer.event(
+            state,
+            event_type,
+            occurred_at,
+            EvidenceClass::LocallyMeasured,
+            None,
+            json!({"status": format!("{state:?}").to_ascii_lowercase()}),
+            Some(AdapterFailure {
+                kind: failure_kind,
+                message_key: message_key.into(),
+                retryable,
+                provider_code: None,
+                redacted_detail: None,
+            }),
+        )?;
+        self.terminal = true;
+        Ok(event)
+    }
 }
 
 impl CodexEventNormalizer {
@@ -523,5 +582,25 @@ mod tests {
             AdapterFailureKind::Authentication
         );
         assert!(!event.event.redacted_payload_json.contains("secret"));
+    }
+
+    #[test]
+    fn local_timeout_and_transport_loss_are_terminal_and_distinct() {
+        let mut timeout = CodexRunStream::new(RunId::from_bytes([1; 16]), "turn_1").unwrap();
+        let timeout_event = timeout.deadline_exceeded(NOW).unwrap();
+        assert_eq!(timeout_event.event.state, NormalizedRunState::Failed);
+        assert_eq!(
+            timeout_event.failure.unwrap().kind,
+            AdapterFailureKind::Timeout
+        );
+        assert!(timeout.transport_lost(NOW).is_err());
+
+        let mut crash = CodexRunStream::new(RunId::from_bytes([2; 16]), "turn_2").unwrap();
+        let crash_event = crash.transport_lost(NOW).unwrap();
+        assert_eq!(crash_event.event.state, NormalizedRunState::Uncertain);
+        assert_eq!(
+            crash_event.failure.unwrap().kind,
+            AdapterFailureKind::Crashed
+        );
     }
 }

@@ -65,5 +65,9 @@ verification status; it does not add scope.
   `turn/diff/updated` into a redacted write receipt and `thread/tokenUsage/updated.tokenUsage.last`
   into provider-reported input/output token evidence. Raw diffs are discarded, and no currency or
   amount is invented when the provider does not report one. No real thread or turn is launched by
-  these tests.
+  these tests. A Codex protocol fixture now replays all ten required conformance scenarios through
+  the production lifecycle and evidence normalizers, including locally measured timeout and
+  transport-loss terminals. Its fixture-only capability target is intentionally separate from the
+  production adapter declaration, which continues to withhold Start, Cancel, resume, write, and
+  structured-event claims until real execution coverage is complete.
 - M2.4–M2.8: not started.
