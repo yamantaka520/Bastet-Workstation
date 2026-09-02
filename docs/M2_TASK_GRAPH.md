@@ -47,6 +47,9 @@ verification status; it does not add scope.
   boundary, sanitized authentication-status parsing, and a capability declaration that does not
   claim unimplemented execution. A fixture-backed app-server JSON-RPC boundary now enforces the
   required initialize/initialized handshake and strictly normalizes `model/list` model, modality,
-  default, and reasoning-effort data. The real stdio transport, interactive authentication,
-  execution, session lifecycle, and conformance integration remain pending.
+  default, and reasoning-effort data. A bounded JSONL stdio transport now owns request IDs, ignores
+  notifications while awaiting a response, rejects mismatched/error responses, and closes or kills
+  its child within a deadline. An installed Codex CLI passed a real handshake and model-list probe,
+  so the adapter now declares `ListModels`. Interactive authentication, execution, session
+  lifecycle, and conformance integration remain pending.
 - M2.4–M2.8: not started.

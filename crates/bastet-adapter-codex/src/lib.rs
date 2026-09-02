@@ -1,11 +1,13 @@
 //! Codex CLI discovery and read-only health boundary.
 
 mod app_server;
+mod stdio;
 
 pub use app_server::{
     AppServerError, AppServerTransport, CodexAppServer, ModelCatalogPage, ModelDescriptor,
     ReasoningEffort, TransportError,
 };
+pub use stdio::StdioTransport;
 
 use std::{
     ffi::OsStr,
@@ -217,6 +219,7 @@ impl<R: CommandRunner> CodexAdapter<R> {
                 AdapterOperation::Version,
                 AdapterOperation::Doctor,
                 AdapterOperation::InspectAuthentication,
+                AdapterOperation::ListModels,
             ],
             reasoning_controls: Vec::new(),
             supports_read_only: false,
@@ -412,6 +415,9 @@ mod tests {
         assert!(capabilities
             .operations
             .contains(&AdapterOperation::InspectAuthentication));
+        assert!(capabilities
+            .operations
+            .contains(&AdapterOperation::ListModels));
         assert!(!capabilities.operations.contains(&AdapterOperation::Start));
         assert!(!capabilities.supports_read_only);
         assert!(!capabilities.supports_write);
