@@ -87,4 +87,15 @@ describe("M1 shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "套用 Pet" }));
     expect(invokeMock).toHaveBeenCalledWith("apply_builtin_pet");
   });
+
+  it("disables provider dispatch while long-running graph work is active", async () => {
+    invokeMock.mockImplementation((command: string) => command === "m3_projection"
+      ? Promise.resolve({ revision: 2, pet_profiles: [], pet_assignments: 3, rooms: 1, meetings: 1, documents: 0, costs: 0, graph_nodes: [{ execution_id: "graph-1", title: "Research A", state: "pending", pet_state: "idle" }], awaiting_meetings: [], document_versions: [], knowledge_deliveries: [] })
+      : command === "run_ready_mvp_nodes" ? new Promise(() => undefined) : defaultInvoke(command));
+    render(<App />);
+    const button = await screen.findByRole("button", { name: "執行已就緒的 Graph 工作" });
+    fireEvent.click(button);
+    expect(button).toBeDisabled();
+    expect(screen.getByText("工作執行中…")).toBeInTheDocument();
+  });
 });

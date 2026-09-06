@@ -587,21 +587,22 @@ fn deliver_agent_memory_with(
         ])
         .output()
         .map_err(|error| error.to_string())?;
-    if search.status.success() {
-        let hits: serde_json::Value =
-            serde_json::from_slice(&search.stdout).map_err(|error| error.to_string())?;
-        if let Some(id) = hits
-            .as_array()
-            .and_then(|items| {
-                items.iter().find(|item| {
-                    item.get("content").and_then(|value| value.as_str()) == Some(&content)
-                })
-            })
-            .and_then(|item| item.get("id"))
-            .and_then(|value| value.as_str())
-        {
-            return Ok(format!("agent-memory:{id}"));
-        }
+    if !search.status.success() {
+        return Err("AgentMemoryOS reconciliation search failed".into());
+    }
+    let hits: serde_json::Value =
+        serde_json::from_slice(&search.stdout).map_err(|error| error.to_string())?;
+    if let Some(id) = hits
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("content").and_then(|value| value.as_str()) == Some(&content))
+        })
+        .and_then(|item| item.get("id"))
+        .and_then(|value| value.as_str())
+    {
+        return Ok(format!("agent-memory:{id}"));
     }
     let output = Command::new(executable)
         .args([

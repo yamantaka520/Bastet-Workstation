@@ -32,6 +32,7 @@ export function App() {
   const [documentTitle, setDocumentTitle] = useState("");
   const [documentMarkdown, setDocumentMarkdown] = useState("");
   const [actionError, setActionError] = useState(false);
+  const [actionBusy, setActionBusy] = useState(false);
   const [autostart, setAutostart] = useState(false);
 
   const reconnect = useCallback(async () => {
@@ -74,9 +75,10 @@ export function App() {
     catch { setActionError(true); }
   };
   const runReady = async () => {
-    setActionError(false);
+    setActionError(false); setActionBusy(true);
     try { setM3(await invoke<M3Projection>("run_ready_mvp_nodes")); await reconnect(); }
     catch { setActionError(true); }
+    finally { setActionBusy(false); }
   };
   const completedExecution = m3.graph_nodes.length > 0 && m3.graph_nodes.every((node) => node.state === "succeeded") ? m3.graph_nodes[0].execution_id : null;
   const createDocument = async () => {
@@ -96,9 +98,10 @@ export function App() {
     catch { setActionError(true); }
   };
   const deliverKnowledge = async (deliveryId: string) => {
-    setActionError(false);
+    setActionError(false); setActionBusy(true);
     try { await invoke("deliver_knowledge", { deliveryId, deliveredOn: new Date().toISOString().slice(0, 10) }); await reconnect(); }
     catch { setActionError(true); }
+    finally { setActionBusy(false); }
   };
 
   return <main>
@@ -108,6 +111,8 @@ export function App() {
     <nav aria-label={translate(locale, "navigation")}>{(["office", "agents", "approvals", "diagnostics"] as const).map((item) =>
       <button key={item} type="button" aria-current={view === item ? "page" : undefined} onClick={() => setView(item)}>{translate(locale, item)}</button>)}</nav>
     <p role="status" className="connection" data-state={connection}>{translate(locale, connection)}</p>
+    {actionBusy && <p role="status">{translate(locale, "working")}</p>}
+    {actionError && <p role="alert">{translate(locale, "actionFailed")}</p>}
 
     {view === "office" && <section aria-labelledby="office-heading"><h2 id="office-heading">{translate(locale, "office")}</h2><p>{translate(locale, "officeHelp")}</p>
       <dl><dt>{translate(locale, "revision")}</dt><dd>{m3.revision}</dd><dt>{translate(locale, "rooms")}</dt><dd>{m3.rooms}</dd><dt>{translate(locale, "meetings")}</dt><dd>{m3.meetings}</dd><dt>{translate(locale, "documents")}</dt><dd>{m3.documents}</dd><dt>{translate(locale, "costs")}</dt><dd>{m3.costs}</dd></dl>
@@ -116,10 +121,10 @@ export function App() {
         <button type="button" onClick={() => void changeBuiltinPet(m3.pet_profiles.length === 0)}>{translate(locale, m3.pet_profiles.length ? "rollbackPet" : "applyPet")}</button></article>
       {m3.meetings === 0 && <form onSubmit={(event) => { event.preventDefault(); void prepareMvp(); }}><h3>{translate(locale, "prepareMvp")}</h3><label>{translate(locale, "projectName")}<input required value={projectName} onChange={(event) => setProjectName(event.target.value)} /></label><label>{translate(locale, "workspaceRoot")}<input required value={workspaceRoot} onChange={(event) => setWorkspaceRoot(event.target.value)} /></label><label>Codex {translate(locale, "models")}<select required value={codexModel} onChange={(event) => setCodexModel(event.target.value)}><option value="">—</option>{agents.find((agent) => agent.adapter_kind === "codex_cli")?.models.map((model) => <option key={model}>{model}</option>)}</select></label><label>Agy {translate(locale, "models")}<select required value={agyModel} onChange={(event) => setAgyModel(event.target.value)}><option value="">—</option>{agents.find((agent) => agent.adapter_kind === "agy_cli")?.models.map((model) => <option key={model}>{model}</option>)}</select></label><button type="submit">{translate(locale, "prepare")}</button></form>}
       {m3.awaiting_meetings.map((meeting) => <article key={meeting.meeting_id}><h3>{translate(locale, "decisionBaseline")}</h3><p>{meeting.summary}</p><label>{translate(locale, "decisionBaseline")}<textarea required value={decision} onChange={(event) => setDecision(event.target.value)} /></label><button type="button" disabled={!decision.trim()} onClick={() => void acceptDecision(meeting.meeting_id)}>{translate(locale, "acceptDecision")}</button></article>)}
-      {m3.graph_nodes.some((node) => node.state === "pending") && <button type="button" onClick={() => void runReady()}>{translate(locale, "runReady")}</button>}
+      {m3.graph_nodes.some((node) => node.state === "pending") && <button type="button" disabled={actionBusy} onClick={() => void runReady()}>{translate(locale, "runReady")}</button>}
       {completedExecution && m3.document_versions.length === 0 && <form onSubmit={(event) => { event.preventDefault(); void createDocument(); }}><label>{translate(locale, "documentTitle")}<input required value={documentTitle} onChange={(event) => setDocumentTitle(event.target.value)} /></label><label>{translate(locale, "documentMarkdown")}<textarea required value={documentMarkdown} onChange={(event) => setDocumentMarkdown(event.target.value)} /></label><button type="submit">{translate(locale, "createDocument")}</button></form>}
       {m3.document_versions.map((document) => <article key={document.version_id}><h3>{document.title}</h3><pre>{document.markdown}</pre><code>{document.content_hash}</code>{document.accepted ? <><p>{translate(locale, "approved")}</p><div className="actions"><button type="button" onClick={() => void prepareKnowledge(document, "agent_memory_os")}>{translate(locale, "prepareMemory")}</button><button type="button" onClick={() => void prepareKnowledge(document, "bastet_mind")}>{translate(locale, "prepareMind")}</button></div></> : <button type="button" onClick={() => void acceptDocument(document)}>{translate(locale, "acceptDocument")}</button>}</article>)}
-      {m3.knowledge_deliveries.length > 0 && <section aria-labelledby="delivery-heading"><h3 id="delivery-heading">{translate(locale, "knowledgeDeliveries")}</h3><ul>{m3.knowledge_deliveries.map((delivery) => <li key={delivery.delivery_id}>{delivery.target} — {translate(locale, delivery.state === "delivered" ? "delivered" : "prepared")} {delivery.state === "prepared" && <button type="button" onClick={() => void deliverKnowledge(delivery.delivery_id)}>{translate(locale, "deliverNow")}</button>}</li>)}</ul></section>}
+      {m3.knowledge_deliveries.length > 0 && <section aria-labelledby="delivery-heading"><h3 id="delivery-heading">{translate(locale, "knowledgeDeliveries")}</h3><ul>{m3.knowledge_deliveries.map((delivery) => <li key={delivery.delivery_id}>{delivery.target} — {translate(locale, delivery.state === "delivered" ? "delivered" : "prepared")} {delivery.state === "prepared" && <button type="button" disabled={actionBusy} onClick={() => void deliverKnowledge(delivery.delivery_id)}>{translate(locale, "deliverNow")}</button>}</li>)}</ul></section>}
       {m3.graph_nodes.length > 0 && <ul>{m3.graph_nodes.map((node) => <li key={`${node.title}-${node.state}`}><span aria-hidden="true">🐈</span> {node.title} — {node.state} <span className="sr-only">{node.pet_state}</span></li>)}</ul>}</section>}
 
     {view === "agents" && <section aria-labelledby="agents-heading"><h2 id="agents-heading">{translate(locale, "agents")}</h2><p>{translate(locale, "agentHelp")}</p>
@@ -128,7 +133,6 @@ export function App() {
           <dt>{translate(locale, "models")}</dt><dd>{agent.model_count ?? translate(locale, "unknown")}</dd><dt>{translate(locale, "reasoning")}</dt><dd>{agent.reasoning_controls.join(" · ") || translate(locale, "unknown")}</dd>
           <dt>{translate(locale, "runControl")}</dt><dd>{agent.operations.join(" · ") || translate(locale, "unavailable")}</dd></dl></article>)}</div>
       <h3>{translate(locale, "sessionsAndRuns")}</h3><p>{translate(locale, "sessions")}: {work.sessions} · {translate(locale, "revision")}: {work.revision}</p>
-      {actionError && <p role="alert">{translate(locale, "cancelRejected")}</p>}
       {work.runs.length === 0 ? <p>{translate(locale, "noRuns")}</p> : <ul>{work.runs.map((run) => <li key={run.run_id}><code>{run.run_id}</code> — {run.state} {run.can_cancel && <button type="button" onClick={() => void cancelRun(run.run_id)}>{translate(locale, "cancel")}</button>}</li>)}</ul>}</section>}
 
     {view === "approvals" && <section aria-labelledby="approvals-heading"><h2 id="approvals-heading">{translate(locale, "approvals")}</h2><p>{translate(locale, "approvalHelp")}</p>
