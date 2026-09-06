@@ -162,4 +162,21 @@ verification status; it does not add scope.
   to `Uncertain`, with both entity and catalog revisions advanced and a count-only reconciliation
   event recorded. This prevents a process kill from silently presenting stale active work as
   authoritative or retrying a side effect without reconciliation.
-- M2.6–M2.8: not started.
+- M2.6 approval and sandbox boundary: complete through `4f89e47`, `ae68e47`, `b8c5d81`,
+  `3be7210`, `bca3cb6`, `4fff24e`, and `3e12341`. Approval requests are immutable, hash-bound,
+  expiring, single-decision records. Initial macOS, Windows, and Linux sandbox plans fail closed;
+  platform probes and cross-platform path semantics are covered by tests and CI.
+- M2.7 Agent/Approval UI: complete through `6124632`, `4e40051`, `9357a57`, `0578f9c`,
+  `2cb224f`, `7966541`, and `3bc7dd3`. The five-locale keyboard-native shell projects live
+  installation/version/doctor/auth/model/reasoning/capability status, daemon-owned sessions/runs,
+  immutable approvals, and revision-guarded cancellation. Provider cancellation must be accepted
+  through the exact-run controller registry before the daemon persists `Cancelling`; unknown
+  handles fail closed.
+- M2.8 integrated gate: complete. On 2026-09-07, local deterministic verification passed Agy
+  10 unit + 2 conformance tests, Codex 50 unit + 3 conformance tests, and conformance harness
+  12 tests. Both protocol fixtures cover all ten required read-only, write, cancel, timeout,
+  authentication failure, quota failure, crash, resume, redaction, and cost-evidence scenarios.
+  The real-provider canaries remain explicit/ignored by default because they can start provider
+  work; their prior successful evidence is recorded in M2.3/M2.4 above. GitHub Actions runs
+  `34043216696`, `34043352166`, and `34043400584` passed the cancellation, localized UI, and
+  controller-registry slices on macOS, Windows, and Linux.
