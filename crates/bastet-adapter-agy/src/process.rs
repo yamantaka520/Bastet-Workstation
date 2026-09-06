@@ -83,7 +83,6 @@ impl AgyProcess {
                 "--sandbox",
                 "--add-dir",
                 cwd,
-                "--dangerously-skip-permissions",
                 "--model",
                 &request.model,
                 "--print-timeout",

@@ -110,6 +110,12 @@ pub struct RestartMissingOutputGraphCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryFailedGraphNodeCommand {
+    pub node_id: bastet_core::GraphNodeId,
+    pub expected_graph_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrepareMvpCommand {
     pub expected_catalog_revision: u64,
     pub expected_m3_revision: u64,
@@ -210,6 +216,8 @@ pub struct FinishGraphNodeRunCommand {
     pub run_id: bastet_core::RunId,
     pub owner: String,
     pub terminal_state: bastet_core::NormalizedRunState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<bastet_core::AdapterFailure>,
     pub provider_session_id: Option<String>,
     pub output_markdown: Option<String>,
     pub cost: bastet_core::CostEvidence,

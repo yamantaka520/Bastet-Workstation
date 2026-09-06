@@ -94,6 +94,8 @@ struct JoinedDraftProjection {
 #[derive(Serialize)]
 struct GraphNodeProjection {
     execution_id: String,
+    node_id: String,
+    failure_kind: Option<&'static str>,
     title: String,
     state: String,
     pet_state: &'static str,
@@ -129,6 +131,42 @@ struct ProviderOutcome {
     provider_session_id: Option<String>,
     cost: bastet_core::CostEvidence,
     output_markdown: Option<String>,
+    failure: Option<bastet_core::AdapterFailure>,
+}
+
+fn failure_kind_label(kind: bastet_core::AdapterFailureKind) -> &'static str {
+    use bastet_core::AdapterFailureKind::*;
+    match kind {
+        BinaryMissing | Unsupported => "provider_unavailable",
+        Authentication => "provider_authentication",
+        Quota => "provider_quota",
+        PermissionDenied => "provider_rejected",
+        Timeout => "provider_timeout",
+        Cancelled => "cancelled",
+        Crashed => "provider_crashed",
+        ProtocolDrift | MalformedOutput => "invalid_output",
+        Unknown => "unknown",
+    }
+}
+
+fn output_failure(
+    state: bastet_core::NormalizedRunState,
+    output: Option<&str>,
+    failure: Option<bastet_core::AdapterFailure>,
+) -> Option<bastet_core::AdapterFailure> {
+    if state == bastet_core::NormalizedRunState::Succeeded
+        && output.is_none_or(|text| text.trim().is_empty())
+    {
+        Some(bastet_core::AdapterFailure {
+            kind: bastet_core::AdapterFailureKind::MalformedOutput,
+            message_key: "mvp.failure.invalid_output".into(),
+            retryable: true,
+            provider_code: None,
+            redacted_detail: None,
+        })
+    } else {
+        failure
+    }
 }
 
 fn unknown_cost() -> bastet_core::CostEvidence {
@@ -182,7 +220,10 @@ async fn retry_missing_graph_outputs(client: State<'_, DaemonClient>) -> Result<
                 .nodes
                 .iter()
                 .all(|node| node.state == bastet_core::GraphNodeState::Succeeded)
-                && execution.outputs.len() < execution.nodes.len()
+                && execution
+                    .nodes
+                    .iter()
+                    .any(|node| execution.output(node.node_id).is_none())
                 && !executions
                     .iter()
                     .any(|next| next.restarted_from_execution_id == Some(execution.id))
@@ -192,6 +233,34 @@ async fn retry_missing_graph_outputs(client: State<'_, DaemonClient>) -> Result<
         .restart_missing_output_graph(
             execution.id,
             bastet_protocol::RestartMissingOutputGraphCommand {
+                expected_graph_revision: execution.revision,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn retry_failed_mvp_node(
+    client: State<'_, DaemonClient>,
+    execution_id: bastet_core::GraphRunId,
+    node_id: bastet_core::GraphNodeId,
+) -> Result<(), String> {
+    let executions = client
+        .graph_executions()
+        .await
+        .map_err(|error| error.to_string())?
+        .executions;
+    let execution = executions
+        .iter()
+        .find(|execution| execution.id == execution_id)
+        .ok_or("graph not found")?;
+    client
+        .retry_failed_graph_node(
+            execution_id,
+            bastet_protocol::RetryFailedGraphNodeCommand {
+                node_id,
                 expected_graph_revision: execution.revision,
             },
         )
@@ -284,6 +353,13 @@ async fn run_ready_mvp_nodes(client: State<'_, DaemonClient>) -> Result<M3Projec
                 provider_session_id: None,
                 cost: unknown_cost(),
                 output_markdown: None,
+                failure: Some(bastet_core::AdapterFailure {
+                    kind: bastet_core::AdapterFailureKind::Unknown,
+                    message_key: "mvp.failure.unknown".into(),
+                    retryable: false,
+                    provider_code: None,
+                    redacted_detail: None,
+                }),
             },
         });
     }
@@ -303,6 +379,7 @@ async fn run_ready_mvp_nodes(client: State<'_, DaemonClient>) -> Result<M3Projec
                     provider_session_id: outcome.provider_session_id,
                     cost: outcome.cost,
                     output_markdown: outcome.output_markdown,
+                    failure: outcome.failure,
                 },
             )
             .await
@@ -385,6 +462,11 @@ fn run_codex(
                         provider_session_id,
                         cost,
                         output_markdown: started.tracker.final_output().map(str::to_owned),
+                        failure: output_failure(
+                            event.event.state,
+                            started.tracker.final_output(),
+                            event.failure,
+                        ),
                     })
                 }
                 _ => {}
@@ -425,7 +507,7 @@ fn run_agy(
             bastet_adapter_agy::AgyRunUpdate::WriteReceipt(_) => {
                 return Err("read-only Agy run reported a write".into())
             }
-            bastet_adapter_agy::AgyRunUpdate::Lifecycle { event, .. } => match event.state {
+            bastet_adapter_agy::AgyRunUpdate::Lifecycle { event, failure } => match event.state {
                 bastet_core::NormalizedRunState::Succeeded
                 | bastet_core::NormalizedRunState::Failed
                 | bastet_core::NormalizedRunState::Cancelled
@@ -436,6 +518,7 @@ fn run_agy(
                         provider_session_id: process.conversation_id().map(str::to_owned),
                         cost,
                         output_markdown: process.final_output().map(str::to_owned),
+                        failure: output_failure(event.state, process.final_output(), failure),
                     })
                 }
                 _ => {}
@@ -930,7 +1013,10 @@ fn project_m3(
                 .nodes
                 .iter()
                 .all(|node| node.state == bastet_core::GraphNodeState::Succeeded)
-                && execution.outputs.len() < execution.nodes.len()
+                && execution
+                    .nodes
+                    .iter()
+                    .any(|node| execution.output(node.node_id).is_none())
                 && !executions
                     .iter()
                     .any(|next| next.restarted_from_execution_id == Some(execution.id))
@@ -962,10 +1048,7 @@ fn project_m3(
                 .nodes
                 .iter()
                 .find(|node| node.kind == bastet_core::GraphNodeKind::Join)?;
-            let output = execution
-                .outputs
-                .iter()
-                .find(|output| output.node_id == join.id)?;
+            let output = execution.output(join.id)?;
             Some(JoinedDraftProjection {
                 execution_id: execution.id.value().to_string(),
                 title: output
@@ -1033,6 +1116,11 @@ fn project_m3(
                     .find(|definition| definition.id == node.node_id)?;
                 Some(GraphNodeProjection {
                     execution_id: execution.id.value().to_string(),
+                    node_id: node.node_id.value().to_string(),
+                    failure_kind: node
+                        .failure
+                        .as_ref()
+                        .map(|failure| failure_kind_label(failure.kind)),
                     title: definition.title.clone(),
                     state: format!("{:?}", node.state).to_lowercase(),
                     pet_state: pet_state(node.state),
@@ -1062,7 +1150,7 @@ fn pet_state(state: bastet_core::GraphNodeState) -> &'static str {
         bastet_core::GraphNodeState::Pending => "idle",
         bastet_core::GraphNodeState::Running => "working",
         bastet_core::GraphNodeState::Succeeded => "succeeded",
-        bastet_core::GraphNodeState::Failed => "failed",
+        bastet_core::GraphNodeState::Failed | bastet_core::GraphNodeState::Cancelled => "failed",
         bastet_core::GraphNodeState::Blocked => "blocked",
         bastet_core::GraphNodeState::Uncertain => "waiting",
     }
@@ -1431,6 +1519,7 @@ pub fn run() {
             m3_projection,
             run_ready_mvp_nodes,
             retry_missing_graph_outputs,
+            retry_failed_mvp_node,
             prepare_mvp,
             accept_mvp_decision,
             create_mvp_document,
@@ -1463,6 +1552,28 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_success_has_safe_failure_evidence() {
+        use bastet_core::{AdapterFailureKind, NormalizedRunState};
+        let failure = output_failure(NormalizedRunState::Succeeded, Some("  "), None).unwrap();
+        assert_eq!(failure.kind, AdapterFailureKind::MalformedOutput);
+        assert_eq!(failure.provider_code, None);
+        assert_eq!(failure.redacted_detail, None);
+        assert_eq!(failure_kind_label(failure.kind), "invalid_output");
+        assert!(output_failure(NormalizedRunState::Succeeded, Some("# Report"), None).is_none());
+        let timed_out = bastet_core::AdapterFailure {
+            kind: AdapterFailureKind::Timeout,
+            message_key: "adapter.agy.timed_out".into(),
+            retryable: true,
+            provider_code: None,
+            redacted_detail: None,
+        };
+        assert_eq!(
+            output_failure(NormalizedRunState::Failed, None, Some(timed_out.clone())),
+            Some(timed_out)
+        );
+    }
 
     #[test]
     fn document_export_contains_markdown_and_never_overwrites_other_content() {
@@ -1565,7 +1676,7 @@ mod tests {
             .unwrap();
         let accepted = store.accept_mvp_decision(bastet_protocol::AcceptDecisionBaselineCommand {
             expected_m3_revision: prepared.m3_revision, meeting_id: prepared.meeting_id,
-            content: "Independently assess the same bounded statement and then integrate the evidence.".into(),
+            content: "Independently assess this statement: a matching SHA-256 digest can verify that document bytes have not changed, but does not prove that its factual claims are correct. Explain the distinction briefly, then integrate the two assessments. No external tools are needed for this bounded conceptual task.".into(),
             accepted_by: "m3-real-gate".into(), accepted_at: "2026-09-07T00:00:00Z".into(),
         }).unwrap();
         let graph = store.graph_execution(accepted.graph_execution_id).unwrap();
@@ -1637,6 +1748,7 @@ mod tests {
                     provider_session_id: left.provider_session_id,
                     cost: left.cost,
                     output_markdown: left.output_markdown,
+                    failure: left.failure,
                 },
             )
             .unwrap();
@@ -1654,6 +1766,7 @@ mod tests {
                     provider_session_id: right.provider_session_id,
                     cost: right.cost,
                     output_markdown: right.output_markdown,
+                    failure: right.failure,
                 },
             )
             .unwrap();
@@ -1706,6 +1819,7 @@ mod tests {
                     provider_session_id: joined.provider_session_id,
                     cost: joined.cost,
                     output_markdown: joined.output_markdown,
+                    failure: joined.failure,
                 },
             )
             .unwrap();

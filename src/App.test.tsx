@@ -99,6 +99,21 @@ describe("M1 shell", () => {
     expect(screen.getByText("工作執行中…")).toBeInTheDocument();
   });
 
+  it("shows only a localized safe failure classification and retries the failed node", async () => {
+    invokeMock.mockImplementation((command: string) => command === "m3_projection"
+      ? Promise.resolve({ revision: 2, pet_profiles: [], pet_assignments: 3, rooms: 1, meetings: 1, documents: 0, costs: 0, graph_nodes: [{ execution_id: "graph-1", node_id: "research-agy", title: "Research A", state: "failed", pet_state: "failed", failure_kind: "provider_timeout", failure_message_key: "provider response: secret internal detail" }], awaiting_meetings: [], joined_drafts: [], missing_output_execution_id: null, document_versions: [], knowledge_deliveries: [] })
+      : command === "retry_failed_mvp_node" ? new Promise(() => undefined) : defaultInvoke(command));
+    render(<App />);
+
+    expect(await screen.findByText("這項工作失敗，因為供應商逾時。")).toBeInTheDocument();
+    expect(screen.queryByText(/secret internal detail/)).not.toBeInTheDocument();
+    expect(screen.getByText("只會重試這項失敗工作；成功後，被阻擋的合併會繼續。")).toBeInTheDocument();
+    const button = screen.getByRole("button", { name: "重試失敗的工作" });
+    fireEvent.click(button);
+    expect(invokeMock).toHaveBeenCalledWith("retry_failed_mvp_node", { executionId: "graph-1", nodeId: "research-agy" });
+    expect(button).toBeDisabled();
+  });
+
   it("prefills a document from the latest joined draft and keeps manual edits after reconnect", async () => {
     const projection = { revision: 4, pet_profiles: [], pet_assignments: 3, rooms: 1, meetings: 1, documents: 0, costs: 0, graph_nodes: [{ execution_id: "graph-older", title: "Research A", state: "succeeded", pet_state: "succeeded" }, { execution_id: "graph-newer", title: "Join", state: "succeeded", pet_state: "succeeded" }], awaiting_meetings: [], joined_drafts: [{ execution_id: "graph-older", title: "Earlier draft", markdown: "# Earlier" }, { execution_id: "graph-newer", title: "Joined research", markdown: "# Joined\n\nActual graph output" }], missing_output_execution_id: null, document_versions: [], knowledge_deliveries: [] };
     invokeMock.mockImplementation((command: string) => command === "m3_projection" ? Promise.resolve(projection) : defaultInvoke(command));

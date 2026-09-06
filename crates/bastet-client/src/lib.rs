@@ -13,7 +13,7 @@ use bastet_protocol::{
     GraphExecutionReceipt, KnowledgeDeliveryReceipt, M3CatalogSnapshot,
     PrepareKnowledgeDeliveryCommand, PrepareMvpCommand, PrepareMvpReceipt, RecordCostCommand,
     ReplaceCatalogCommand, ReplaceM3CatalogCommand, RestartMissingOutputGraphCommand,
-    PROTOCOL_VERSION,
+    RetryFailedGraphNodeCommand, PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -169,6 +169,28 @@ impl DaemonClient {
             .http
             .post(format!(
                 "{}/v1/graphs/{}/restart-missing-output",
+                self.base_url,
+                execution_id.value()
+            ))
+            .json(&command)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<GraphExecutionReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
+    pub async fn retry_failed_graph_node(
+        &self,
+        execution_id: bastet_core::GraphRunId,
+        command: RetryFailedGraphNodeCommand,
+    ) -> Result<GraphExecutionReceipt, ClientError> {
+        let receipt = self
+            .http
+            .post(format!(
+                "{}/v1/graphs/{}/retry-failed",
                 self.base_url,
                 execution_id.value()
             ))
@@ -695,6 +717,7 @@ mod tests {
                     run_id: begun.run_id,
                     owner: "codex-worker".into(),
                     terminal_state: bastet_core::NormalizedRunState::Succeeded,
+                    failure: None,
                     provider_session_id: None,
                     output_markdown: None,
                     cost: bastet_core::CostEvidence {
@@ -725,6 +748,7 @@ mod tests {
                     run_id: begun.run_id,
                     owner: "codex-worker".into(),
                     terminal_state: bastet_core::NormalizedRunState::Succeeded,
+                    failure: None,
                     provider_session_id: Some("provider-thread-client-test".into()),
                     output_markdown: Some("# Codex research\n\nEvidence A.".into()),
                     cost: bastet_core::CostEvidence {
@@ -752,7 +776,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let second_finished = client
+        let second_failed = client
             .finish_graph_node_run(
                 execution_id,
                 FinishGraphNodeRunCommand {
@@ -762,8 +786,63 @@ mod tests {
                     node_id: second.node_id,
                     run_id: second.run_id,
                     owner: "agy-worker".into(),
-                    terminal_state: bastet_core::NormalizedRunState::Succeeded,
+                    terminal_state: bastet_core::NormalizedRunState::Failed,
+                    failure: Some(bastet_core::AdapterFailure {
+                        kind: bastet_core::AdapterFailureKind::PermissionDenied,
+                        message_key: "adapter.agy.failed".into(),
+                        retryable: true,
+                        provider_code: Some("must-not-cross-durable-boundary".into()),
+                        redacted_detail: Some("must-not-cross-durable-boundary".into()),
+                    }),
                     provider_session_id: Some("provider-thread-client-test-2".into()),
+                    output_markdown: None,
+                    cost: bastet_core::CostEvidence {
+                        evidence_class: bastet_core::EvidenceClass::ProviderReported,
+                        currency: None,
+                        amount: None,
+                        input_tokens: Some(7),
+                        output_tokens: Some(3),
+                        confidence: 1.0,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let retried = client
+            .retry_failed_graph_node(
+                execution_id,
+                RetryFailedGraphNodeCommand {
+                    node_id: second.node_id,
+                    expected_graph_revision: second_failed.graph_revision,
+                },
+            )
+            .await
+            .unwrap();
+        let second = client
+            .begin_graph_node_run(
+                execution_id,
+                BeginGraphNodeRunCommand {
+                    expected_catalog_revision: second_failed.catalog_revision,
+                    expected_graph_revision: retried.revision,
+                    node_id: second.node_id,
+                    owner: "agy-worker-retry".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let second_finished = client
+            .finish_graph_node_run(
+                execution_id,
+                FinishGraphNodeRunCommand {
+                    expected_catalog_revision: second.catalog_revision,
+                    expected_graph_revision: second.graph_revision,
+                    expected_m3_revision: second_failed.m3_revision,
+                    node_id: second.node_id,
+                    run_id: second.run_id,
+                    owner: "agy-worker-retry".into(),
+                    terminal_state: bastet_core::NormalizedRunState::Succeeded,
+                    failure: None,
+                    provider_session_id: Some("provider-thread-client-test-2-retry".into()),
                     output_markdown: Some("# Agy research\n\nEvidence B.".into()),
                     cost: bastet_core::CostEvidence {
                         evidence_class: bastet_core::EvidenceClass::ProviderReported,
@@ -803,6 +882,7 @@ mod tests {
                     run_id: join.run_id,
                     owner: "integrator".into(),
                     terminal_state: bastet_core::NormalizedRunState::Succeeded,
+                    failure: None,
                     provider_session_id: Some("provider-thread-client-test-join".into()),
                     output_markdown: Some("# Joined report\n\nEvidence A and B.".into()),
                     cost: bastet_core::CostEvidence {
@@ -942,7 +1022,7 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.revision, initial.revision + 1);
         assert_eq!(client.snapshot().await.unwrap().revision, receipt.revision);
-        assert_eq!(store.events_after(0).unwrap().len(), 19);
+        assert_eq!(store.events_after(0).unwrap().len(), 22);
         let suspended = client
             .suspend(receipt.revision, "integration simulated sleep")
             .await

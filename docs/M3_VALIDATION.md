@@ -95,6 +95,22 @@ provider cause is unresolved (the configured 120-second timeout is not proof of 
 The user's actual report has NOT been recovered, accepted, or republished. Do not treat the passing
 isolated-provider scenario as a passing retest of this user's complete research task.
 
+2026-09-07 follow-up correction (supersedes the failure-only status above): schema v8 adds
+revision-guarded failed-node retry with immutable attempt history and current-run binding.
+Successful sibling output and old failed costs/outputs are preserved; cancelled/uncertain work is
+not automatically retried. Failure classifications now persist without raw provider details and
+are localized in the UI. Agy's auto-approval bypass flag was removed. Safe diagnostic runs with the
+user's `gemini-3.8-flash-high` model reproduced SUCCESS with empty output/denied actions; an explicit
+read-only final-report contract returned text without permission bypass. This establishes a
+reproducible correction, not proof of the exact unrecorded cause of the earlier failure.
+
+Local final workspace suite, Clippy, formatting, 13 frontend tests and bundle build pass. The
+actual-content provider gate passes in 31.21 seconds with the user's model and normal permissions;
+its formerly underspecified question now includes a concrete bounded statement to assess.
+On `Test-Prj`, retrying only Agy succeeded and persisted 7,439 characters while retaining the
+original 2,911-character Codex answer and old failure history. Human document acceptance and
+publishing remain separate actions; this is still not full M3 acceptance.
+
 2026-09-07 blocking finding: after applying the built-in Pet, preparing `Test-Prj` failed.
 Desktop and core constructed identical Pet assets with different metadata timestamps, so the daemon
 rejected the desktop profile as existing data. The global error was outside the scrolled form.

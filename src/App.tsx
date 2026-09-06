@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { locales, type Locale, translate } from "./i18n";
+import { locales, type Locale, translate, translateFailure } from "./i18n";
 import "./styles.css";
 
 type ConnectionState = "connecting" | "ready" | "offline";
@@ -12,7 +12,7 @@ type AgentStatus = { adapter_kind: string; display_name: string; installed: bool
 type AgentCenterSnapshot = { agents: AgentStatus[] };
 type WorkProjection = { revision: number; sessions: number; runs: { run_id: string; session_id: string; state: string; can_cancel: boolean }[] };
 type PetProfile = { metadata: { id: string }; name: string; version: number; states: { state_key: string; accessible_label_key: string }[] };
-type M3Projection = { revision: number; pet_profiles: PetProfile[]; pet_assignments: number; rooms: number; meetings: number; documents: number; costs: number; graph_nodes: { execution_id: string; title: string; state: string; pet_state: string }[]; awaiting_meetings: { meeting_id: string; summary: string }[]; joined_drafts: { execution_id: string; title: string; markdown: string }[]; missing_output_execution_id: string | null; document_versions: { project_id: string; artifact_id: string; version_id: string; title: string; markdown: string; content_hash: string; accepted: boolean; workspace_file?: string | null }[]; knowledge_deliveries: { delivery_id: string; target: string; preview: string; state: string }[] };
+type M3Projection = { revision: number; pet_profiles: PetProfile[]; pet_assignments: number; rooms: number; meetings: number; documents: number; costs: number; graph_nodes: { execution_id: string; node_id: string; title: string; state: string; pet_state: string; failure_kind?: string | null; failure_message_key?: string | null }[]; awaiting_meetings: { meeting_id: string; summary: string }[]; joined_drafts: { execution_id: string; title: string; markdown: string }[]; missing_output_execution_id: string | null; document_versions: { project_id: string; artifact_id: string; version_id: string; title: string; markdown: string; content_hash: string; accepted: boolean; workspace_file?: string | null }[]; knowledge_deliveries: { delivery_id: string; target: string; preview: string; state: string }[] };
 type View = "office" | "agents" | "approvals" | "diagnostics";
 
 export function App() {
@@ -124,6 +124,12 @@ export function App() {
     catch { setActionError(true); }
     finally { setActionBusy(false); }
   };
+  const retryFailedNode = async (node: M3Projection["graph_nodes"][number]) => {
+    setActionError(false); setActionBusy(true);
+    try { await invoke<void>("retry_failed_mvp_node", { executionId: node.execution_id, nodeId: node.node_id }); await reconnect(); }
+    catch { setActionError(true); }
+    finally { setActionBusy(false); }
+  };
   const exportDocument = async (document: M3Projection["document_versions"][number]) => {
     setActionError(false);
     try {
@@ -155,7 +161,7 @@ export function App() {
       {m3.missing_output_execution_id && <section><p>{translate(locale, "retryMissingOutputHelp")}</p><button type="button" disabled={actionBusy} onClick={() => void retryMissingGraphOutputs()}>{translate(locale, "retryMissingOutputs")}</button></section>}
       {m3.document_versions.map((document) => { const workspaceFile = workspaceFiles[document.version_id] ?? document.workspace_file; return <article key={document.version_id}><h3>{document.title}</h3><pre>{document.markdown}</pre><code>{document.content_hash}</code>{workspaceFile && <p>{translate(locale, "workspaceFile")}: <code>{workspaceFile}</code></p>}{document.accepted ? <><p>{translate(locale, "approved")}</p><div className="actions"><button type="button" onClick={() => void exportDocument(document)}>{translate(locale, "exportDocument")}</button><button type="button" onClick={() => void prepareKnowledge(document, "agent_memory_os")}>{translate(locale, "prepareMemory")}</button><button type="button" onClick={() => void prepareKnowledge(document, "bastet_mind")}>{translate(locale, "prepareMind")}</button></div></> : <button type="button" onClick={() => void acceptDocument(document)}>{translate(locale, "acceptDocument")}</button>}</article>; })}
       {m3.knowledge_deliveries.length > 0 && <section aria-labelledby="delivery-heading"><h3 id="delivery-heading">{translate(locale, "knowledgeDeliveries")}</h3><ul>{m3.knowledge_deliveries.map((delivery) => <li key={delivery.delivery_id}>{delivery.target} — {translate(locale, delivery.state === "delivered" ? "delivered" : "prepared")} {delivery.state === "prepared" && <button type="button" disabled={actionBusy} onClick={() => void deliverKnowledge(delivery.delivery_id)}>{translate(locale, "deliverNow")}</button>}</li>)}</ul></section>}
-      {m3.graph_nodes.length > 0 && <ul>{m3.graph_nodes.map((node) => <li key={`${node.execution_id}-${node.title}`}><span aria-hidden="true">🐈</span> {node.title} — {node.state} <span className="sr-only">{node.pet_state}</span></li>)}</ul>}</section>}
+      {m3.graph_nodes.length > 0 && <ul>{m3.graph_nodes.map((node) => <li key={`${node.execution_id}-${node.node_id}`}><span aria-hidden="true">🐈</span> {node.title} — {node.state} <span className="sr-only">{node.pet_state}</span>{node.state === "failed" && <><p role="alert">{translateFailure(node.failure_kind, node.failure_message_key, locale)}</p><p>{translate(locale, "retryFailedNodeHelp")}</p><button type="button" disabled={actionBusy} onClick={() => void retryFailedNode(node)}>{translate(locale, "retryFailedNode")}</button></>}</li>)}</ul>}</section>}
 
     {view === "agents" && <section aria-labelledby="agents-heading"><h2 id="agents-heading">{translate(locale, "agents")}</h2><p>{translate(locale, "agentHelp")}</p>
       <div className="card-grid">{agents.map((agent) => <article key={agent.adapter_kind}><h3>{agent.display_name}</h3><span className="badge">{translate(locale, agent.installed ? "installed" : "notInstalled")}</span>

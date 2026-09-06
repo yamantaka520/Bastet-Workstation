@@ -226,6 +226,25 @@ impl AgyRunStream {
             return Err(AgyStreamError::ProtocolDrift);
         }
         let (state, event_type, failure) = match status {
+            "SUCCESS"
+                if self.final_output.is_empty()
+                    && result
+                        .get("denied_actions")
+                        .and_then(Value::as_array)
+                        .is_some_and(|actions| !actions.is_empty()) =>
+            {
+                (
+                    NormalizedRunState::Failed,
+                    "run.failed",
+                    Some(AdapterFailure {
+                        kind: AdapterFailureKind::PermissionDenied,
+                        message_key: "adapter.agy.permission_denied".into(),
+                        retryable: false,
+                        provider_code: None,
+                        redacted_detail: None,
+                    }),
+                )
+            }
             "SUCCESS" => (NormalizedRunState::Succeeded, "run.succeeded", None),
             "ERROR" => {
                 let kind = classify_error(result.get("error").and_then(Value::as_str));
@@ -484,6 +503,37 @@ mod tests {
         assert_eq!(event.state, NormalizedRunState::Succeeded);
         assert_eq!(event.sequence, 2);
         assert!(failure.is_none());
+    }
+
+    #[test]
+    fn empty_success_with_denied_tools_is_a_sanitized_permission_failure() {
+        let mut stream = stream();
+        stream
+            .consume_line(
+                &json!({"event":"init","conversation_id":ID,"init":{}}).to_string(),
+                "now",
+            )
+            .unwrap();
+        let update = stream
+            .consume_line(
+                &json!({"event":"result","result":{
+                    "conversation_id":ID,"status":"SUCCESS","response":"",
+                    "denied_actions":[{"tool":"private-tool-name","arguments":"sensitive-input"}]
+                }})
+                .to_string(),
+                "now",
+            )
+            .unwrap()
+            .unwrap();
+        let AgyRunUpdate::Lifecycle { event, failure } = update else {
+            panic!("expected lifecycle");
+        };
+        assert_eq!(event.state, NormalizedRunState::Failed);
+        let failure = failure.unwrap();
+        assert_eq!(failure.kind, AdapterFailureKind::PermissionDenied);
+        assert_eq!(failure.redacted_detail, None);
+        assert!(!event.redacted_payload_json.contains("private-tool-name"));
+        assert!(!event.redacted_payload_json.contains("sensitive-input"));
     }
 
     #[test]

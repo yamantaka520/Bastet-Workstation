@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{DecisionBaselineId, GraphNodeId, GraphRunId, RoleId, RunId};
+use crate::{AdapterFailure, DecisionBaselineId, GraphNodeId, GraphRunId, RoleId, RunId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +36,7 @@ pub enum GraphNodeState {
     Running,
     Succeeded,
     Failed,
+    Cancelled,
     Blocked,
     Uncertain,
 }
@@ -46,6 +47,10 @@ pub struct GraphNodeExecution {
     pub state: GraphNodeState,
     pub owner: Option<String>,
     pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<RunId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<AdapterFailure>,
 }
 
 pub const MAX_NODE_OUTPUT_BYTES: usize = 256 * 1024;
@@ -182,6 +187,8 @@ impl GraphExecution {
                 state: GraphNodeState::Pending,
                 owner: None,
                 revision: 0,
+                run_id: None,
+                failure: None,
             })
             .collect();
         Ok(Self {
@@ -213,7 +220,8 @@ impl GraphExecution {
                     || match execution.state {
                         GraphNodeState::Running
                         | GraphNodeState::Succeeded
-                        | GraphNodeState::Failed => execution.owner.is_none(),
+                        | GraphNodeState::Failed
+                        | GraphNodeState::Cancelled => execution.owner.is_none(),
                         GraphNodeState::Pending
                         | GraphNodeState::Blocked
                         | GraphNodeState::Uncertain => execution.owner.is_some(),
@@ -222,18 +230,12 @@ impl GraphExecution {
         {
             return Err(GraphError::InvalidExecution);
         }
-        let output_nodes = self
-            .outputs
-            .iter()
-            .map(|output| output.node_id)
-            .collect::<HashSet<_>>();
         let output_runs = self
             .outputs
             .iter()
             .map(|output| output.run_id)
             .collect::<HashSet<_>>();
-        if output_nodes.len() != self.outputs.len()
-            || output_runs.len() != self.outputs.len()
+        if output_runs.len() != self.outputs.len()
             || self.outputs.iter().any(|output| {
                 output.validate().is_err()
                     || !self
@@ -241,16 +243,6 @@ impl GraphExecution {
                         .nodes
                         .iter()
                         .any(|node| node.id == output.node_id)
-                    || self
-                        .nodes
-                        .iter()
-                        .find(|node| node.node_id == output.node_id)
-                        .is_none_or(|node| {
-                            !matches!(
-                                node.state,
-                                GraphNodeState::Succeeded | GraphNodeState::Failed
-                            )
-                        })
             })
         {
             return Err(GraphError::InvalidOutput);
@@ -264,7 +256,10 @@ impl GraphExecution {
             .nodes
             .iter()
             .any(|node| node.state != GraphNodeState::Succeeded)
-            || self.outputs.len() == self.nodes.len()
+            || self
+                .nodes
+                .iter()
+                .all(|node| self.output(node.node_id).is_some())
         {
             return Err(GraphError::InvalidOutput);
         }
@@ -274,7 +269,22 @@ impl GraphExecution {
     }
 
     pub fn output(&self, node_id: GraphNodeId) -> Option<&GraphNodeOutput> {
-        self.outputs.iter().find(|output| output.node_id == node_id)
+        let current_run_id = self
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .and_then(|node| node.run_id);
+        match current_run_id {
+            Some(run_id) => self
+                .outputs
+                .iter()
+                .find(|output| output.node_id == node_id && output.run_id == run_id),
+            None => self
+                .outputs
+                .iter()
+                .rev()
+                .find(|output| output.node_id == node_id),
+        }
     }
 
     pub fn record_output(&mut self, output: GraphNodeOutput) -> Result<(), GraphError> {
@@ -282,7 +292,7 @@ impl GraphExecution {
         if self
             .outputs
             .iter()
-            .any(|existing| existing.node_id == output.node_id || existing.run_id == output.run_id)
+            .any(|existing| existing.run_id == output.run_id)
             || self
                 .nodes
                 .iter()
@@ -291,7 +301,7 @@ impl GraphExecution {
                     !matches!(
                         node.state,
                         GraphNodeState::Succeeded | GraphNodeState::Failed
-                    )
+                    ) || node.run_id.is_some_and(|run_id| run_id != output.run_id)
                 })
         {
             return Err(GraphError::InvalidOutput);
@@ -306,6 +316,8 @@ impl GraphExecution {
             if node.state == GraphNodeState::Running {
                 node.state = GraphNodeState::Uncertain;
                 node.owner = None;
+                node.run_id = None;
+                node.failure = None;
                 node.revision += 1;
                 changed += 1;
             }
@@ -347,6 +359,7 @@ impl GraphExecution {
             {
                 execution.state = GraphNodeState::Running;
                 execution.owner = Some(owner.into());
+                execution.failure = None;
                 execution.revision += 1;
                 claimed.push(execution.node_id);
             }
@@ -389,8 +402,30 @@ impl GraphExecution {
         }
         execution.state = GraphNodeState::Running;
         execution.owner = Some(owner.into());
+        execution.failure = None;
         execution.revision += 1;
         self.revision += 1;
+        Ok(())
+    }
+
+    pub fn bind_run(
+        &mut self,
+        node_id: GraphNodeId,
+        owner: &str,
+        run_id: RunId,
+    ) -> Result<(), GraphError> {
+        let execution = self
+            .nodes
+            .iter_mut()
+            .find(|node| node.node_id == node_id)
+            .ok_or(GraphError::InvalidExecution)?;
+        if execution.state != GraphNodeState::Running
+            || execution.owner.as_deref() != Some(owner)
+            || execution.run_id.is_some()
+        {
+            return Err(GraphError::InvalidExecution);
+        }
+        execution.run_id = Some(run_id);
         Ok(())
     }
 
@@ -413,6 +448,7 @@ impl GraphExecution {
         } else {
             GraphNodeState::Failed
         };
+        execution.failure = None;
         execution.revision += 1;
         self.revision += 1;
         if !succeeded {
@@ -426,11 +462,13 @@ impl GraphExecution {
         node_id: GraphNodeId,
         owner: &str,
         state: GraphNodeState,
+        failure: Option<AdapterFailure>,
     ) -> Result<(), GraphError> {
         if !matches!(
             state,
             GraphNodeState::Succeeded
                 | GraphNodeState::Failed
+                | GraphNodeState::Cancelled
                 | GraphNodeState::Blocked
                 | GraphNodeState::Uncertain
         ) {
@@ -445,16 +483,86 @@ impl GraphExecution {
             return Err(GraphError::InvalidExecution);
         }
         execution.state = state;
-        execution.owner = if matches!(state, GraphNodeState::Succeeded | GraphNodeState::Failed) {
+        execution.owner = if matches!(
+            state,
+            GraphNodeState::Succeeded | GraphNodeState::Failed | GraphNodeState::Cancelled
+        ) {
             Some(owner.into())
         } else {
             None
         };
+        execution.failure = failure;
         execution.revision += 1;
         self.revision += 1;
-        if matches!(state, GraphNodeState::Failed | GraphNodeState::Blocked) {
+        if matches!(
+            state,
+            GraphNodeState::Failed | GraphNodeState::Cancelled | GraphNodeState::Blocked
+        ) {
             self.block_dependents(node_id);
         }
+        Ok(())
+    }
+
+    /// Reopens exactly one failed node without discarding successful siblings or
+    /// historical outputs. Blocked descendants are reopened only when no failed,
+    /// cancelled, or still-blocked dependency continues to make them impossible.
+    pub fn retry_failed(&mut self, node_id: GraphNodeId) -> Result<(), GraphError> {
+        let execution = self
+            .nodes
+            .iter_mut()
+            .find(|node| node.node_id == node_id)
+            .ok_or(GraphError::InvalidExecution)?;
+        if execution.state != GraphNodeState::Failed {
+            return Err(GraphError::InvalidExecution);
+        }
+        execution.state = GraphNodeState::Pending;
+        execution.owner = None;
+        execution.run_id = None;
+        execution.failure = None;
+        execution.revision += 1;
+
+        loop {
+            let states = self
+                .nodes
+                .iter()
+                .map(|node| (node.node_id, node.state))
+                .collect::<HashMap<_, _>>();
+            let mut reopened = Vec::new();
+            for definition in &self.graph.nodes {
+                if states.get(&definition.id) != Some(&GraphNodeState::Blocked) {
+                    continue;
+                }
+                let still_blocked = definition.needs.iter().any(|dependency| {
+                    matches!(
+                        states.get(dependency),
+                        Some(
+                            GraphNodeState::Failed
+                                | GraphNodeState::Cancelled
+                                | GraphNodeState::Blocked
+                        )
+                    )
+                });
+                if !still_blocked {
+                    reopened.push(definition.id);
+                }
+            }
+            if reopened.is_empty() {
+                break;
+            }
+            for reopened_id in reopened {
+                let node = self
+                    .nodes
+                    .iter_mut()
+                    .find(|node| node.node_id == reopened_id)
+                    .ok_or(GraphError::InvalidExecution)?;
+                node.state = GraphNodeState::Pending;
+                node.owner = None;
+                node.run_id = None;
+                node.failure = None;
+                node.revision += 1;
+            }
+        }
+        self.revision += 1;
         Ok(())
     }
 
@@ -587,7 +695,7 @@ mod tests {
         let mut execution = GraphExecution::start(GraphRunId::new(), graph()).unwrap();
         let node_id = execution.claim_ready("worker", 1).unwrap()[0];
         execution
-            .finish_terminal(node_id, "worker", GraphNodeState::Uncertain)
+            .finish_terminal(node_id, "worker", GraphNodeState::Uncertain, None)
             .unwrap();
         let node = execution
             .nodes
@@ -619,6 +727,77 @@ mod tests {
         let mut implicit = graph();
         implicit.nodes[2].needs.pop();
         assert_eq!(implicit.validate(), Err(GraphError::InvalidResearchJoin));
+    }
+
+    #[test]
+    fn failed_retry_preserves_succeeded_sibling_and_reopens_join() {
+        let mut execution = GraphExecution::start(GraphRunId::new(), graph()).unwrap();
+        let branches = execution.claim_ready("worker", 2).unwrap();
+        execution.complete(branches[0], "worker", true).unwrap();
+        execution.complete(branches[1], "worker", false).unwrap();
+        assert_eq!(execution.nodes[0].state, GraphNodeState::Succeeded);
+        assert_eq!(execution.nodes[2].state, GraphNodeState::Blocked);
+
+        execution.retry_failed(branches[1]).unwrap();
+        assert_eq!(execution.nodes[0].state, GraphNodeState::Succeeded);
+        assert_eq!(execution.nodes[1].state, GraphNodeState::Pending);
+        assert_eq!(execution.nodes[2].state, GraphNodeState::Pending);
+        execution.claim_node(branches[1], "retry").unwrap();
+        execution.complete(branches[1], "retry", true).unwrap();
+        assert_eq!(
+            execution.claim_ready("join", 1).unwrap(),
+            vec![execution.graph.nodes[2].id]
+        );
+    }
+
+    #[test]
+    fn retry_rejects_uncertain_cancelled_and_succeeded_nodes() {
+        for state in [
+            GraphNodeState::Uncertain,
+            GraphNodeState::Cancelled,
+            GraphNodeState::Succeeded,
+        ] {
+            let mut execution = GraphExecution::start(GraphRunId::new(), graph()).unwrap();
+            execution.nodes[0].state = state;
+            execution.nodes[0].owner = if state == GraphNodeState::Uncertain {
+                None
+            } else {
+                Some("worker".into())
+            };
+            assert_eq!(
+                execution.retry_failed(execution.nodes[0].node_id),
+                Err(GraphError::InvalidExecution)
+            );
+        }
+    }
+
+    #[test]
+    fn retried_node_uses_current_attempt_output_and_keeps_old_evidence() {
+        let mut execution = GraphExecution::start(GraphRunId::new(), graph()).unwrap();
+        let node_id = execution.claim_ready("worker", 1).unwrap()[0];
+        let failed_run = RunId::new();
+        execution.bind_run(node_id, "worker", failed_run).unwrap();
+        execution.complete(node_id, "worker", false).unwrap();
+        execution
+            .record_output(
+                GraphNodeOutput::create(node_id, failed_run, "old partial".into()).unwrap(),
+            )
+            .unwrap();
+
+        execution.retry_failed(node_id).unwrap();
+        execution.claim_node(node_id, "retry").unwrap();
+        let succeeded_run = RunId::new();
+        execution.bind_run(node_id, "retry", succeeded_run).unwrap();
+        execution.complete(node_id, "retry", true).unwrap();
+        execution
+            .record_output(
+                GraphNodeOutput::create(node_id, succeeded_run, "new final".into()).unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(execution.outputs.len(), 2);
+        assert_eq!(execution.output(node_id).unwrap().run_id, succeeded_run);
+        assert_eq!(execution.output(node_id).unwrap().markdown, "new final");
     }
 
     #[test]

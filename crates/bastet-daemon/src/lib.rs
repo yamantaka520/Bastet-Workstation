@@ -14,11 +14,11 @@ use axum::{
     Json, Router,
 };
 use bastet_core::{
-    accept_mvp_decision, ApprovalError, ApprovalRequestId, ArtifactId, ArtifactVersionId,
-    CatalogError, DocumentArtifact, DocumentVersion, EntityLifecycle, EntityMetadata, GraphError,
-    GraphExecution, GraphNodeId, GraphNodeKind, GraphNodeOutput, GraphNodeState, GraphRunId,
-    IdentityCatalog, KnowledgeDelivery, KnowledgeDeliveryId, M3Catalog, M3State, MvpDraft,
-    Provenance, RunId,
+    accept_mvp_decision, AdapterFailure, AdapterFailureKind, ApprovalError, ApprovalRequestId,
+    ArtifactId, ArtifactVersionId, CatalogError, DocumentArtifact, DocumentVersion,
+    EntityLifecycle, EntityMetadata, GraphError, GraphExecution, GraphNodeId, GraphNodeKind,
+    GraphNodeOutput, GraphNodeState, GraphRunId, IdentityCatalog, KnowledgeDelivery,
+    KnowledgeDeliveryId, M3Catalog, M3State, MvpDraft, Provenance, RunId,
 };
 use bastet_protocol::{
     AcceptDecisionBaselineCommand, AcceptDecisionBaselineReceipt, AcceptDocumentCommand,
@@ -31,7 +31,7 @@ use bastet_protocol::{
     FinishGraphNodeRunReceipt, GraphExecutionList, GraphExecutionReceipt, KnowledgeDeliveryReceipt,
     M3CatalogSnapshot, PrepareKnowledgeDeliveryCommand, PrepareMvpCommand, PrepareMvpReceipt,
     RecordCostCommand, ReplaceCatalogCommand, ReplaceM3CatalogCommand,
-    RestartMissingOutputGraphCommand, PROTOCOL_VERSION,
+    RestartMissingOutputGraphCommand, RetryFailedGraphNodeCommand, PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
@@ -39,7 +39,7 @@ use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -205,6 +205,10 @@ fn build_router_with_controller(
             "/v1/graphs/{execution_id}/restart-missing-output",
             post(restart_missing_output_graph),
         )
+        .route(
+            "/v1/graphs/{execution_id}/retry-failed",
+            post(retry_failed_graph_node),
+        )
         .route("/v1/graphs/{execution_id}/runs", post(begin_graph_node_run))
         .route(
             "/v1/graphs/{execution_id}/runs/finish",
@@ -332,6 +336,17 @@ async fn restart_missing_output_graph(
     Ok(Json(state.store.restart_missing_output_graph(
         GraphRunId::from_bytes(*execution_id.as_bytes()),
         command.expected_graph_revision,
+    )?))
+}
+
+async fn retry_failed_graph_node(
+    State(state): State<AppState>,
+    AxumPath(execution_id): AxumPath<Uuid>,
+    Json(command): Json<RetryFailedGraphNodeCommand>,
+) -> Result<Json<GraphExecutionReceipt>, ApiError> {
+    Ok(Json(state.store.retry_failed_graph_node(
+        GraphRunId::from_bytes(*execution_id.as_bytes()),
+        command,
     )?))
 }
 
@@ -1333,6 +1348,10 @@ impl Store {
         &self,
         execution: &GraphExecution,
     ) -> Result<GraphExecutionReceipt, StoreError> {
+        let mut execution = execution.clone();
+        for node in &mut execution.nodes {
+            node.failure = node.failure.as_ref().map(sanitize_adapter_failure);
+        }
         execution.validate()?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1342,7 +1361,7 @@ impl Store {
             params![
                 execution.id.value().to_string(),
                 execution.revision,
-                serde_json::to_string(execution)?,
+                serde_json::to_string(&execution)?,
                 timestamp()
             ],
         )?;
@@ -1446,6 +1465,61 @@ impl Store {
             protocol_version: PROTOCOL_VERSION,
             execution_id: restarted.id,
             revision: restarted.revision,
+            event_sequence: event.sequence,
+        })
+    }
+
+    pub fn retry_failed_graph_node(
+        &self,
+        id: GraphRunId,
+        command: RetryFailedGraphNodeCommand,
+    ) -> Result<GraphExecutionReceipt, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (actual_revision, json): (u64, String) = transaction
+            .query_row(
+                "SELECT revision, execution_json FROM graph_executions WHERE execution_id=?1",
+                [id.value().to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::GraphNotFound)?;
+        if actual_revision != command.expected_graph_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: command.expected_graph_revision,
+                actual: actual_revision,
+            });
+        }
+        let mut execution: GraphExecution = serde_json::from_str(&json)?;
+        execution.validate()?;
+        validate_graph_output_ledger(&transaction, &execution)?;
+        execution.retry_failed(command.node_id)?;
+        execution.validate()?;
+        transaction.execute(
+            "UPDATE graph_executions SET revision=?1, execution_json=?2, updated_at=?3
+             WHERE execution_id=?4",
+            params![
+                execution.revision,
+                serde_json::to_string(&execution)?,
+                timestamp(),
+                id.value().to_string()
+            ],
+        )?;
+        let event = insert_event(
+            &transaction,
+            "graph.failed_node_retried",
+            &serde_json::json!({
+                "execution_id": id,
+                "node_id": command.node_id,
+                "revision": execution.revision
+            })
+            .to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(GraphExecutionReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            execution_id: id,
+            revision: execution.revision,
             event_sequence: event.sequence,
         })
     }
@@ -1595,6 +1669,13 @@ impl Store {
         execution.claim_node(command.node_id, &command.owner)?;
         let session_id = bastet_core::SessionId::new();
         let run_id = RunId::new();
+        execution.bind_run(command.node_id, &command.owner, run_id)?;
+        let attempt: u64 = transaction.query_row(
+            "SELECT COALESCE(MAX(attempt), 0) + 1 FROM graph_node_runs
+             WHERE execution_id=?1 AND node_id=?2",
+            params![id.value().to_string(), command.node_id.value().to_string()],
+            |row| row.get(0),
+        )?;
         identity.sessions.push(bastet_core::Session {
             metadata: entity_metadata(session_id, "graph_node_run"),
             agent_instance_id: agent.metadata.id,
@@ -1618,12 +1699,13 @@ impl Store {
         transaction.execute("UPDATE graph_executions SET revision=?1,execution_json=?2,updated_at=?3 WHERE execution_id=?4",
             params![execution.revision, serde_json::to_string(&execution)?, timestamp(), id.value().to_string()])?;
         transaction.execute(
-            "INSERT INTO graph_node_runs(execution_id, node_id, run_id, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO graph_node_runs(execution_id, node_id, run_id, attempt, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 id.value().to_string(),
                 command.node_id.value().to_string(),
                 run_id.value().to_string(),
+                attempt,
                 timestamp()
             ],
         )?;
@@ -1698,20 +1780,30 @@ impl Store {
         let mut execution: GraphExecution = serde_json::from_str(&graph_json)?;
         execution.validate()?;
         validate_graph_output_ledger(&transaction, &execution)?;
-        let bound_run: bool = transaction.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM graph_node_runs
-                WHERE execution_id=?1 AND node_id=?2 AND run_id=?3)",
-            params![
-                id.value().to_string(),
-                command.node_id.value().to_string(),
-                command.run_id.value().to_string()
-            ],
-            |row| row.get(0),
-        )?;
-        if !bound_run {
+        if execution
+            .nodes
+            .iter()
+            .find(|node| node.node_id == command.node_id)
+            .and_then(|node| node.run_id)
+            != Some(command.run_id)
+        {
             return Err(StoreError::InvalidRunState(
-                "run is not bound to this graph execution and node".into(),
+                "run is not the active graph node attempt".into(),
+            ));
+        }
+        let current_run: Option<String> = transaction
+            .query_row(
+                "SELECT run_id FROM graph_node_runs
+             WHERE execution_id=?1 AND node_id=?2
+             ORDER BY attempt DESC LIMIT 1",
+                params![id.value().to_string(), command.node_id.value().to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let expected_run_id = command.run_id.value().to_string();
+        if current_run.as_deref() != Some(expected_run_id.as_str()) {
+            return Err(StoreError::InvalidRunState(
+                "run is not the current attempt for this graph execution and node".into(),
             ));
         }
         let run_index = identity
@@ -1767,8 +1859,8 @@ impl Store {
             .clone();
         let graph_state = match command.terminal_state {
             bastet_core::NormalizedRunState::Succeeded => GraphNodeState::Succeeded,
-            bastet_core::NormalizedRunState::Failed
-            | bastet_core::NormalizedRunState::Cancelled => GraphNodeState::Failed,
+            bastet_core::NormalizedRunState::Failed => GraphNodeState::Failed,
+            bastet_core::NormalizedRunState::Cancelled => GraphNodeState::Cancelled,
             bastet_core::NormalizedRunState::Blocked => GraphNodeState::Blocked,
             bastet_core::NormalizedRunState::Uncertain => GraphNodeState::Uncertain,
             _ => {
@@ -1788,7 +1880,18 @@ impl Store {
             }
             None => None,
         };
-        execution.finish_terminal(command.node_id, &command.owner, graph_state)?;
+        let failure = command.failure.as_ref().map(sanitize_adapter_failure);
+        if graph_state == GraphNodeState::Succeeded && failure.is_some() {
+            return Err(StoreError::InvalidRunState(
+                "successful run cannot include failure evidence".into(),
+            ));
+        }
+        execution.finish_terminal(
+            command.node_id,
+            &command.owner,
+            graph_state,
+            failure.clone(),
+        )?;
         if let Some(output) = output.clone() {
             execution.record_output(output)?;
         }
@@ -1866,6 +1969,17 @@ impl Store {
         )?;
         transaction.execute("UPDATE graph_executions SET revision=?1,execution_json=?2,updated_at=?3 WHERE execution_id=?4",
             params![execution.revision, serde_json::to_string(&execution)?, timestamp(), id.value().to_string()])?;
+        transaction.execute(
+            "UPDATE graph_node_runs
+             SET finished_at=?1, terminal_state=?2, failure_json=?3
+             WHERE run_id=?4",
+            params![
+                timestamp(),
+                serde_json::to_string(&command.terminal_state)?,
+                failure.as_ref().map(serde_json::to_string).transpose()?,
+                command.run_id.value().to_string()
+            ],
+        )?;
         if let Some(output) = &output {
             transaction.execute(
                 "INSERT INTO graph_node_outputs(
@@ -2429,6 +2543,49 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StoreError> {
         )?;
         transaction.commit()?;
     }
+    if current < 8 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "ALTER TABLE graph_node_outputs RENAME TO graph_node_outputs_v7;
+             ALTER TABLE graph_node_runs RENAME TO graph_node_runs_v7;
+             CREATE TABLE graph_node_runs (
+                execution_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                run_id TEXT NOT NULL PRIMARY KEY,
+                attempt INTEGER NOT NULL CHECK(attempt >= 1),
+                created_at TEXT NOT NULL,
+                finished_at TEXT,
+                terminal_state TEXT,
+                failure_json TEXT,
+                UNIQUE(execution_id, node_id, attempt));
+             INSERT INTO graph_node_runs(
+                execution_id, node_id, run_id, attempt, created_at)
+             SELECT execution_id, node_id, run_id, 1, created_at
+             FROM graph_node_runs_v7;
+             CREATE INDEX graph_node_runs_current_attempt
+                ON graph_node_runs(execution_id, node_id, attempt DESC);
+             CREATE TABLE graph_node_outputs (
+                execution_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                run_id TEXT NOT NULL PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                markdown TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES graph_node_runs(run_id),
+                CHECK(length(CAST(markdown AS BLOB)) BETWEEN 1 AND 262144));
+             INSERT INTO graph_node_outputs(
+                execution_id, node_id, run_id, content_hash, markdown, created_at)
+             SELECT execution_id, node_id, run_id, content_hash, markdown, created_at
+             FROM graph_node_outputs_v7;
+             DROP TABLE graph_node_outputs_v7;
+             DROP TABLE graph_node_runs_v7;",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (8, ?1)",
+            [timestamp()],
+        )?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -2446,6 +2603,57 @@ fn validate_m3_catalog(catalog: &M3Catalog, identity: &IdentityCatalog) -> Resul
         .validate()
         .map_err(|error| StoreError::InvalidM3(error.to_string()))?;
     Ok(())
+}
+
+fn sanitize_adapter_failure(failure: &AdapterFailure) -> AdapterFailure {
+    const MESSAGE_KEYS: &[&str] = &[
+        "adapter.agy.cancelled",
+        "adapter.agy.crashed",
+        "adapter.agy.failed",
+        "adapter.agy.invalid_state",
+        "adapter.agy.timed_out",
+        "codex.failure.bad_request",
+        "codex.failure.context_window_exceeded",
+        "codex.failure.http_connection_failed",
+        "codex.failure.internal_server_error",
+        "codex.failure.response_stream_connection_failed",
+        "codex.failure.response_stream_disconnected",
+        "codex.failure.response_too_many_failed_attempts",
+        "codex.failure.sandbox_error",
+        "codex.failure.timeout",
+        "codex.failure.transport_lost",
+        "codex.failure.unauthorized",
+        "codex.failure.unknown",
+        "codex.failure.usage_limit_exceeded",
+    ];
+    let message_key = if MESSAGE_KEYS.contains(&failure.message_key.as_str()) {
+        failure.message_key.clone()
+    } else {
+        match failure.kind {
+            AdapterFailureKind::Timeout => "adapter.failure.timeout",
+            AdapterFailureKind::Cancelled => "adapter.failure.cancelled",
+            AdapterFailureKind::Authentication => "adapter.failure.authentication",
+            AdapterFailureKind::Quota => "adapter.failure.quota",
+            AdapterFailureKind::PermissionDenied => "adapter.failure.permission_denied",
+            AdapterFailureKind::Crashed => "adapter.failure.crashed",
+            AdapterFailureKind::ProtocolDrift => "adapter.failure.protocol_drift",
+            AdapterFailureKind::MalformedOutput => "adapter.failure.malformed_output",
+            AdapterFailureKind::BinaryMissing => "adapter.failure.binary_missing",
+            AdapterFailureKind::Unsupported => "adapter.failure.unsupported",
+            AdapterFailureKind::Unknown => "adapter.failure.unknown",
+        }
+        .into()
+    };
+    AdapterFailure {
+        kind: failure.kind,
+        message_key,
+        retryable: failure.retryable,
+        // Provider codes and details are deliberately excluded at the durable
+        // boundary. They can contain command lines, paths, credentials, or raw
+        // provider payloads even when a caller labels them as redacted.
+        provider_code: None,
+        redacted_detail: None,
+    }
 }
 
 fn m3_is_unconfigured(catalog: &M3Catalog) -> bool {
@@ -2470,7 +2678,7 @@ fn graph_node_prompt(
     baseline: &str,
 ) -> Result<String, StoreError> {
     let mut prompt = format!(
-        "Decision baseline:\n{}\n\nAssigned task:\n{}",
+        "Decision baseline:\n{}\n\nAssigned task:\n{}\n\nOutput contract:\nReturn a self-contained Markdown final response directly. This is a read-only report task, not a request to plan work or edit files. Do not use task-planning or file-writing tools. You may use permitted read-only research tools. Explicitly state material tool limitations and unverified facts. Never return an empty, plan-only, or filename-only result.",
         baseline, definition.title
     );
     if definition.needs.is_empty() {
@@ -2931,6 +3139,17 @@ mod tests {
         .unwrap()
     }
 
+    fn cost(tokens: u64) -> bastet_core::CostEvidence {
+        bastet_core::CostEvidence {
+            evidence_class: bastet_core::EvidenceClass::ProviderReported,
+            currency: None,
+            amount: None,
+            input_tokens: Some(tokens),
+            output_tokens: Some(tokens),
+            confidence: 1.0,
+        }
+    }
+
     #[test]
     fn enables_wal_and_applies_forward_migration() {
         let directory = tempdir().unwrap();
@@ -2948,14 +3167,22 @@ mod tests {
         let fixture = Connection::open(&path).unwrap();
         fixture
             .execute_batch(
-                "DELETE FROM schema_migrations WHERE version = 7;
-                 DROP TABLE graph_node_outputs;",
+                "DELETE FROM schema_migrations WHERE version >= 7;
+                 DROP TABLE graph_node_outputs;
+                 DROP INDEX graph_node_runs_current_attempt;
+                 DROP TABLE graph_node_runs;
+                 CREATE TABLE graph_node_runs (
+                    execution_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(execution_id, node_id));",
             )
             .unwrap();
         drop(fixture);
 
         let upgraded = Store::open(&path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 7);
+        assert_eq!(upgraded.schema_version().unwrap(), 8);
         let output_table: String = upgraded
             .connection()
             .unwrap()
@@ -2966,6 +3193,78 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output_table, "graph_node_outputs");
+    }
+
+    #[test]
+    fn upgrades_v7_run_and_output_ledgers_without_losing_evidence() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("v7.db");
+        let store = Store::open(&path).unwrap();
+        drop(store);
+        let fixture = Connection::open(&path).unwrap();
+        fixture
+            .execute_batch(
+                "DELETE FROM schema_migrations WHERE version = 8;
+                 DROP TABLE graph_node_outputs;
+                 DROP TABLE graph_node_runs;
+                 CREATE TABLE graph_node_runs (
+                    execution_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(execution_id, node_id));
+                 CREATE TABLE graph_node_outputs (
+                    execution_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    markdown TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(execution_id, node_id),
+                    UNIQUE(run_id),
+                    FOREIGN KEY(run_id) REFERENCES graph_node_runs(run_id));
+                 INSERT INTO graph_node_runs VALUES ('execution', 'node', 'run-1', 'before');
+                 INSERT INTO graph_node_outputs VALUES (
+                    'execution', 'node', 'run-1', 'sha256:old', 'old output', 'before');",
+            )
+            .unwrap();
+        drop(fixture);
+
+        let upgraded = Store::open(&path).unwrap();
+        assert_eq!(upgraded.schema_version().unwrap(), 8);
+        let connection = upgraded.connection().unwrap();
+        let migrated: (u64, String) = connection
+            .query_row(
+                "SELECT attempt, created_at FROM graph_node_runs WHERE run_id='run-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(migrated, (1, "before".into()));
+        let old_output: String = connection
+            .query_row(
+                "SELECT markdown FROM graph_node_outputs WHERE run_id='run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_output, "old output");
+        connection
+            .execute(
+                "INSERT INTO graph_node_runs(
+                    execution_id, node_id, run_id, attempt, created_at)
+                 VALUES ('execution', 'node', 'run-2', 2, 'after')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO graph_node_outputs(
+                    execution_id, node_id, run_id, content_hash, markdown, created_at)
+                 VALUES ('execution', 'node', 'run-2', 'sha256:new', 'new output', 'after')",
+                [],
+            )
+            .unwrap();
     }
 
     #[test]
@@ -3396,6 +3695,264 @@ mod tests {
             event.event_type == "graph.running_nodes_marked_uncertain"
                 && !event.payload_json.contains("worker")
         }));
+    }
+
+    #[test]
+    fn failed_node_retry_preserves_attempts_cost_outputs_and_sanitized_failure() {
+        let directory = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let path = directory.path().join("retry.db");
+        let store = Store::open(&path).unwrap();
+        let prepared = store
+            .prepare_mvp(PrepareMvpCommand {
+                expected_catalog_revision: 0,
+                expected_m3_revision: 0,
+                project_name: "Retry fixture".into(),
+                workspace_root: workspace.path().to_string_lossy().into_owned(),
+                codex_model: "gpt-test".into(),
+                agy_model: "agy-test".into(),
+            })
+            .unwrap();
+        let accepted = store
+            .accept_mvp_decision(AcceptDecisionBaselineCommand {
+                expected_m3_revision: prepared.m3_revision,
+                meeting_id: prepared.meeting_id,
+                content: "Research independently and join the final evidence.".into(),
+                accepted_by: "test-user".into(),
+                accepted_at: "2026-09-07T00:00:00Z".into(),
+            })
+            .unwrap();
+        let execution_id = accepted.graph_execution_id;
+        let graph = store.graph_execution(execution_id).unwrap();
+        let left_id = graph.nodes[0].node_id;
+        let right_id = graph.nodes[1].node_id;
+
+        let left = store
+            .begin_graph_node_run(
+                execution_id,
+                BeginGraphNodeRunCommand {
+                    expected_catalog_revision: prepared.catalog_revision,
+                    expected_graph_revision: graph.revision,
+                    node_id: left_id,
+                    owner: "left".into(),
+                },
+            )
+            .unwrap();
+        let left_finished = store
+            .finish_graph_node_run(
+                execution_id,
+                FinishGraphNodeRunCommand {
+                    expected_catalog_revision: left.catalog_revision,
+                    expected_graph_revision: left.graph_revision,
+                    expected_m3_revision: accepted.m3_revision,
+                    node_id: left_id,
+                    run_id: left.run_id,
+                    owner: "left".into(),
+                    terminal_state: bastet_core::NormalizedRunState::Succeeded,
+                    failure: None,
+                    provider_session_id: None,
+                    output_markdown: Some("# A final\n\nPreserved evidence.".into()),
+                    cost: cost(11),
+                },
+            )
+            .unwrap();
+        let left_hash = left_finished.output_content_hash.clone().unwrap();
+
+        let failed = store
+            .begin_graph_node_run(
+                execution_id,
+                BeginGraphNodeRunCommand {
+                    expected_catalog_revision: left_finished.catalog_revision,
+                    expected_graph_revision: left_finished.graph_revision,
+                    node_id: right_id,
+                    owner: "right".into(),
+                },
+            )
+            .unwrap();
+        let secret = "SUPERSECRET-provider-token";
+        let failed_finished = store
+            .finish_graph_node_run(
+                execution_id,
+                FinishGraphNodeRunCommand {
+                    expected_catalog_revision: failed.catalog_revision,
+                    expected_graph_revision: failed.graph_revision,
+                    expected_m3_revision: left_finished.m3_revision,
+                    node_id: right_id,
+                    run_id: failed.run_id,
+                    owner: "right".into(),
+                    terminal_state: bastet_core::NormalizedRunState::Failed,
+                    failure: Some(AdapterFailure {
+                        kind: AdapterFailureKind::PermissionDenied,
+                        message_key: "untrusted.secret-bearing-key".into(),
+                        retryable: true,
+                        provider_code: Some(secret.into()),
+                        redacted_detail: Some(format!("raw failure: {secret}")),
+                    }),
+                    provider_session_id: None,
+                    output_markdown: Some("# B partial\n\nHistorical partial evidence.".into()),
+                    cost: cost(13),
+                },
+            )
+            .unwrap();
+        let failed_graph = store.graph_execution(execution_id).unwrap();
+        assert_eq!(failed_graph.nodes[0].state, GraphNodeState::Succeeded);
+        assert_eq!(failed_graph.nodes[1].state, GraphNodeState::Failed);
+        assert_eq!(failed_graph.nodes[2].state, GraphNodeState::Blocked);
+        let sanitized = failed_graph.nodes[1].failure.as_ref().unwrap();
+        assert_eq!(sanitized.kind, AdapterFailureKind::PermissionDenied);
+        assert_eq!(sanitized.message_key, "adapter.failure.permission_denied");
+        assert!(sanitized.provider_code.is_none());
+        assert!(sanitized.redacted_detail.is_none());
+        assert!(!serde_json::to_string(&failed_graph)
+            .unwrap()
+            .contains(secret));
+        drop(store);
+
+        let store = Store::open(&path).unwrap();
+        let reopened_failed = store.graph_execution(execution_id).unwrap();
+        assert_eq!(reopened_failed.nodes[1].failure.as_ref(), Some(sanitized));
+        let failure_json: String = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT failure_json FROM graph_node_runs WHERE run_id=?1",
+                [failed.run_id.value().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!failure_json.contains(secret));
+        assert!(failure_json.contains("permission_denied"));
+
+        let retry = store
+            .retry_failed_graph_node(
+                execution_id,
+                RetryFailedGraphNodeCommand {
+                    node_id: right_id,
+                    expected_graph_revision: failed_finished.graph_revision,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            store.retry_failed_graph_node(
+                execution_id,
+                RetryFailedGraphNodeCommand {
+                    node_id: right_id,
+                    expected_graph_revision: failed_finished.graph_revision,
+                }
+            ),
+            Err(StoreError::RevisionConflict { .. })
+        ));
+        let retried_graph = store.graph_execution(execution_id).unwrap();
+        assert_eq!(retried_graph.nodes[0].state, GraphNodeState::Succeeded);
+        assert_eq!(retried_graph.nodes[1].state, GraphNodeState::Pending);
+        assert_eq!(retried_graph.nodes[2].state, GraphNodeState::Pending);
+        assert_eq!(retried_graph.outputs.len(), 2);
+        assert_eq!(
+            retried_graph.output(left_id).unwrap().content_hash,
+            left_hash
+        );
+
+        let second = store
+            .begin_graph_node_run(
+                execution_id,
+                BeginGraphNodeRunCommand {
+                    expected_catalog_revision: failed_finished.catalog_revision,
+                    expected_graph_revision: retry.revision,
+                    node_id: right_id,
+                    owner: "right-retry".into(),
+                },
+            )
+            .unwrap();
+        let stale = store.finish_graph_node_run(
+            execution_id,
+            FinishGraphNodeRunCommand {
+                expected_catalog_revision: second.catalog_revision,
+                expected_graph_revision: second.graph_revision,
+                expected_m3_revision: failed_finished.m3_revision,
+                node_id: right_id,
+                run_id: failed.run_id,
+                owner: "right".into(),
+                terminal_state: bastet_core::NormalizedRunState::Succeeded,
+                failure: None,
+                provider_session_id: None,
+                output_markdown: Some("stale result".into()),
+                cost: cost(99),
+            },
+        );
+        assert!(matches!(stale, Err(StoreError::InvalidRunState(_))));
+
+        let recovered = store
+            .finish_graph_node_run(
+                execution_id,
+                FinishGraphNodeRunCommand {
+                    expected_catalog_revision: second.catalog_revision,
+                    expected_graph_revision: second.graph_revision,
+                    expected_m3_revision: failed_finished.m3_revision,
+                    node_id: right_id,
+                    run_id: second.run_id,
+                    owner: "right-retry".into(),
+                    terminal_state: bastet_core::NormalizedRunState::Succeeded,
+                    failure: None,
+                    provider_session_id: None,
+                    output_markdown: Some("# B recovered\n\nCurrent evidence.".into()),
+                    cost: cost(17),
+                },
+            )
+            .unwrap();
+        let recovered_graph = store.graph_execution(execution_id).unwrap();
+        assert_eq!(recovered_graph.outputs.len(), 3);
+        assert_eq!(
+            recovered_graph.output(right_id).unwrap().run_id,
+            second.run_id
+        );
+        assert!(recovered_graph
+            .output(right_id)
+            .unwrap()
+            .markdown
+            .contains("recovered"));
+        let join = store
+            .begin_graph_node_run(
+                execution_id,
+                BeginGraphNodeRunCommand {
+                    expected_catalog_revision: recovered.catalog_revision,
+                    expected_graph_revision: recovered.graph_revision,
+                    node_id: recovered_graph.nodes[2].node_id,
+                    owner: "join".into(),
+                },
+            )
+            .unwrap();
+        assert!(join.prompt.contains("A final"));
+        assert!(join.prompt.contains("B recovered"));
+        assert!(!join.prompt.contains("B partial"));
+        assert!(join
+            .prompt
+            .contains("self-contained Markdown final response"));
+
+        let m3 = store.m3_catalog().unwrap();
+        assert_eq!(m3.catalog.deliverables.costs.len(), 3);
+        let connection = store.connection().unwrap();
+        let attempt_count: usize = connection
+            .query_row(
+                "SELECT COUNT(*) FROM graph_node_runs WHERE execution_id=?1 AND node_id=?2",
+                params![
+                    execution_id.value().to_string(),
+                    right_id.value().to_string()
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempt_count, 2);
+        let output_count: usize = connection
+            .query_row(
+                "SELECT COUNT(*) FROM graph_node_outputs WHERE execution_id=?1 AND node_id=?2",
+                params![
+                    execution_id.value().to_string(),
+                    right_id.value().to_string()
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(output_count, 2);
     }
 
     #[test]
