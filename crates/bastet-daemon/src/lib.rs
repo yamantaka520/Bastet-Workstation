@@ -253,8 +253,10 @@ impl axum::response::IntoResponse for ApiError {
         let status = match self.0 {
             StoreError::RevisionConflict { .. }
             | StoreError::InvalidLifecycle { .. }
-            | StoreError::ApprovalConflict => StatusCode::CONFLICT,
-            StoreError::ApprovalNotFound => StatusCode::NOT_FOUND,
+            | StoreError::ApprovalConflict
+            | StoreError::InvalidRunState(_) => StatusCode::CONFLICT,
+            StoreError::ApprovalNotFound | StoreError::RunNotFound => StatusCode::NOT_FOUND,
+            StoreError::RunControlRejected => StatusCode::SERVICE_UNAVAILABLE,
             StoreError::InvalidCatalog(_)
             | StoreError::InvalidApproval(_)
             | StoreError::Serialization(_) => StatusCode::BAD_REQUEST,
@@ -962,6 +964,7 @@ fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::Body, http::Request};
     use bastet_core::{
         Account, AccountId, AgentInstance, AgentInstanceId, AgentProvider, AgentProviderId,
         ApprovalAction, ApprovalDecision, ApprovalDecisionKind, ApprovalRequest, ApprovalRequestId,
@@ -971,6 +974,15 @@ mod tests {
         Run, RunId, ScopedPolicy, Session, SessionId,
     };
     use tempfile::tempdir;
+    use tower::ServiceExt;
+
+    struct AcceptingRunController;
+
+    impl RunController for AcceptingRunController {
+        fn cancel(&self, _run_id: RunId) -> Result<(), RunControlError> {
+            Ok(())
+        }
+    }
 
     fn metadata<I>(id: I) -> EntityMetadata<I> {
         EntityMetadata {
@@ -1513,6 +1525,77 @@ mod tests {
         assert_eq!(
             store.events_after(0).unwrap().last().unwrap().event_type,
             "run.cancel_accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_route_persists_only_after_controller_acceptance() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("cancel-route.db")).unwrap();
+        let mut catalog = catalog_fixture();
+        catalog.runs[0].state = bastet_core::NormalizedRunState::Running;
+        catalog.runs[0].started_at = Some("2026-09-06T00:00:01Z".into());
+        let run_id = catalog.runs[0].metadata.id;
+        store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: 0,
+                catalog,
+            })
+            .unwrap();
+        let command = bastet_protocol::CancelRunCommand {
+            run_id,
+            expected_catalog_revision: 1,
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/runs/{}/cancel", run_id.value()))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&command).unwrap()))
+            .unwrap();
+
+        let response = router_with_run_controller(store.clone(), Arc::new(AcceptingRunController))
+            .oneshot(request)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            store.catalog().unwrap().catalog.runs[0].state,
+            bastet_core::NormalizedRunState::Cancelling
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_route_fails_closed_without_provider_controller() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("cancel-rejected.db")).unwrap();
+        let mut catalog = catalog_fixture();
+        catalog.runs[0].state = bastet_core::NormalizedRunState::Running;
+        catalog.runs[0].started_at = Some("2026-09-06T00:00:01Z".into());
+        let run_id = catalog.runs[0].metadata.id;
+        store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: 0,
+                catalog,
+            })
+            .unwrap();
+        let command = bastet_protocol::CancelRunCommand {
+            run_id,
+            expected_catalog_revision: 1,
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/runs/{}/cancel", run_id.value()))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&command).unwrap()))
+            .unwrap();
+
+        let response = router(store.clone()).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            store.catalog().unwrap().catalog.runs[0].state,
+            bastet_core::NormalizedRunState::Running
         );
     }
 

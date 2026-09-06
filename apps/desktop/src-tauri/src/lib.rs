@@ -87,6 +87,18 @@ async fn work_projection(client: State<'_, DaemonClient>) -> Result<WorkProjecti
 }
 
 #[tauri::command]
+async fn cancel_run(
+    client: State<'_, DaemonClient>,
+    run_id: bastet_core::RunId,
+    expected_catalog_revision: u64,
+) -> Result<bastet_protocol::CancelRunReceipt, String> {
+    client
+        .cancel_run(run_id, expected_catalog_revision)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn agent_center_snapshot() -> Result<AgentCenterSnapshot, String> {
     tauri::async_runtime::spawn_blocking(inspect_agents)
         .await
@@ -395,6 +407,7 @@ pub fn run() {
             daemon_snapshot,
             agent_center_snapshot,
             work_projection,
+            cancel_run,
             approval_center_snapshot,
             decide_approval,
             prepare_for_sleep,

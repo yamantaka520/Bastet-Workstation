@@ -21,6 +21,7 @@ export function App() {
   const [approvals, setApprovals] = useState<ApprovalRecord[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
   const [work, setWork] = useState<WorkProjection>({ revision: 0, sessions: 0, runs: [] });
+  const [actionError, setActionError] = useState(false);
   const [autostart, setAutostart] = useState(false);
 
   const reconnect = useCallback(async () => {
@@ -39,6 +40,11 @@ export function App() {
     await invoke("decide_approval", { requestId: record.request.id, requestHash: record.request.request_hash, kind, decidedAtMs: Date.now() });
     await reconnect();
   };
+  const cancelRun = async (runId: string) => {
+    setActionError(false);
+    try { await invoke("cancel_run", { runId, expectedCatalogRevision: work.revision }); await reconnect(); }
+    catch { setActionError(true); }
+  };
 
   return <main>
     <header><div><p className="eyebrow">{translate(locale, "milestone")}</p><h1>{translate(locale, "title")}</h1></div>
@@ -54,7 +60,8 @@ export function App() {
           <dt>{translate(locale, "models")}</dt><dd>{agent.model_count ?? translate(locale, "unknown")}</dd><dt>{translate(locale, "reasoning")}</dt><dd>{agent.reasoning_controls.join(" · ") || translate(locale, "unknown")}</dd>
           <dt>{translate(locale, "runControl")}</dt><dd>{agent.operations.join(" · ") || translate(locale, "unavailable")}</dd></dl></article>)}</div>
       <h3>Sessions and runs</h3><p>Sessions: {work.sessions} · Revision: {work.revision}</p>
-      {work.runs.length === 0 ? <p>No runs.</p> : <ul>{work.runs.map((run) => <li key={run.run_id}><code>{run.run_id}</code> — {run.state}</li>)}</ul>}</section>}
+      {actionError && <p role="alert">Cancellation was not accepted.</p>}
+      {work.runs.length === 0 ? <p>No runs.</p> : <ul>{work.runs.map((run) => <li key={run.run_id}><code>{run.run_id}</code> — {run.state} {run.can_cancel && <button type="button" onClick={() => void cancelRun(run.run_id)}>Cancel</button>}</li>)}</ul>}</section>}
 
     {view === "approvals" && <section aria-labelledby="approvals-heading"><h2 id="approvals-heading">{translate(locale, "approvals")}</h2><p>{translate(locale, "approvalHelp")}</p>
       {approvals.length === 0 ? <p>{translate(locale, "noApprovals")}</p> : approvals.map((record) => <article key={record.request.id} className="approval-card"><h3>{record.request.action.action_key}</h3>

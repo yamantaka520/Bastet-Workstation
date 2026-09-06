@@ -1,10 +1,10 @@
 use std::{env, time::Duration};
 
-use bastet_core::{ApprovalDecision, ApprovalRequest, ApprovalRequestId, IdentityCatalog};
+use bastet_core::{ApprovalDecision, ApprovalRequest, ApprovalRequestId, IdentityCatalog, RunId};
 use bastet_protocol::{
-    ApprovalList, ApprovalReceipt, ApprovalRecord, CatalogReceipt, CatalogSnapshot,
-    CheckpointCommand, CheckpointReceipt, CreateApprovalCommand, DaemonSnapshot,
-    DecideApprovalCommand, EventEnvelope, ReplaceCatalogCommand, PROTOCOL_VERSION,
+    ApprovalList, ApprovalReceipt, ApprovalRecord, CancelRunCommand, CancelRunReceipt,
+    CatalogReceipt, CatalogSnapshot, CheckpointCommand, CheckpointReceipt, CreateApprovalCommand,
+    DaemonSnapshot, DecideApprovalCommand, EventEnvelope, ReplaceCatalogCommand, PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -174,6 +174,31 @@ impl DaemonClient {
             .await?
             .error_for_status()?
             .json::<ApprovalReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
+    pub async fn cancel_run(
+        &self,
+        run_id: RunId,
+        expected_catalog_revision: u64,
+    ) -> Result<CancelRunReceipt, ClientError> {
+        let receipt = self
+            .http
+            .post(format!(
+                "{}/v1/runs/{}/cancel",
+                self.base_url,
+                run_id.value()
+            ))
+            .json(&CancelRunCommand {
+                run_id,
+                expected_catalog_revision,
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<CancelRunReceipt>()
             .await?;
         require_protocol(receipt.protocol_version)?;
         Ok(receipt)
