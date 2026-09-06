@@ -2,7 +2,8 @@ use std::{path::PathBuf, time::Duration};
 
 use bastet_adapter_codex::{
     ApprovalPolicy, CodexAppServer, CodexRunEvidence, CodexRunEvidenceUpdate, CodexRunStream,
-    StdioTransport, ThreadSandbox, ThreadStartRequest, TurnSandboxPolicy, TurnStartRequest,
+    CodexRunUpdate, StdioTransport, ThreadSandbox, ThreadStartRequest, TurnSandboxPolicy,
+    TurnStartRequest,
 };
 use bastet_core::{AdapterFailureKind, NormalizedRunState, RunId};
 
@@ -68,9 +69,11 @@ fn installed_codex_completes_a_read_only_turn_over_stdio() {
     let mut saw_cost = false;
 
     loop {
-        let notification = server.next_notification().unwrap();
-        if let Some(update) = evidence.ingest(&notification).unwrap() {
-            match update {
+        match server
+            .next_run_update(&mut stream, &evidence, "2026-09-03T00:00:00Z")
+            .unwrap()
+        {
+            CodexRunUpdate::Evidence(update) => match update {
                 CodexRunEvidenceUpdate::Cost(cost) => {
                     assert!(cost.input_tokens.is_some());
                     assert!(cost.output_tokens.is_some());
@@ -80,18 +83,12 @@ fn installed_codex_completes_a_read_only_turn_over_stdio() {
                 CodexRunEvidenceUpdate::WriteReceipt(_) => {
                     panic!("read-only probe unexpectedly reported a write")
                 }
-            }
-        }
-        let Some(event) = stream
-            .ingest(&notification, "2026-09-03T00:00:00Z")
-            .unwrap()
-        else {
-            continue;
-        };
-        match event.event.state {
-            NormalizedRunState::Running => saw_running = true,
-            NormalizedRunState::Succeeded => break,
-            state => panic!("read-only probe ended in unexpected state: {state:?}"),
+            },
+            CodexRunUpdate::Lifecycle(event) => match event.event.state {
+                NormalizedRunState::Running => saw_running = true,
+                NormalizedRunState::Succeeded => break,
+                state => panic!("read-only probe ended in unexpected state: {state:?}"),
+            },
         }
     }
 

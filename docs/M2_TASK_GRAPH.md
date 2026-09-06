@@ -99,5 +99,7 @@ verification status; it does not add scope.
   each app-server notification exactly once and routes it to lifecycle or redacted evidence
   normalization. Locally observed notification timeout becomes a terminal timeout event and
   transport loss becomes an uncertain crash event; protocol drift and remote rejection still fail
-  closed instead of being mislabeled as runtime state.
+  closed instead of being mislabeled as runtime state. A real read-only canary passes through this
+  unified boundary. Real write evidence remains gated separately because the provider does not
+  guarantee a diff notification for every observed filesystem write.
 - M2.4–M2.8: not started.
