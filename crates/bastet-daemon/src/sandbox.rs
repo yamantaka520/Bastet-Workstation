@@ -115,17 +115,22 @@ mod tests {
 
     #[test]
     fn platform_plans_fail_closed_and_never_use_prompt_level_controls() {
-        let profile = SandboxProfile {
+        let mac_profile = SandboxProfile {
             workspace_root: PathBuf::from("/workspace"),
             allow_workspace_write: true,
             allow_network: false,
         };
-        let mac = profile.macos_profile();
+        let mac = mac_profile.macos_profile();
         assert!(mac.contains("deny default"));
         assert!(mac.contains("(subpath \"/workspace\")"));
         assert!(!mac.contains("allow network"));
         assert!(matches!(
-            profile.launch_command(
+            SandboxProfile {
+                workspace_root: std::env::current_dir().unwrap(),
+                allow_workspace_write: true,
+                allow_network: false,
+            }
+            .launch_command(
                 SandboxPlatform::WindowsAppContainer,
                 Path::new("agent.exe"),
                 &[]
