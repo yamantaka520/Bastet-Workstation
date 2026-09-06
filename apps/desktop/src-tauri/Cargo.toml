@@ -21,6 +21,7 @@ bastet-adapter-agy = { path = "../../../crates/bastet-adapter-agy" }
 bastet-adapter-codex = { path = "../../../crates/bastet-adapter-codex" }
 bastet-protocol = { path = "../../../crates/bastet-protocol" }
 serde.workspace = true
+serde_json.workspace = true
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2.5.1"
 tokio.workspace = true

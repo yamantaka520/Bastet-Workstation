@@ -13,7 +13,13 @@ use bastet_protocol::{
     PROTOCOL_VERSION,
 };
 use serde::Serialize;
-use std::{env, path::PathBuf, time::Duration};
+use std::{
+    env,
+    io::Write,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
 use supervisor::DaemonSupervisor;
 use tauri::{
     menu::{Menu, MenuItem, Submenu},
@@ -492,6 +498,205 @@ async fn prepare_knowledge_delivery(
             preview,
         })
         .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn deliver_knowledge(
+    client: State<'_, DaemonClient>,
+    delivery_id: bastet_core::KnowledgeDeliveryId,
+    delivered_on: String,
+) -> Result<bastet_protocol::KnowledgeDeliveryReceipt, String> {
+    if delivered_on.len() != 10
+        || delivered_on
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| {
+                if matches!(index, 4 | 7) {
+                    *byte != b'-'
+                } else {
+                    !byte.is_ascii_digit()
+                }
+            })
+    {
+        return Err("delivery date must be YYYY-MM-DD".into());
+    }
+    let snapshot = client
+        .m3_catalog()
+        .await
+        .map_err(|error| error.to_string())?;
+    let delivery = snapshot
+        .catalog
+        .deliverables
+        .knowledge_deliveries
+        .iter()
+        .find(|delivery| delivery.metadata.id == delivery_id)
+        .ok_or_else(|| "knowledge delivery not found".to_string())?;
+    if delivery.state != bastet_core::DeliveryState::Prepared {
+        return Err("knowledge delivery is not prepared".into());
+    }
+    let preview = delivery.preview.clone();
+    let target = delivery.target;
+    let receipt = tauri::async_runtime::spawn_blocking(move || match target {
+        bastet_core::KnowledgeTarget::AgentMemoryOs => deliver_agent_memory(delivery_id, &preview),
+        bastet_core::KnowledgeTarget::BastetMind => {
+            let root = env::var_os("BASTET_MIND_ROOT")
+                .map(PathBuf::from)
+                .ok_or_else(|| "BASTET_MIND_ROOT is not configured".to_string())?;
+            deliver_bastet_mind(&root, delivery_id, &preview, &delivered_on)
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    client
+        .complete_knowledge_delivery(bastet_protocol::CompleteKnowledgeDeliveryCommand {
+            expected_m3_revision: snapshot.revision,
+            delivery_id,
+            destination_receipt: receipt,
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn deliver_agent_memory(
+    delivery_id: bastet_core::KnowledgeDeliveryId,
+    preview: &str,
+) -> Result<String, String> {
+    let executable = configured_executable("BASTET_AGENT_MEMORY_BIN", "agent-memory")
+        .ok_or_else(|| "AgentMemoryOS CLI is unavailable".to_string())?;
+    deliver_agent_memory_with(&executable, delivery_id, preview)
+}
+
+fn deliver_agent_memory_with(
+    executable: &Path,
+    delivery_id: bastet_core::KnowledgeDeliveryId,
+    preview: &str,
+) -> Result<String, String> {
+    let marker = format!("bastet-delivery:{}", delivery_id.value());
+    let content = format!("[{marker}] {}", preview.trim());
+    let search = Command::new(executable)
+        .args([
+            "search",
+            &marker,
+            "--owner",
+            "bastet-workstation",
+            "--limit",
+            "20",
+            "--json",
+        ])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if search.status.success() {
+        let hits: serde_json::Value =
+            serde_json::from_slice(&search.stdout).map_err(|error| error.to_string())?;
+        if let Some(id) = hits
+            .as_array()
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("content").and_then(|value| value.as_str()) == Some(&content)
+                })
+            })
+            .and_then(|item| item.get("id"))
+            .and_then(|value| value.as_str())
+        {
+            return Ok(format!("agent-memory:{id}"));
+        }
+    }
+    let output = Command::new(executable)
+        .args([
+            "add",
+            &content,
+            "--owner",
+            "bastet-workstation",
+            "--scope",
+            "project",
+            "--type",
+            "fact",
+            "--tag",
+            &marker,
+            "--confidence",
+            "1",
+            "--importance",
+            "0.9",
+        ])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err("AgentMemoryOS rejected the delivery".into());
+    }
+    let id = std::str::from_utf8(&output.stdout)
+        .map_err(|error| error.to_string())?
+        .trim();
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err("AgentMemoryOS returned an invalid receipt".into());
+    }
+    Ok(format!("agent-memory:{id}"))
+}
+
+fn deliver_bastet_mind(
+    root: &Path,
+    delivery_id: bastet_core::KnowledgeDeliveryId,
+    preview: &str,
+    delivered_on: &str,
+) -> Result<String, String> {
+    let root = root.canonicalize().map_err(|error| error.to_string())?;
+    let output_dir = root
+        .join("40-輸出成果")
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let index = root.join("index.md");
+    let log = root.join("log.md");
+    if !root.join("AGENTS.md").is_file()
+        || !index.is_file()
+        || !log.is_file()
+        || !output_dir.starts_with(&root)
+    {
+        return Err("BASTET_MIND_ROOT is not a valid BastetMind vault".into());
+    }
+    let marker = format!("bastet-delivery:{}", delivery_id.value());
+    let name = format!("Bastet Workstation Delivery {}", delivery_id.value());
+    let path = output_dir.join(format!("{name}.md"));
+    let body = format!("---\ntype: output\nstatus: active\ncreated: {delivered_on}\nupdated: {delivered_on}\naliases: []\ntags: [Bastet-Workstation]\nsources: [\"[[40-輸出成果/Bastet Workstation Master Plan]]\"]\nconfidence: high\n---\n\n<!-- {marker} -->\n\n# {name}\n\n{}\n", preview.trim());
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => file
+            .write_all(body.as_bytes())
+            .map_err(|error| error.to_string())?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::read_to_string(&path).map_err(|error| error.to_string())? != body {
+                return Err("BastetMind delivery path conflicts with different content".into());
+            }
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+    append_once(
+        &index,
+        &marker,
+        &format!("\n- [[40-輸出成果/{name}]] — Bastet Workstation 明確交付。 <!-- {marker} -->\n"),
+    )?;
+    append_once(&log, &marker, &format!("\n\n## [{delivered_on}] knowledge delivery | Bastet Workstation\n\n- 新增 [[40-輸出成果/{name}]]；來源為已接受且已遮蔽的 Workstation artifact。 <!-- {marker} -->\n"))?;
+    Ok(format!("bastetmind:{marker}"))
+}
+
+fn append_once(path: &Path, marker: &str, content: &str) -> Result<(), String> {
+    if std::fs::read_to_string(path)
+        .map_err(|error| error.to_string())?
+        .contains(marker)
+    {
+        return Ok(());
+    }
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(content.as_bytes()))
         .map_err(|error| error.to_string())
 }
 
@@ -1064,6 +1269,7 @@ pub fn run() {
             create_mvp_document,
             accept_mvp_document,
             prepare_knowledge_delivery,
+            deliver_knowledge,
             apply_builtin_pet,
             rollback_builtin_pet,
             cancel_run,
@@ -1096,5 +1302,56 @@ mod tests {
         assert_eq!(state.product_name, "Bastet Workstation");
         assert_eq!(state.protocol_version, 1);
         assert!(state.daemon_authoritative);
+    }
+
+    #[test]
+    fn bastet_mind_delivery_is_idempotent_and_updates_required_indexes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("40-輸出成果")).unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "fixture").unwrap();
+        std::fs::write(root.path().join("index.md"), "# Index\n").unwrap();
+        std::fs::write(root.path().join("log.md"), "# Log\n").unwrap();
+        let id = bastet_core::KnowledgeDeliveryId::from_bytes([91; 16]);
+        let first = deliver_bastet_mind(root.path(), id, "Redacted result", "2026-09-07").unwrap();
+        let second = deliver_bastet_mind(root.path(), id, "Redacted result", "2026-09-07").unwrap();
+        assert_eq!(first, second);
+        let marker = format!("bastet-delivery:{}", id.value());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("index.md"))
+                .unwrap()
+                .matches(&marker)
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("log.md"))
+                .unwrap()
+                .matches(&marker)
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path().join("40-輸出成果"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_memory_delivery_requires_and_returns_a_real_cli_receipt() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("agent-memory-fixture");
+        std::fs::write(&executable, "#!/bin/sh\nif [ \"$1\" = search ]; then printf '[]'; else printf 'mem_fixture_receipt\\n'; fi\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let receipt = deliver_agent_memory_with(
+            &executable,
+            bastet_core::KnowledgeDeliveryId::from_bytes([92; 16]),
+            "Redacted result",
+        )
+        .unwrap();
+        assert_eq!(receipt, "agent-memory:mem_fixture_receipt");
     }
 }

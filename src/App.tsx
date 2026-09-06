@@ -95,6 +95,11 @@ export function App() {
     try { await invoke("prepare_knowledge_delivery", { projectId: document.project_id, artifactVersionId: document.version_id, target, preview: document.markdown }); await reconnect(); }
     catch { setActionError(true); }
   };
+  const deliverKnowledge = async (deliveryId: string) => {
+    setActionError(false);
+    try { await invoke("deliver_knowledge", { deliveryId, deliveredOn: new Date().toISOString().slice(0, 10) }); await reconnect(); }
+    catch { setActionError(true); }
+  };
 
   return <main>
     <header><div><p className="eyebrow">{translate(locale, "milestone")}</p><h1>{translate(locale, "title")}</h1></div>
@@ -114,7 +119,7 @@ export function App() {
       {m3.graph_nodes.some((node) => node.state === "pending") && <button type="button" onClick={() => void runReady()}>{translate(locale, "runReady")}</button>}
       {completedExecution && m3.document_versions.length === 0 && <form onSubmit={(event) => { event.preventDefault(); void createDocument(); }}><label>{translate(locale, "documentTitle")}<input required value={documentTitle} onChange={(event) => setDocumentTitle(event.target.value)} /></label><label>{translate(locale, "documentMarkdown")}<textarea required value={documentMarkdown} onChange={(event) => setDocumentMarkdown(event.target.value)} /></label><button type="submit">{translate(locale, "createDocument")}</button></form>}
       {m3.document_versions.map((document) => <article key={document.version_id}><h3>{document.title}</h3><pre>{document.markdown}</pre><code>{document.content_hash}</code>{document.accepted ? <><p>{translate(locale, "approved")}</p><div className="actions"><button type="button" onClick={() => void prepareKnowledge(document, "agent_memory_os")}>{translate(locale, "prepareMemory")}</button><button type="button" onClick={() => void prepareKnowledge(document, "bastet_mind")}>{translate(locale, "prepareMind")}</button></div></> : <button type="button" onClick={() => void acceptDocument(document)}>{translate(locale, "acceptDocument")}</button>}</article>)}
-      {m3.knowledge_deliveries.length > 0 && <section aria-labelledby="delivery-heading"><h3 id="delivery-heading">{translate(locale, "knowledgeDeliveries")}</h3><ul>{m3.knowledge_deliveries.map((delivery) => <li key={delivery.delivery_id}>{delivery.target} — {translate(locale, delivery.state === "delivered" ? "delivered" : "prepared")}</li>)}</ul></section>}
+      {m3.knowledge_deliveries.length > 0 && <section aria-labelledby="delivery-heading"><h3 id="delivery-heading">{translate(locale, "knowledgeDeliveries")}</h3><ul>{m3.knowledge_deliveries.map((delivery) => <li key={delivery.delivery_id}>{delivery.target} — {translate(locale, delivery.state === "delivered" ? "delivered" : "prepared")} {delivery.state === "prepared" && <button type="button" onClick={() => void deliverKnowledge(delivery.delivery_id)}>{translate(locale, "deliverNow")}</button>}</li>)}</ul></section>}
       {m3.graph_nodes.length > 0 && <ul>{m3.graph_nodes.map((node) => <li key={`${node.title}-${node.state}`}><span aria-hidden="true">🐈</span> {node.title} — {node.state} <span className="sr-only">{node.pet_state}</span></li>)}</ul>}</section>}
 
     {view === "agents" && <section aria-labelledby="agents-heading"><h2 id="agents-heading">{translate(locale, "agents")}</h2><p>{translate(locale, "agentHelp")}</p>
