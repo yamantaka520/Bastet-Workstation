@@ -3,14 +3,15 @@ use std::{env, time::Duration};
 use bastet_core::{ApprovalDecision, ApprovalRequest, ApprovalRequestId, IdentityCatalog, RunId};
 use bastet_protocol::{
     AcceptDecisionBaselineCommand, AcceptDecisionBaselineReceipt, AcceptDocumentCommand,
-    ApprovalList, ApprovalReceipt, ApprovalRecord, CancelRunCommand, CancelRunReceipt,
-    CatalogReceipt, CatalogSnapshot, CheckpointCommand, CheckpointReceipt, ClaimGraphNodesCommand,
-    ClaimGraphNodesReceipt, CompleteGraphNodeCommand, CompleteGraphNodeReceipt,
-    CompleteKnowledgeDeliveryCommand, CostReceipt, CreateApprovalCommand, CreateDocumentCommand,
-    CreateGraphExecutionCommand, DaemonSnapshot, DecideApprovalCommand, DocumentReceipt,
-    EventEnvelope, GraphExecutionList, GraphExecutionReceipt, KnowledgeDeliveryReceipt,
-    M3CatalogSnapshot, PrepareKnowledgeDeliveryCommand, PrepareMvpCommand, PrepareMvpReceipt,
-    RecordCostCommand, ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
+    ApprovalList, ApprovalReceipt, ApprovalRecord, BeginGraphNodeRunCommand,
+    BeginGraphNodeRunReceipt, CancelRunCommand, CancelRunReceipt, CatalogReceipt, CatalogSnapshot,
+    CheckpointCommand, CheckpointReceipt, ClaimGraphNodesCommand, ClaimGraphNodesReceipt,
+    CompleteGraphNodeCommand, CompleteGraphNodeReceipt, CompleteKnowledgeDeliveryCommand,
+    CostReceipt, CreateApprovalCommand, CreateDocumentCommand, CreateGraphExecutionCommand,
+    DaemonSnapshot, DecideApprovalCommand, DocumentReceipt, EventEnvelope, GraphExecutionList,
+    GraphExecutionReceipt, KnowledgeDeliveryReceipt, M3CatalogSnapshot,
+    PrepareKnowledgeDeliveryCommand, PrepareMvpCommand, PrepareMvpReceipt, RecordCostCommand,
+    ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -208,6 +209,28 @@ impl DaemonClient {
             .await?
             .error_for_status()?
             .json::<ClaimGraphNodesReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
+    pub async fn begin_graph_node_run(
+        &self,
+        execution_id: bastet_core::GraphRunId,
+        command: BeginGraphNodeRunCommand,
+    ) -> Result<BeginGraphNodeRunReceipt, ClientError> {
+        let receipt = self
+            .http
+            .post(format!(
+                "{}/v1/graphs/{}/runs",
+                self.base_url,
+                execution_id.value()
+            ))
+            .json(&command)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<BeginGraphNodeRunReceipt>()
             .await?;
         require_protocol(receipt.protocol_version)?;
         Ok(receipt)
@@ -599,19 +622,46 @@ mod tests {
             .unwrap()
             .executions
             .remove(0);
+        let begun = client
+            .begin_graph_node_run(
+                execution_id,
+                BeginGraphNodeRunCommand {
+                    expected_catalog_revision: prepared.catalog_revision,
+                    expected_graph_revision: graph.revision,
+                    node_id: graph.nodes[0].node_id,
+                    owner: "codex-worker".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(begun.adapter_kind, "codex_cli");
+        assert!(begun.prompt.contains("Assigned task"));
         let branches = client
             .claim_graph_nodes(
                 execution_id,
                 ClaimGraphNodesCommand {
-                    expected_revision: graph.revision,
+                    expected_revision: begun.graph_revision,
                     owner: "research".into(),
                     limit: 2,
                 },
             )
             .await
             .unwrap();
-        assert_eq!(branches.claimed.len(), 2);
+        assert_eq!(branches.claimed.len(), 1);
         let mut revision = branches.revision;
+        revision = client
+            .complete_graph_node(
+                execution_id,
+                CompleteGraphNodeCommand {
+                    expected_revision: revision,
+                    node_id: begun.node_id,
+                    owner: "codex-worker".into(),
+                    succeeded: true,
+                },
+            )
+            .await
+            .unwrap()
+            .revision;
         for node_id in branches.claimed {
             revision = client
                 .complete_graph_node(
@@ -710,13 +760,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mind.state, bastet_core::DeliveryState::Delivered);
+        let cost = client
+            .record_cost(RecordCostCommand {
+                expected_m3_revision: mind.m3_revision,
+                record: bastet_core::CostLedgerRecord {
+                    metadata: bastet_core::EntityMetadata {
+                        id: bastet_core::CostRecordId::new(),
+                        revision: 0,
+                        created_at: "2026-09-07T00:02:00Z".into(),
+                        updated_at: "2026-09-07T00:02:00Z".into(),
+                        provenance: bastet_core::Provenance {
+                            source_kind: "provider_event".into(),
+                            source_id: "client-test".into(),
+                            recorded_by: "bastet-client-test".into(),
+                        },
+                        lifecycle: bastet_core::EntityLifecycle::Active,
+                    },
+                    project_id: prepared.project_id,
+                    node_id: begun.node_id,
+                    run_id: begun.run_id,
+                    provider: begun.adapter_kind,
+                    account: "local-default".into(),
+                    model: begun.model,
+                    currency: None,
+                    amount: None,
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    evidence_class: bastet_core::EvidenceClass::ProviderReported,
+                    source: "provider usage event".into(),
+                    formula_version: None,
+                    confidence: 1.0,
+                    reconciliation_state: "observed".into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(cost.m3_revision, mind.m3_revision + 1);
         let receipt = client
             .checkpoint(initial.revision, "client integration test")
             .await
             .unwrap();
         assert_eq!(receipt.revision, initial.revision + 1);
         assert_eq!(client.snapshot().await.unwrap().revision, receipt.revision);
-        assert_eq!(store.events_after(0).unwrap().len(), 17);
+        assert_eq!(store.events_after(0).unwrap().len(), 19);
         let suspended = client
             .suspend(receipt.revision, "integration simulated sleep")
             .await

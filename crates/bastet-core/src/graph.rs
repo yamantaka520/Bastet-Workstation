@@ -235,6 +235,43 @@ impl GraphExecution {
         Ok(claimed)
     }
 
+    pub fn claim_node(&mut self, node_id: GraphNodeId, owner: &str) -> Result<(), GraphError> {
+        if owner.trim().is_empty() {
+            return Err(GraphError::InvalidExecution);
+        }
+        let states = self
+            .nodes
+            .iter()
+            .map(|node| (node.node_id, node.state))
+            .collect::<HashMap<_, _>>();
+        let definition = self
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .ok_or(GraphError::InvalidExecution)?;
+        if !definition
+            .needs
+            .iter()
+            .all(|dependency| states.get(dependency) == Some(&GraphNodeState::Succeeded))
+        {
+            return Err(GraphError::InvalidExecution);
+        }
+        let execution = self
+            .nodes
+            .iter_mut()
+            .find(|node| node.node_id == node_id)
+            .ok_or(GraphError::InvalidExecution)?;
+        if execution.state != GraphNodeState::Pending {
+            return Err(GraphError::InvalidExecution);
+        }
+        execution.state = GraphNodeState::Running;
+        execution.owner = Some(owner.into());
+        execution.revision += 1;
+        self.revision += 1;
+        Ok(())
+    }
+
     pub fn complete(
         &mut self,
         node_id: GraphNodeId,

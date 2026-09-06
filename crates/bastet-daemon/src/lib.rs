@@ -21,15 +21,15 @@ use bastet_core::{
 };
 use bastet_protocol::{
     AcceptDecisionBaselineCommand, AcceptDecisionBaselineReceipt, AcceptDocumentCommand,
-    ApprovalList, ApprovalReceipt, ApprovalRecord, CancelRunReceipt, CatalogReceipt,
-    CatalogSnapshot, CheckpointCommand, CheckpointReceipt, ClaimGraphNodesCommand,
-    ClaimGraphNodesReceipt, CompleteGraphNodeCommand, CompleteGraphNodeReceipt,
-    CompleteKnowledgeDeliveryCommand, CostReceipt, CreateApprovalCommand, CreateDocumentCommand,
-    CreateGraphExecutionCommand, DaemonLifecycle, DaemonSnapshot, DecideApprovalCommand,
-    DocumentReceipt, EventEnvelope, GraphExecutionList, GraphExecutionReceipt,
-    KnowledgeDeliveryReceipt, M3CatalogSnapshot, PrepareKnowledgeDeliveryCommand,
-    PrepareMvpCommand, PrepareMvpReceipt, RecordCostCommand, ReplaceCatalogCommand,
-    ReplaceM3CatalogCommand, PROTOCOL_VERSION,
+    ApprovalList, ApprovalReceipt, ApprovalRecord, BeginGraphNodeRunCommand,
+    BeginGraphNodeRunReceipt, CancelRunReceipt, CatalogReceipt, CatalogSnapshot, CheckpointCommand,
+    CheckpointReceipt, ClaimGraphNodesCommand, ClaimGraphNodesReceipt, CompleteGraphNodeCommand,
+    CompleteGraphNodeReceipt, CompleteKnowledgeDeliveryCommand, CostReceipt, CreateApprovalCommand,
+    CreateDocumentCommand, CreateGraphExecutionCommand, DaemonLifecycle, DaemonSnapshot,
+    DecideApprovalCommand, DocumentReceipt, EventEnvelope, GraphExecutionList,
+    GraphExecutionReceipt, KnowledgeDeliveryReceipt, M3CatalogSnapshot,
+    PrepareKnowledgeDeliveryCommand, PrepareMvpCommand, PrepareMvpReceipt, RecordCostCommand,
+    ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
@@ -199,6 +199,7 @@ fn build_router_with_controller(
             get(graph_executions).post(create_graph_execution),
         )
         .route("/v1/graphs/{execution_id}/claim", post(claim_graph_nodes))
+        .route("/v1/graphs/{execution_id}/runs", post(begin_graph_node_run))
         .route(
             "/v1/graphs/{execution_id}/complete",
             post(complete_graph_node),
@@ -346,6 +347,17 @@ async fn claim_graph_nodes(
         revision,
         claimed,
     }))
+}
+
+async fn begin_graph_node_run(
+    State(state): State<AppState>,
+    AxumPath(execution_id): AxumPath<Uuid>,
+    Json(command): Json<BeginGraphNodeRunCommand>,
+) -> Result<Json<BeginGraphNodeRunReceipt>, ApiError> {
+    Ok(Json(state.store.begin_graph_node_run(
+        GraphRunId::from_bytes(*execution_id.as_bytes()),
+        command,
+    )?))
 }
 
 async fn complete_graph_node(
@@ -1332,6 +1344,152 @@ impl Store {
     ) -> Result<Vec<GraphNodeId>, StoreError> {
         self.update_graph(id, expected_revision, "graph.nodes_claimed", |execution| {
             execution.claim_ready(owner, limit)
+        })
+    }
+
+    pub fn begin_graph_node_run(
+        &self,
+        id: GraphRunId,
+        command: BeginGraphNodeRunCommand,
+    ) -> Result<BeginGraphNodeRunReceipt, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (catalog_revision, identity_json): (u64, String) = transaction.query_row(
+            "SELECT revision, catalog_json FROM identity_catalog WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if catalog_revision != command.expected_catalog_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: command.expected_catalog_revision,
+                actual: catalog_revision,
+            });
+        }
+        let mut identity: IdentityCatalog = serde_json::from_str(&identity_json)?;
+        let m3: M3Catalog = serde_json::from_str(&transaction.query_row::<String, _, _>(
+            "SELECT catalog_json FROM m3_catalog WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?)?;
+        let (graph_revision, graph_json): (u64, String) = transaction
+            .query_row(
+                "SELECT revision, execution_json FROM graph_executions WHERE execution_id=?1",
+                [id.value().to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::GraphNotFound)?;
+        if graph_revision != command.expected_graph_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: command.expected_graph_revision,
+                actual: graph_revision,
+            });
+        }
+        let mut execution: GraphExecution = serde_json::from_str(&graph_json)?;
+        let definition = execution
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.id == command.node_id)
+            .ok_or(GraphError::InvalidExecution)?
+            .clone();
+        let baseline = m3
+            .meetings
+            .decision_baselines
+            .iter()
+            .find(|baseline| baseline.metadata.id == execution.graph.decision_baseline_id)
+            .ok_or_else(|| StoreError::InvalidMvp("graph DecisionBaseline not found".into()))?;
+        let meeting = m3
+            .meetings
+            .meetings
+            .iter()
+            .find(|meeting| meeting.metadata.id == baseline.meeting_id)
+            .ok_or_else(|| StoreError::InvalidMvp("DecisionBaseline meeting not found".into()))?;
+        let assignment = m3
+            .office
+            .pet_assignments
+            .iter()
+            .find(|assignment| {
+                assignment.project_id == meeting.project_id
+                    && assignment.role_id == definition.role_id
+            })
+            .ok_or_else(|| StoreError::InvalidMvp("role-bound Pet assignment not found".into()))?;
+        let agent = identity
+            .agent_instances
+            .iter()
+            .find(|agent| agent.metadata.id == assignment.agent_instance_id)
+            .ok_or_else(|| StoreError::InvalidMvp("assigned agent not found".into()))?;
+        let provider = identity
+            .agent_providers
+            .iter()
+            .find(|provider| provider.metadata.id == agent.agent_provider_id)
+            .ok_or_else(|| StoreError::InvalidMvp("agent provider not found".into()))?;
+        let model_id = agent
+            .default_model_id
+            .ok_or_else(|| StoreError::InvalidMvp("default model not configured".into()))?;
+        let model = identity
+            .models
+            .iter()
+            .find(|model| model.metadata.id == model_id)
+            .ok_or_else(|| StoreError::InvalidMvp("default model not found".into()))?;
+        let workspace_root = identity
+            .projects
+            .iter()
+            .find(|project| project.metadata.id == meeting.project_id)
+            .ok_or_else(|| StoreError::InvalidMvp("project not found".into()))?
+            .workspace_root
+            .clone();
+        let adapter_kind = provider.adapter_kind.clone();
+        let provider_model = model.provider_model_id.clone();
+        let prompt = format!(
+            "Decision baseline:\n{}\n\nAssigned task:\n{}",
+            baseline.content, definition.title
+        );
+        execution.claim_node(command.node_id, &command.owner)?;
+        let session_id = bastet_core::SessionId::new();
+        let run_id = RunId::new();
+        identity.sessions.push(bastet_core::Session {
+            metadata: entity_metadata(session_id, "graph_node_run"),
+            agent_instance_id: agent.metadata.id,
+            project_id: meeting.project_id,
+            provider_session_id: None,
+        });
+        identity.runs.push(bastet_core::Run {
+            metadata: entity_metadata(run_id, "graph_node_run"),
+            session_id,
+            model_id,
+            state: bastet_core::NormalizedRunState::Starting,
+            started_at: Some(timestamp()),
+            finished_at: None,
+        });
+        identity.validate()?;
+        let next_catalog_revision = catalog_revision
+            .checked_add(1)
+            .ok_or(StoreError::RevisionOverflow)?;
+        transaction.execute("UPDATE identity_catalog SET revision=?1,catalog_json=?2,updated_at=?3 WHERE singleton=1",
+            params![next_catalog_revision, serde_json::to_string(&identity)?, timestamp()])?;
+        transaction.execute("UPDATE graph_executions SET revision=?1,execution_json=?2,updated_at=?3 WHERE execution_id=?4",
+            params![execution.revision, serde_json::to_string(&execution)?, timestamp(), id.value().to_string()])?;
+        let event = insert_event(
+            &transaction,
+            "graph.node_run_started",
+            &serde_json::json!({"execution_id": id, "node_id": command.node_id, "run_id": run_id})
+                .to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(BeginGraphNodeRunReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            execution_id: id,
+            node_id: command.node_id,
+            session_id,
+            run_id,
+            adapter_kind,
+            model: provider_model,
+            workspace_root,
+            prompt,
+            catalog_revision: next_catalog_revision,
+            graph_revision: execution.revision,
+            event_sequence: event.sequence,
         })
     }
 
