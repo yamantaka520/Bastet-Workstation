@@ -87,6 +87,14 @@ scenario above now asserts actual content instead of injecting a canned document
 creates an idempotent child graph using the existing accepted decision and preserves historical
 artifacts. M3 remains open pending the full human gate and final cross-platform CI.
 
+Rebuilt-app operator check on the existing `Test-Prj`: old accepted filename-only document and
+delivery remain intact, schema upgrade loads, and the recovery action creates a new child graph.
+Its Codex branch retained 2,911 characters of actual research, but Agy finished `failed` without
+output and join is `blocked`. Failure detail was not retained by the desktop outcome, so the exact
+provider cause is unresolved (the configured 120-second timeout is not proof of a timeout).
+The user's actual report has NOT been recovered, accepted, or republished. Do not treat the passing
+isolated-provider scenario as a passing retest of this user's complete research task.
+
 2026-09-07 blocking finding: after applying the built-in Pet, preparing `Test-Prj` failed.
 Desktop and core constructed identical Pet assets with different metadata timestamps, so the daemon
 rejected the desktop profile as existing data. The global error was outside the scrolled form.
