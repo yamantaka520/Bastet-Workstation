@@ -39,6 +39,9 @@ impl SandboxProfile {
         self.validate()?;
         let mut command = match platform {
             SandboxPlatform::MacosSeatbelt => {
+                if self.workspace_root.to_string_lossy().contains('\\') {
+                    return Err(SandboxError::UnsafeWorkspace);
+                }
                 require_executable(Path::new("/usr/bin/sandbox-exec"), "sandbox-exec")?;
                 let mut command = Command::new("/usr/bin/sandbox-exec");
                 command.args(["-p", &self.macos_profile(), "--"]);
@@ -76,7 +79,7 @@ impl SandboxProfile {
             return Err(SandboxError::NonAbsoluteWorkspace);
         }
         let root = self.workspace_root.to_string_lossy();
-        if root.contains(['\n', '\r', '"', '\\']) {
+        if root.contains(['\n', '\r', '"']) {
             return Err(SandboxError::UnsafeWorkspace);
         }
         Ok(())
