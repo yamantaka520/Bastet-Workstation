@@ -151,4 +151,15 @@ verification status; it does not add scope.
   passes all ten mandatory conformance scenarios, including auth/quota classification and
   redaction. Production capabilities now expose only the verified start, attach/resume,
   status/wait, cancel, usage, read-only, bounded-write, and structured-event boundaries.
-- M2.5–M2.8: not started.
+- M2.5 daemon persistence and API: complete locally. Forward-only schema v2 adds a singleton,
+  independently revisioned identity catalog aggregate. Every replacement first passes the core
+  relationship and policy validation, then commits the catalog plus a redacted count-only journal
+  event in one immediate transaction. `GET/PUT /v1/catalog` and the loopback client enforce the
+  protocol version and compare-and-swap revision. Tests cover v0 and previous-v1 upgrades,
+  unsupported future schemas, invalid-catalog rejection before mutation, stale revisions,
+  restart persistence, and online backup/reopen with identity/policy/adapter state intact.
+  On daemon restart, persisted `Running`, `Cancelling`, or `Recovering` runs are atomically changed
+  to `Uncertain`, with both entity and catalog revisions advanced and a count-only reconciliation
+  event recorded. This prevents a process kill from silently presenting stale active work as
+  authoritative or retrying a side effect without reconciliation.
+- M2.6–M2.8: not started.

@@ -10,9 +10,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use bastet_core::{CatalogError, IdentityCatalog};
 use bastet_protocol::{
-    CheckpointCommand, CheckpointReceipt, DaemonLifecycle, DaemonSnapshot, EventEnvelope,
-    PROTOCOL_VERSION,
+    CatalogReceipt, CatalogSnapshot, CheckpointCommand, CheckpointReceipt, DaemonLifecycle,
+    DaemonSnapshot, EventEnvelope, ReplaceCatalogCommand, PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
@@ -20,7 +21,7 @@ use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -37,6 +38,12 @@ pub enum StoreError {
     },
     #[error("store mutex was poisoned")]
     Poisoned,
+    #[error("identity catalog is invalid: {0}")]
+    InvalidCatalog(#[from] CatalogError),
+    #[error("identity catalog serialization failed: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("state revision overflow")]
+    RevisionOverflow,
 }
 
 #[derive(Clone)]
@@ -68,6 +75,7 @@ fn build_router(store: Store, shutdown_signal: Option<watch::Sender<bool>>) -> R
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/events", get(events))
+        .route("/v1/catalog", get(catalog).put(replace_catalog))
         .route("/v1/checkpoints", post(checkpoint))
         .route("/v1/power/suspend", post(suspend))
         .route("/v1/power/resume", post(resume))
@@ -94,6 +102,17 @@ async fn checkpoint(
     Json(command): Json<CheckpointCommand>,
 ) -> Result<Json<CheckpointReceipt>, ApiError> {
     Ok(Json(state.store.checkpoint(command)?))
+}
+
+async fn catalog(State(state): State<AppState>) -> Result<Json<CatalogSnapshot>, ApiError> {
+    Ok(Json(state.store.catalog()?))
+}
+
+async fn replace_catalog(
+    State(state): State<AppState>,
+    Json(command): Json<ReplaceCatalogCommand>,
+) -> Result<Json<CatalogReceipt>, ApiError> {
+    Ok(Json(state.store.replace_catalog(command)?))
 }
 
 async fn shutdown(
@@ -131,13 +150,12 @@ impl From<StoreError> for ApiError {
 
 impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let status = if matches!(
-            self.0,
-            StoreError::RevisionConflict { .. } | StoreError::InvalidLifecycle { .. }
-        ) {
-            StatusCode::CONFLICT
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
+        let status = match self.0 {
+            StoreError::RevisionConflict { .. } | StoreError::InvalidLifecycle { .. } => {
+                StatusCode::CONFLICT
+            }
+            StoreError::InvalidCatalog(_) | StoreError::Serialization(_) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (
             status,
@@ -172,6 +190,7 @@ impl Store {
                 [current + 1],
             )?;
             insert_event(&transaction, "daemon.recovery_started", "{}")?;
+            reconcile_catalog_for_recovery(&transaction)?;
             transaction.commit()?;
         }
         Ok(Self {
@@ -205,6 +224,67 @@ impl Store {
             daemon_id: Uuid::parse_str(&daemon_id).expect("stored daemon UUID must be valid"),
             revision,
             lifecycle: parse_lifecycle(&lifecycle),
+        })
+    }
+
+    pub fn catalog(&self) -> Result<CatalogSnapshot, StoreError> {
+        let connection = self.connection()?;
+        let (revision, catalog_json): (u64, String) = connection.query_row(
+            "SELECT revision, catalog_json FROM identity_catalog WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let catalog: IdentityCatalog = serde_json::from_str(&catalog_json)?;
+        catalog.validate()?;
+        Ok(CatalogSnapshot {
+            protocol_version: PROTOCOL_VERSION,
+            revision,
+            catalog,
+        })
+    }
+
+    pub fn replace_catalog(
+        &self,
+        command: ReplaceCatalogCommand,
+    ) -> Result<CatalogReceipt, StoreError> {
+        command.catalog.validate()?;
+        let catalog_json = serde_json::to_string(&command.catalog)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actual: u64 = transaction.query_row(
+            "SELECT revision FROM identity_catalog WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if actual != command.expected_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: command.expected_revision,
+                actual,
+            });
+        }
+        let revision = actual + 1;
+        transaction.execute(
+            "UPDATE identity_catalog SET revision = ?1, catalog_json = ?2, updated_at = ?3
+             WHERE singleton = 1",
+            params![revision, catalog_json, timestamp()],
+        )?;
+        let event = insert_event(
+            &transaction,
+            "catalog.replaced",
+            &serde_json::json!({
+                "revision": revision,
+                "agent_providers": command.catalog.agent_providers.len(),
+                "projects": command.catalog.projects.len(),
+                "sessions": command.catalog.sessions.len(),
+                "runs": command.catalog.runs.len()
+            })
+            .to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(CatalogReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            revision,
+            event_sequence: event.sequence,
         })
     }
 
@@ -429,6 +509,76 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StoreError> {
         )?;
         transaction.commit()?;
     }
+    if current < 2 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let empty_catalog = serde_json::to_string(&IdentityCatalog::default())?;
+        transaction.execute_batch(
+            "CREATE TABLE identity_catalog (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                revision INTEGER NOT NULL,
+                catalog_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL);",
+        )?;
+        transaction.execute(
+            "INSERT INTO identity_catalog(singleton, revision, catalog_json, updated_at)
+             VALUES (1, 0, ?1, ?2)",
+            params![empty_catalog, timestamp()],
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?1)",
+            [timestamp()],
+        )?;
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
+fn reconcile_catalog_for_recovery(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), StoreError> {
+    let (catalog_revision, catalog_json): (u64, String) = transaction.query_row(
+        "SELECT revision, catalog_json FROM identity_catalog WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let mut catalog: IdentityCatalog = serde_json::from_str(&catalog_json)?;
+    catalog.validate()?;
+    let updated_at = timestamp();
+    let mut changed = 0_u64;
+    for run in &mut catalog.runs {
+        if matches!(
+            run.state,
+            bastet_core::NormalizedRunState::Running
+                | bastet_core::NormalizedRunState::Cancelling
+                | bastet_core::NormalizedRunState::Recovering
+        ) {
+            run.state = bastet_core::NormalizedRunState::Uncertain;
+            run.metadata.revision = run
+                .metadata
+                .revision
+                .checked_add(1)
+                .ok_or(StoreError::RevisionOverflow)?;
+            run.metadata.updated_at.clone_from(&updated_at);
+            changed = changed.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
+        }
+    }
+    if changed == 0 {
+        return Ok(());
+    }
+    catalog.validate()?;
+    let revision = catalog_revision
+        .checked_add(1)
+        .ok_or(StoreError::RevisionOverflow)?;
+    transaction.execute(
+        "UPDATE identity_catalog SET revision = ?1, catalog_json = ?2, updated_at = ?3
+         WHERE singleton = 1",
+        params![revision, serde_json::to_string(&catalog)?, updated_at],
+    )?;
+    insert_event(
+        transaction,
+        "catalog.runs_marked_uncertain",
+        &serde_json::json!({"revision": revision, "runs": changed}).to_string(),
+    )?;
     Ok(())
 }
 
@@ -498,7 +648,116 @@ fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bastet_core::{
+        Account, AccountId, AgentInstance, AgentInstanceId, AgentProvider, AgentProviderId,
+        CredentialBackend, CredentialReference, CredentialReferenceId, EntityLifecycle,
+        EntityMetadata, Model, ModelId, ModelProvider, ModelProviderId, PermissionLevel,
+        PolicyCeiling, PolicyLayer, Project, ProjectId, Provenance, Role, RoleId, Run, RunId,
+        ScopedPolicy, Session, SessionId,
+    };
     use tempfile::tempdir;
+
+    fn metadata<I>(id: I) -> EntityMetadata<I> {
+        EntityMetadata {
+            id,
+            revision: 0,
+            created_at: "2026-09-06T00:00:00Z".into(),
+            updated_at: "2026-09-06T00:00:00Z".into(),
+            provenance: Provenance {
+                source_kind: "test_fixture".into(),
+                source_id: "m2.5".into(),
+                recorded_by: "bastet-daemon".into(),
+            },
+            lifecycle: EntityLifecycle::Active,
+        }
+    }
+
+    fn catalog_fixture() -> IdentityCatalog {
+        let credential_id = CredentialReferenceId::from_bytes([1; 16]);
+        let agent_provider_id = AgentProviderId::from_bytes([2; 16]);
+        let model_provider_id = ModelProviderId::from_bytes([3; 16]);
+        let account_id = AccountId::from_bytes([4; 16]);
+        let model_id = ModelId::from_bytes([5; 16]);
+        let observe = PolicyCeiling {
+            filesystem: PermissionLevel::Observe,
+            network: PermissionLevel::Deny,
+            process: PermissionLevel::Observe,
+            device: PermissionLevel::Deny,
+            credential: PermissionLevel::Deny,
+            persistent_approval: false,
+        };
+        let agent_instance_id = AgentInstanceId::from_bytes([6; 16]);
+        let project_id = ProjectId::from_bytes([7; 16]);
+        let session_id = SessionId::from_bytes([9; 16]);
+        IdentityCatalog {
+            credential_references: vec![CredentialReference {
+                metadata: metadata(credential_id),
+                backend: CredentialBackend::MacosKeychain,
+                service: "dev.bastet.workstation.agy".into(),
+                account_label: "opaque-default".into(),
+            }],
+            agent_providers: vec![AgentProvider {
+                metadata: metadata(agent_provider_id),
+                adapter_kind: "agy_cli".into(),
+                display_name: "Agy CLI".into(),
+            }],
+            model_providers: vec![ModelProvider {
+                metadata: metadata(model_provider_id),
+                provider_key: "google".into(),
+                display_name: "Google".into(),
+            }],
+            accounts: vec![Account {
+                metadata: metadata(account_id),
+                agent_provider_id,
+                provider_identity: "agy-default".into(),
+                credential_reference_id: Some(credential_id),
+            }],
+            models: vec![Model {
+                metadata: metadata(model_id),
+                model_provider_id,
+                provider_model_id: "gemini-fixture".into(),
+                reasoning_controls: vec!["low".into()],
+            }],
+            agent_instances: vec![AgentInstance {
+                metadata: metadata(agent_instance_id),
+                agent_provider_id,
+                account_id: Some(account_id),
+                default_model_id: Some(model_id),
+            }],
+            projects: vec![Project {
+                metadata: metadata(project_id),
+                name: "Fixture".into(),
+                workspace_root: "/fixture".into(),
+                policy: ScopedPolicy {
+                    layer: PolicyLayer::Project,
+                    ceiling: observe.clone(),
+                },
+            }],
+            roles: vec![Role {
+                metadata: metadata(RoleId::from_bytes([8; 16])),
+                name: "Researcher".into(),
+                responsibilities: vec!["research".into()],
+                policy: ScopedPolicy {
+                    layer: PolicyLayer::RoleOrAgent,
+                    ceiling: observe,
+                },
+            }],
+            sessions: vec![Session {
+                metadata: metadata(session_id),
+                agent_instance_id,
+                project_id,
+                provider_session_id: Some("provider-session-fixture".into()),
+            }],
+            runs: vec![Run {
+                metadata: metadata(RunId::from_bytes([10; 16])),
+                session_id,
+                model_id,
+                state: bastet_core::NormalizedRunState::Starting,
+                started_at: None,
+                finished_at: None,
+            }],
+        }
+    }
 
     #[test]
     fn enables_wal_and_applies_forward_migration() {
@@ -538,7 +797,7 @@ mod tests {
 
         let upgraded = Store::open(&path).unwrap();
         let snapshot = upgraded.snapshot().unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 1);
+        assert_eq!(upgraded.schema_version().unwrap(), 2);
         assert_eq!(snapshot.daemon_id, daemon_id);
         assert_eq!(snapshot.revision, 42);
         assert_eq!(snapshot.lifecycle, DaemonLifecycle::Recovering);
@@ -569,9 +828,141 @@ mod tests {
             Store::open(&path),
             Err(StoreError::UnsupportedSchemaVersion {
                 actual: 99,
-                supported: 1
+                supported: 2
             })
         ));
+    }
+
+    #[test]
+    fn upgrades_previous_v1_fixture_with_empty_valid_catalog() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("v1.db");
+        let daemon_id = Uuid::new_v4();
+        let fixture = Connection::open(&path).unwrap();
+        fixture
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+                 INSERT INTO schema_migrations(version, applied_at) VALUES (1, 'fixture');
+                 CREATE TABLE daemon_state (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    daemon_id TEXT NOT NULL, revision INTEGER NOT NULL, lifecycle TEXT NOT NULL);
+                 CREATE TABLE event_journal (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE, protocol_version INTEGER NOT NULL,
+                    event_type TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_json TEXT NOT NULL);
+                 CREATE TABLE checkpoints (
+                    checkpoint_id TEXT PRIMARY KEY, revision INTEGER NOT NULL,
+                    event_sequence INTEGER NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL);",
+            )
+            .unwrap();
+        fixture
+            .execute(
+                "INSERT INTO daemon_state(singleton, daemon_id, revision, lifecycle)
+                 VALUES (1, ?1, 9, 'ready')",
+                [daemon_id.to_string()],
+            )
+            .unwrap();
+        drop(fixture);
+
+        let upgraded = Store::open(&path).unwrap();
+        assert_eq!(upgraded.schema_version().unwrap(), 2);
+        assert_eq!(upgraded.snapshot().unwrap().daemon_id, daemon_id);
+        assert_eq!(upgraded.catalog().unwrap().revision, 0);
+        assert_eq!(
+            upgraded.catalog().unwrap().catalog,
+            IdentityCatalog::default()
+        );
+    }
+
+    #[test]
+    fn catalog_is_validated_durable_and_revision_guarded() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("catalog.db");
+        let store = Store::open(&path).unwrap();
+        let catalog = catalog_fixture();
+        let receipt = store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: 0,
+                catalog: catalog.clone(),
+            })
+            .unwrap();
+        assert_eq!(receipt.revision, 1);
+        assert_eq!(store.catalog().unwrap().catalog, catalog);
+        assert!(matches!(
+            store.replace_catalog(ReplaceCatalogCommand {
+                expected_revision: 0,
+                catalog: catalog_fixture(),
+            }),
+            Err(StoreError::RevisionConflict {
+                expected: 0,
+                actual: 1
+            })
+        ));
+        drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        let persisted = reopened.catalog().unwrap();
+        assert_eq!(persisted.revision, 1);
+        assert_eq!(persisted.catalog, catalog);
+        let events = reopened.events_after(0).unwrap();
+        let replaced = events
+            .iter()
+            .find(|event| event.event_type == "catalog.replaced")
+            .unwrap();
+        assert!(!replaced.payload_json.contains("opaque-default"));
+        assert!(!replaced.payload_json.contains("dev.bastet.workstation.agy"));
+    }
+
+    #[test]
+    fn active_run_is_marked_uncertain_atomically_on_restart() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("active-run.db");
+        let store = Store::open(&path).unwrap();
+        let mut catalog = catalog_fixture();
+        catalog.runs[0].state = bastet_core::NormalizedRunState::Running;
+        catalog.runs[0].started_at = Some("2026-09-06T00:00:01Z".into());
+        store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: 0,
+                catalog,
+            })
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        let recovered = reopened.catalog().unwrap();
+        assert_eq!(recovered.revision, 2);
+        assert_eq!(
+            recovered.catalog.runs[0].state,
+            bastet_core::NormalizedRunState::Uncertain
+        );
+        assert_eq!(recovered.catalog.runs[0].metadata.revision, 1);
+        let events = reopened.events_after(0).unwrap();
+        let reconcile = events
+            .iter()
+            .find(|event| event.event_type == "catalog.runs_marked_uncertain")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reconcile.payload_json).unwrap(),
+            serde_json::json!({"revision": 2, "runs": 1})
+        );
+    }
+
+    #[test]
+    fn invalid_catalog_is_rejected_before_revision_changes() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("invalid.db")).unwrap();
+        let mut catalog = catalog_fixture();
+        catalog.credential_references.clear();
+        assert!(matches!(
+            store.replace_catalog(ReplaceCatalogCommand {
+                expected_revision: 0,
+                catalog,
+            }),
+            Err(StoreError::InvalidCatalog(_))
+        ));
+        assert_eq!(store.catalog().unwrap().revision, 0);
     }
 
     #[test]
@@ -690,6 +1081,13 @@ mod tests {
         let backup_path = directory.path().join("backup.db");
         let store = Store::open(&live_path).unwrap();
         store.mark_ready().unwrap();
+        let catalog = catalog_fixture();
+        store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: 0,
+                catalog: catalog.clone(),
+            })
+            .unwrap();
         let receipt = store
             .checkpoint(CheckpointCommand {
                 expected_revision: 1,
@@ -701,10 +1099,14 @@ mod tests {
         let restored = Store::open(&backup_path).unwrap();
 
         assert_eq!(restored.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(restored.catalog().unwrap().catalog, catalog);
+        assert_eq!(restored.catalog().unwrap().revision, 1);
         assert!(has_checkpoint_for_revision(&restored, receipt.revision).unwrap());
         assert_eq!(restored.snapshot().unwrap().revision, receipt.revision + 1);
         let events = restored.events_after(0).unwrap();
-        assert_eq!(events[1].event_type, "daemon.checkpointed");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "daemon.checkpointed"));
         assert_eq!(events.last().unwrap().event_type, "daemon.recovery_started");
     }
 }

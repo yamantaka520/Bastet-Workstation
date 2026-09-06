@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -8,7 +9,7 @@ use crate::{
     ModelProvider, NormalizedRunState, PolicyLayer, Project, Role, Run, Session,
 };
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityCatalog {
     pub credential_references: Vec<CredentialReference>,
     pub agent_providers: Vec<AgentProvider>,

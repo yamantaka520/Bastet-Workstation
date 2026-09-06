@@ -1,7 +1,9 @@
 use std::{env, time::Duration};
 
+use bastet_core::IdentityCatalog;
 use bastet_protocol::{
-    CheckpointCommand, CheckpointReceipt, DaemonSnapshot, EventEnvelope, PROTOCOL_VERSION,
+    CatalogReceipt, CatalogSnapshot, CheckpointCommand, CheckpointReceipt, DaemonSnapshot,
+    EventEnvelope, ReplaceCatalogCommand, PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -66,6 +68,40 @@ impl DaemonClient {
             .await?
             .error_for_status()?
             .json::<CheckpointReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
+    pub async fn catalog(&self) -> Result<CatalogSnapshot, ClientError> {
+        let snapshot = self
+            .http
+            .get(format!("{}/v1/catalog", self.base_url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<CatalogSnapshot>()
+            .await?;
+        require_protocol(snapshot.protocol_version)?;
+        Ok(snapshot)
+    }
+
+    pub async fn replace_catalog(
+        &self,
+        expected_revision: u64,
+        catalog: IdentityCatalog,
+    ) -> Result<CatalogReceipt, ClientError> {
+        let receipt = self
+            .http
+            .put(format!("{}/v1/catalog", self.base_url))
+            .json(&ReplaceCatalogCommand {
+                expected_revision,
+                catalog,
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<CatalogReceipt>()
             .await?;
         require_protocol(receipt.protocol_version)?;
         Ok(receipt)
@@ -182,13 +218,30 @@ mod tests {
 
         let client = DaemonClient::new(format!("http://{address}"));
         let initial = client.snapshot().await.unwrap();
+        let initial_catalog = client.catalog().await.unwrap();
+        assert_eq!(initial_catalog.revision, 0);
+        let catalog_receipt = client
+            .replace_catalog(initial_catalog.revision, IdentityCatalog::default())
+            .await
+            .unwrap();
+        assert_eq!(catalog_receipt.revision, 1);
+        assert_eq!(client.catalog().await.unwrap().revision, 1);
+        let stale_catalog = client
+            .replace_catalog(0, IdentityCatalog::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            stale_catalog,
+            ClientError::Request(ref error)
+                if error.status() == Some(reqwest::StatusCode::CONFLICT)
+        ));
         let receipt = client
             .checkpoint(initial.revision, "client integration test")
             .await
             .unwrap();
         assert_eq!(receipt.revision, initial.revision + 1);
         assert_eq!(client.snapshot().await.unwrap().revision, receipt.revision);
-        assert_eq!(store.events_after(0).unwrap().len(), 2);
+        assert_eq!(store.events_after(0).unwrap().len(), 3);
         let suspended = client
             .suspend(receipt.revision, "integration simulated sleep")
             .await

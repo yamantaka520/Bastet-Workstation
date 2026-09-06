@@ -218,6 +218,7 @@ name = "bastet-client"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bastet-core",
  "bastet-daemon",
  "bastet-protocol",
  "reqwest",
@@ -244,6 +245,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bastet-core",
  "bastet-protocol",
  "rusqlite",
  "serde",
@@ -275,6 +277,7 @@ dependencies = [
 name = "bastet-protocol"
 version = "0.1.0"
 dependencies = [
+ "bastet-core",
  "serde",
  "serde_json",
  "uuid",

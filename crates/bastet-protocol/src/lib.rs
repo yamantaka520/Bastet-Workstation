@@ -1,5 +1,6 @@
 //! Shared wire types. The daemon is authoritative; clients only project this state.
 
+use bastet_core::IdentityCatalog;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -44,6 +45,26 @@ pub struct CheckpointCommand {
 pub struct CheckpointReceipt {
     pub protocol_version: u32,
     pub checkpoint_id: Uuid,
+    pub revision: u64,
+    pub event_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogSnapshot {
+    pub protocol_version: u32,
+    pub revision: u64,
+    pub catalog: IdentityCatalog,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplaceCatalogCommand {
+    pub expected_revision: u64,
+    pub catalog: IdentityCatalog,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogReceipt {
+    pub protocol_version: u32,
     pub revision: u64,
     pub event_sequence: u64,
 }

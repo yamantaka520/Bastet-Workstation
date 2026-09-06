@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bastet-core = { path = "../bastet-core" }
 bastet-protocol = { path = "../bastet-protocol" }
 reqwest.workspace = true
 thiserror.workspace = true
