@@ -110,6 +110,7 @@ fn require_executable(path: &Path, name: &'static str) -> Result<(), SandboxErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use tempfile::tempdir;
 
     #[test]
