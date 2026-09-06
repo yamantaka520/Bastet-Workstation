@@ -51,6 +51,10 @@ stable_id!(MeetingId);
 stable_id!(DecisionBaselineId);
 stable_id!(GraphNodeId);
 stable_id!(GraphRunId);
+stable_id!(ArtifactId);
+stable_id!(ArtifactVersionId);
+stable_id!(CostRecordId);
+stable_id!(KnowledgeDeliveryId);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

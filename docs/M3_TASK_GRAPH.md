@@ -32,3 +32,6 @@ verification evidence without adding scope.
   explicit join and failed-dependency blocking.
 - M3.3b started: daemon schema v4 persists graph executions with compare-and-set revisions and
   marks interrupted running nodes uncertain on restart without retaining worker identity in events.
+- M3.5/M3.6 contracts started: immutable document versions require a two-source join receipt and
+  explicit human acceptance; cost and explicit AgentMemoryOS/BastetMind delivery records preserve
+  evidence class, redacted preview, provenance, and destination receipt semantics.

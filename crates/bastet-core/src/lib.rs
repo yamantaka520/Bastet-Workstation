@@ -3,6 +3,7 @@
 pub mod adapter;
 pub mod approval;
 pub mod catalog;
+pub mod deliverable;
 pub mod graph;
 pub mod identity;
 pub mod meeting;
@@ -13,6 +14,7 @@ pub mod workspace;
 pub use adapter::*;
 pub use approval::*;
 pub use catalog::*;
+pub use deliverable::*;
 pub use graph::*;
 pub use identity::*;
 pub use meeting::*;
