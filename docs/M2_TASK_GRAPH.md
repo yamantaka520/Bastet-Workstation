@@ -114,5 +114,7 @@ verification status; it does not add scope.
   receipt before releasing the terminal event. This makes evidence ordering part of the adapter
   boundary instead of a responsibility duplicated by callers. Cancellation is also tracker-owned:
   `Cancelling` is emitted only after `turn/interrupt` is accepted, while authoritative `Cancelled`
-  still requires the provider's terminal `interrupted` notification.
+  still requires the provider's terminal `interrupted` notification. Resume follows the same
+  fail-closed rule: `Recovering` is emitted only after `thread/resume` returns a valid matching
+  thread handle, and its sequence remains owned by the run tracker.
 - M2.4–M2.8: not started.

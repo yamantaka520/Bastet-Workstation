@@ -3,8 +3,8 @@ use thiserror::Error;
 
 use crate::{
     AppServerError, AppServerTransport, CodexAppServer, CodexRunEvidence, CodexRunEvidenceUpdate,
-    CodexRunStream, CodexRunUpdate, EvidenceError, LifecycleError, WorkspaceEvidenceError,
-    WorkspaceSnapshot,
+    CodexRunStream, CodexRunUpdate, EvidenceError, LifecycleError, ThreadHandle,
+    WorkspaceEvidenceError, WorkspaceSnapshot,
 };
 
 #[derive(Debug, Error)]
@@ -56,6 +56,18 @@ impl CodexRunTracker {
         Ok(CodexRunUpdate::Lifecycle(
             self.stream.cancellation_requested(occurred_at)?,
         ))
+    }
+
+    pub fn resume_thread<T: AppServerTransport>(
+        &mut self,
+        server: &mut CodexAppServer<T>,
+        occurred_at: &str,
+    ) -> Result<(ThreadHandle, CodexRunUpdate), RunTrackerError> {
+        let handle = server.resume_thread(&self.provider_thread_id)?;
+        let event = self
+            .stream
+            .recovery_started(&handle.thread_id, occurred_at)?;
+        Ok((handle, CodexRunUpdate::Lifecycle(event)))
     }
 
     pub fn next_update<T: AppServerTransport>(
@@ -246,6 +258,54 @@ mod tests {
             fresh
                 .stream
                 .cancellation_requested("later")
+                .unwrap()
+                .event
+                .sequence,
+            1
+        );
+    }
+
+    #[test]
+    fn recovery_is_recorded_only_after_resume_is_accepted() {
+        let run_id = RunId::from_bytes([11; 16]);
+        let mut tracker = CodexRunTracker::new(run_id, "thr_1", "turn_1", None).unwrap();
+        let mut server = CodexAppServer::new(FixtureTransport {
+            responses: VecDeque::from([
+                Ok(json!({})),
+                Ok(json!({"thread": {"id": "thr_1", "sessionId": "session_1"}})),
+            ]),
+            ..FixtureTransport::default()
+        });
+        server.initialize().unwrap();
+        let (handle, CodexRunUpdate::Lifecycle(update)) = tracker
+            .resume_thread(&mut server, "2026-09-06T00:00:00Z")
+            .unwrap()
+        else {
+            panic!("accepted resume must emit lifecycle evidence");
+        };
+        assert_eq!(handle.thread_id, "thr_1");
+        assert_eq!(update.event.state, NormalizedRunState::Recovering);
+        assert_eq!(update.event.sequence, 1);
+
+        let mut rejected = CodexAppServer::new(FixtureTransport {
+            responses: VecDeque::from([
+                Ok(json!({})),
+                Err(TransportError::RemoteRejected {
+                    code: 55,
+                    retryable: false,
+                }),
+            ]),
+            ..FixtureTransport::default()
+        });
+        rejected.initialize().unwrap();
+        let mut fresh = CodexRunTracker::new(run_id, "thr_1", "turn_1", None).unwrap();
+        assert!(fresh
+            .resume_thread(&mut rejected, "2026-09-06T00:00:00Z")
+            .is_err());
+        assert_eq!(
+            fresh
+                .stream
+                .recovery_started("thr_1", "later")
                 .unwrap()
                 .event
                 .sequence,

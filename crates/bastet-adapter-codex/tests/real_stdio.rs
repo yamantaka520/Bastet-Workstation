@@ -251,13 +251,21 @@ fn installed_codex_resumes_a_read_only_thread_over_new_stdio_process() {
     let second_transport = StdioTransport::spawn(&executable, Duration::from_secs(60)).unwrap();
     let mut second_server = CodexAppServer::new(second_transport);
     second_server.initialize().unwrap();
-    let mut stream = CodexRunStream::new(RunId::from_bytes([45; 16]), "resume_probe").unwrap();
-    let recovering = stream
-        .recovery_started(&original.thread_id, "2026-09-03T00:00:00Z")
-        .unwrap();
+    let mut tracker = CodexRunTracker::new(
+        RunId::from_bytes([45; 16]),
+        &original.thread_id,
+        "resume_probe",
+        None,
+    )
+    .unwrap();
+    let (resumed, CodexRunUpdate::Lifecycle(recovering)) = tracker
+        .resume_thread(&mut second_server, "2026-09-03T00:00:00Z")
+        .unwrap()
+    else {
+        panic!("accepted resume must produce recovery evidence");
+    };
     assert_eq!(recovering.event.state, NormalizedRunState::Recovering);
     assert_eq!(recovering.event.sequence, 1);
-    let resumed = second_server.resume_thread(&original.thread_id).unwrap();
     assert_eq!(resumed.thread_id, original.thread_id);
     assert_eq!(resumed.session_id, original.session_id);
     assert_eq!(std::fs::read_dir(&probe_root).unwrap().count(), 0);
