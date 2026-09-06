@@ -346,7 +346,7 @@ fn run_agy(
         bastet_adapter_agy::AgyRunRequest {
             run_id,
             model,
-            effort: Some("medium".into()),
+            effort: None,
             prompt,
             cwd: root,
             read_only: true,
@@ -1353,5 +1353,182 @@ mod tests {
         )
         .unwrap();
         assert_eq!(receipt, "agent-memory:mem_fixture_receipt");
+    }
+
+    #[test]
+    #[ignore = "requires explicit installed/authenticated Codex and Agy CLIs; starts three real read-only provider runs"]
+    fn real_two_branch_mvp_and_join_survive_restart() {
+        let codex_model = env::var("BASTET_CODEX_MODEL").expect("BASTET_CODEX_MODEL must be set");
+        let agy_model = env::var("BASTET_AGY_MODEL").expect("BASTET_AGY_MODEL must be set");
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("mvp.db");
+        let store = bastet_daemon::Store::open(&database).unwrap();
+        let prepared = store
+            .prepare_mvp(bastet_protocol::PrepareMvpCommand {
+                expected_catalog_revision: 0,
+                expected_m3_revision: 0,
+                project_name: "Real M3 provider gate".into(),
+                workspace_root: root.path().to_string_lossy().into_owned(),
+                codex_model,
+                agy_model,
+            })
+            .unwrap();
+        let accepted = store.accept_mvp_decision(bastet_protocol::AcceptDecisionBaselineCommand {
+            expected_m3_revision: prepared.m3_revision, meeting_id: prepared.meeting_id,
+            content: "Independently assess the same bounded statement and then integrate the evidence.".into(),
+            accepted_by: "m3-real-gate".into(), accepted_at: "2026-09-07T00:00:00Z".into(),
+        }).unwrap();
+        let graph = store.graph_execution(accepted.graph_execution_id).unwrap();
+        let first = store
+            .begin_graph_node_run(
+                graph.id,
+                bastet_protocol::BeginGraphNodeRunCommand {
+                    expected_catalog_revision: prepared.catalog_revision,
+                    expected_graph_revision: graph.revision,
+                    node_id: graph.nodes[0].node_id,
+                    owner: "real-codex".into(),
+                },
+            )
+            .unwrap();
+        let second = store
+            .begin_graph_node_run(
+                graph.id,
+                bastet_protocol::BeginGraphNodeRunCommand {
+                    expected_catalog_revision: first.catalog_revision,
+                    expected_graph_revision: first.graph_revision,
+                    node_id: graph.nodes[1].node_id,
+                    owner: "real-agy".into(),
+                },
+            )
+            .unwrap();
+        let (left, right) = std::thread::scope(|scope| {
+            let left = scope.spawn(|| {
+                run_provider(
+                    &first.adapter_kind,
+                    first.run_id,
+                    first.model.clone(),
+                    first.prompt.clone(),
+                    PathBuf::from(&first.workspace_root),
+                )
+            });
+            let right = scope.spawn(|| {
+                run_provider(
+                    &second.adapter_kind,
+                    second.run_id,
+                    second.model.clone(),
+                    second.prompt.clone(),
+                    PathBuf::from(&second.workspace_root),
+                )
+            });
+            (
+                left.join().unwrap().unwrap(),
+                right.join().unwrap().unwrap(),
+            )
+        });
+        assert_eq!(
+            left.terminal_state,
+            bastet_core::NormalizedRunState::Succeeded
+        );
+        assert_eq!(
+            right.terminal_state,
+            bastet_core::NormalizedRunState::Succeeded
+        );
+        let first_done = store
+            .finish_graph_node_run(
+                graph.id,
+                bastet_protocol::FinishGraphNodeRunCommand {
+                    expected_catalog_revision: second.catalog_revision,
+                    expected_graph_revision: second.graph_revision,
+                    expected_m3_revision: accepted.m3_revision,
+                    node_id: first.node_id,
+                    run_id: first.run_id,
+                    owner: "real-codex".into(),
+                    terminal_state: left.terminal_state,
+                    provider_session_id: left.provider_session_id,
+                    cost: left.cost,
+                },
+            )
+            .unwrap();
+        let second_done = store
+            .finish_graph_node_run(
+                graph.id,
+                bastet_protocol::FinishGraphNodeRunCommand {
+                    expected_catalog_revision: first_done.catalog_revision,
+                    expected_graph_revision: first_done.graph_revision,
+                    expected_m3_revision: first_done.m3_revision,
+                    node_id: second.node_id,
+                    run_id: second.run_id,
+                    owner: "real-agy".into(),
+                    terminal_state: right.terminal_state,
+                    provider_session_id: right.provider_session_id,
+                    cost: right.cost,
+                },
+            )
+            .unwrap();
+        let graph = store.graph_execution(graph.id).unwrap();
+        let join_node = graph
+            .nodes
+            .iter()
+            .find(|node| node.state == bastet_core::GraphNodeState::Pending)
+            .unwrap()
+            .node_id;
+        let join = store
+            .begin_graph_node_run(
+                graph.id,
+                bastet_protocol::BeginGraphNodeRunCommand {
+                    expected_catalog_revision: second_done.catalog_revision,
+                    expected_graph_revision: second_done.graph_revision,
+                    node_id: join_node,
+                    owner: "real-join".into(),
+                },
+            )
+            .unwrap();
+        let joined = run_provider(
+            &join.adapter_kind,
+            join.run_id,
+            join.model.clone(),
+            join.prompt.clone(),
+            PathBuf::from(&join.workspace_root),
+        )
+        .unwrap();
+        assert_eq!(
+            joined.terminal_state,
+            bastet_core::NormalizedRunState::Succeeded
+        );
+        store
+            .finish_graph_node_run(
+                graph.id,
+                bastet_protocol::FinishGraphNodeRunCommand {
+                    expected_catalog_revision: join.catalog_revision,
+                    expected_graph_revision: join.graph_revision,
+                    expected_m3_revision: second_done.m3_revision,
+                    node_id: join.node_id,
+                    run_id: join.run_id,
+                    owner: "real-join".into(),
+                    terminal_state: joined.terminal_state,
+                    provider_session_id: joined.provider_session_id,
+                    cost: joined.cost,
+                },
+            )
+            .unwrap();
+        drop(store);
+        let reopened = bastet_daemon::Store::open(&database).unwrap();
+        assert!(reopened
+            .graph_execution(graph.id)
+            .unwrap()
+            .nodes
+            .iter()
+            .all(|node| node.state == bastet_core::GraphNodeState::Succeeded));
+        assert_eq!(reopened.catalog().unwrap().catalog.runs.len(), 3);
+        assert_eq!(
+            reopened
+                .m3_catalog()
+                .unwrap()
+                .catalog
+                .deliverables
+                .costs
+                .len(),
+            3
+        );
     }
 }

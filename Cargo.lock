@@ -265,6 +265,7 @@ dependencies = [
  "bastet-adapter-codex",
  "bastet-client",
  "bastet-core",
+ "bastet-daemon",
  "bastet-protocol",
  "block2",
  "objc2-app-kit",
