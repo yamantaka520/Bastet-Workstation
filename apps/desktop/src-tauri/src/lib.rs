@@ -43,6 +43,49 @@ struct AgentCenterSnapshot {
     agents: Vec<AgentStatus>,
 }
 
+#[derive(Serialize)]
+struct RunProjection {
+    run_id: String,
+    session_id: String,
+    state: String,
+    can_cancel: bool,
+}
+
+#[derive(Serialize)]
+struct WorkProjection {
+    revision: u64,
+    sessions: usize,
+    runs: Vec<RunProjection>,
+}
+
+#[tauri::command]
+async fn work_projection(client: State<'_, DaemonClient>) -> Result<WorkProjection, String> {
+    let snapshot = client.catalog().await.map_err(|error| error.to_string())?;
+    Ok(WorkProjection {
+        revision: snapshot.revision,
+        sessions: snapshot.catalog.sessions.len(),
+        runs: snapshot
+            .catalog
+            .runs
+            .into_iter()
+            .map(|run| {
+                let can_cancel = matches!(
+                    run.state,
+                    bastet_core::NormalizedRunState::Starting
+                        | bastet_core::NormalizedRunState::Running
+                        | bastet_core::NormalizedRunState::Recovering
+                );
+                RunProjection {
+                    run_id: run.metadata.id.value().to_string(),
+                    session_id: run.session_id.value().to_string(),
+                    state: format!("{:?}", run.state).to_lowercase(),
+                    can_cancel,
+                }
+            })
+            .collect(),
+    })
+}
+
 #[tauri::command]
 async fn agent_center_snapshot() -> Result<AgentCenterSnapshot, String> {
     tauri::async_runtime::spawn_blocking(inspect_agents)
@@ -351,6 +394,7 @@ pub fn run() {
             bootstrap_state,
             daemon_snapshot,
             agent_center_snapshot,
+            work_projection,
             approval_center_snapshot,
             decide_approval,
             prepare_for_sleep,

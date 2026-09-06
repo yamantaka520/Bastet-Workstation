@@ -9,6 +9,8 @@ vi.mock("@tauri-apps/api/core", () => ({
     ? { protocol_version: 1, records: [] }
     : command === "agent_center_snapshot"
       ? { agents: [{ adapter_kind: "codex_cli", display_name: "Codex CLI", installed: true, version: "1.0.0", authenticated: true, model_count: 2, reasoning_controls: ["low", "high"], operations: ["start", "cancel"], error_key: null }] }
+      : command === "work_projection"
+        ? { revision: 3, sessions: 1, runs: [] }
       : { protocol_version: 1, daemon_id: "test-daemon", revision: 7, lifecycle: "ready" })),
 }));
 vi.mock("@tauri-apps/plugin-autostart", () => ({
