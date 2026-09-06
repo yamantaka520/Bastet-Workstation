@@ -109,4 +109,8 @@ verification status; it does not add scope.
   before/after snapshot supplies `LocallyMeasured` fallback evidence. It hashes regular-file
   contents, rejects symlinks, caps scans at 10,000 files and 256 MiB, and exposes only the changed
   file count rather than paths or content.
+  A run-scoped tracker now owns lifecycle, provider evidence, and the optional workspace snapshot;
+  when a writable run reaches a terminal state without provider write evidence, it emits the local
+  receipt before releasing the terminal event. This makes evidence ordering part of the adapter
+  boundary instead of a responsibility duplicated by callers.
 - M2.4–M2.8: not started.

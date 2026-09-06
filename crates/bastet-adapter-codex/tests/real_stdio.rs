@@ -1,7 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use bastet_adapter_codex::{
-    ApprovalPolicy, CodexAppServer, CodexRunEvidence, CodexRunEvidenceUpdate, CodexRunStream,
+    ApprovalPolicy, CodexAppServer, CodexRunEvidenceUpdate, CodexRunStream, CodexRunTracker,
     CodexRunUpdate, StdioTransport, ThreadSandbox, ThreadStartRequest, TurnSandboxPolicy,
     TurnStartRequest, WorkspaceSnapshot,
 };
@@ -63,14 +63,19 @@ fn installed_codex_completes_a_read_only_turn_over_stdio() {
             effort: model.default_reasoning_effort.clone(),
         })
         .unwrap();
-    let mut stream = CodexRunStream::new(RunId::from_bytes([42; 16]), &turn.turn_id).unwrap();
-    let evidence = CodexRunEvidence::new(&thread.thread_id, &turn.turn_id).unwrap();
+    let mut tracker = CodexRunTracker::new(
+        RunId::from_bytes([42; 16]),
+        &thread.thread_id,
+        &turn.turn_id,
+        None,
+    )
+    .unwrap();
     let mut saw_running = false;
     let mut saw_cost = false;
 
     loop {
-        match server
-            .next_run_update(&mut stream, &evidence, "2026-09-03T00:00:00Z")
+        match tracker
+            .next_update(&mut server, "2026-09-03T00:00:00Z")
             .unwrap()
         {
             CodexRunUpdate::Evidence(update) => match update {
@@ -267,7 +272,6 @@ fn installed_codex_reports_a_bounded_workspace_write_over_stdio() {
     assert!(probe_root.is_absolute());
     assert!(probe_root.is_dir());
     assert_eq!(std::fs::read_dir(&probe_root).unwrap().count(), 0);
-    let before = WorkspaceSnapshot::capture(&probe_root).unwrap();
 
     let transport = StdioTransport::spawn(&executable, Duration::from_secs(60)).unwrap();
     let mut server = CodexAppServer::new(transport);
@@ -287,6 +291,7 @@ fn installed_codex_reports_a_bounded_workspace_write_over_stdio() {
             sandbox: ThreadSandbox::WorkspaceWrite,
         })
         .unwrap();
+    let before = WorkspaceSnapshot::capture(&probe_root).unwrap();
     let turn = server
         .start_turn(TurnStartRequest {
             thread_id: thread.thread_id.clone(),
@@ -306,13 +311,18 @@ fn installed_codex_reports_a_bounded_workspace_write_over_stdio() {
             effort: model.default_reasoning_effort.clone(),
         })
         .unwrap();
-    let mut stream = CodexRunStream::new(RunId::from_bytes([46; 16]), &turn.turn_id).unwrap();
-    let evidence = CodexRunEvidence::new(&thread.thread_id, &turn.turn_id).unwrap();
+    let mut tracker = CodexRunTracker::new(
+        RunId::from_bytes([46; 16]),
+        &thread.thread_id,
+        &turn.turn_id,
+        Some(before),
+    )
+    .unwrap();
     let mut saw_write_receipt = false;
 
     loop {
-        match server
-            .next_run_update(&mut stream, &evidence, "2026-09-03T00:00:00Z")
+        match tracker
+            .next_update(&mut server, "2026-09-03T00:00:00Z")
             .unwrap()
         {
             CodexRunUpdate::Evidence(CodexRunEvidenceUpdate::WriteReceipt(receipt)) => {
@@ -329,17 +339,6 @@ fn installed_codex_reports_a_bounded_workspace_write_over_stdio() {
         }
     }
 
-    let after = WorkspaceSnapshot::capture(&probe_root).unwrap();
-    if !saw_write_receipt {
-        let receipt = before
-            .write_receipt(&after)
-            .unwrap()
-            .expect("the bounded write must have locally measured evidence");
-        assert!(receipt.contains("locally_measured"));
-        assert!(!receipt.contains("receipt.txt"));
-        assert!(!receipt.contains("BASTET_WRITE_OK"));
-        saw_write_receipt = true;
-    }
     assert!(saw_write_receipt);
     let entries = std::fs::read_dir(&probe_root)
         .unwrap()

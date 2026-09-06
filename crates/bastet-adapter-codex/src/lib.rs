@@ -3,6 +3,7 @@
 mod app_server;
 mod evidence;
 mod lifecycle;
+mod run;
 mod stdio;
 mod workspace;
 
@@ -14,6 +15,7 @@ pub use app_server::{
 };
 pub use evidence::{CodexRunEvidence, CodexRunEvidenceUpdate, EvidenceError};
 pub use lifecycle::{CodexEventNormalizer, CodexRunStream, LifecycleError, NormalizedCodexEvent};
+pub use run::{CodexRunTracker, RunTrackerError};
 pub use stdio::StdioTransport;
 pub use workspace::{WorkspaceEvidenceError, WorkspaceSnapshot};
 
