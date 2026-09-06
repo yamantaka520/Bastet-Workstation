@@ -299,6 +299,43 @@ impl GraphExecution {
         Ok(())
     }
 
+    pub fn finish_terminal(
+        &mut self,
+        node_id: GraphNodeId,
+        owner: &str,
+        state: GraphNodeState,
+    ) -> Result<(), GraphError> {
+        if !matches!(
+            state,
+            GraphNodeState::Succeeded
+                | GraphNodeState::Failed
+                | GraphNodeState::Blocked
+                | GraphNodeState::Uncertain
+        ) {
+            return Err(GraphError::InvalidExecution);
+        }
+        let execution = self
+            .nodes
+            .iter_mut()
+            .find(|node| node.node_id == node_id)
+            .ok_or(GraphError::InvalidExecution)?;
+        if execution.state != GraphNodeState::Running || execution.owner.as_deref() != Some(owner) {
+            return Err(GraphError::InvalidExecution);
+        }
+        execution.state = state;
+        execution.owner = if matches!(state, GraphNodeState::Succeeded | GraphNodeState::Failed) {
+            Some(owner.into())
+        } else {
+            None
+        };
+        execution.revision += 1;
+        self.revision += 1;
+        if matches!(state, GraphNodeState::Failed | GraphNodeState::Blocked) {
+            self.block_dependents(node_id);
+        }
+        Ok(())
+    }
+
     fn block_dependents(&mut self, failed: GraphNodeId) {
         let mut blocked = HashSet::from([failed]);
         loop {
@@ -417,6 +454,34 @@ mod tests {
         );
         execution.complete(branches[0], "worker", false).unwrap();
         assert_eq!(execution.nodes[2].state, GraphNodeState::Blocked);
+    }
+
+    #[test]
+    fn uncertain_provider_result_releases_owner_without_unlocking_join() {
+        let mut execution = GraphExecution::start(GraphRunId::new(), graph()).unwrap();
+        let node_id = execution.claim_ready("worker", 1).unwrap()[0];
+        execution
+            .finish_terminal(node_id, "worker", GraphNodeState::Uncertain)
+            .unwrap();
+        let node = execution
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .unwrap();
+        assert_eq!(node.state, GraphNodeState::Uncertain);
+        assert_eq!(node.owner, None);
+        let still_ready = execution.claim_ready("other-research", 1).unwrap();
+        assert_eq!(still_ready.len(), 1);
+        assert_eq!(
+            execution
+                .graph
+                .nodes
+                .iter()
+                .find(|node| node.id == still_ready[0])
+                .unwrap()
+                .kind,
+            GraphNodeKind::Research
+        );
     }
 
     #[test]

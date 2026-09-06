@@ -13,7 +13,7 @@ use bastet_protocol::{
     PROTOCOL_VERSION,
 };
 use serde::Serialize;
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, time::Duration};
 use supervisor::DaemonSupervisor;
 use tauri::{
     menu::{Menu, MenuItem, Submenu},
@@ -110,6 +110,23 @@ struct MeetingProjection {
     summary: String,
 }
 
+struct ProviderOutcome {
+    terminal_state: bastet_core::NormalizedRunState,
+    provider_session_id: Option<String>,
+    cost: bastet_core::CostEvidence,
+}
+
+fn unknown_cost() -> bastet_core::CostEvidence {
+    bastet_core::CostEvidence {
+        evidence_class: bastet_core::EvidenceClass::Unknown,
+        currency: None,
+        amount: None,
+        input_tokens: None,
+        output_tokens: None,
+        confidence: 0.0,
+    }
+}
+
 #[tauri::command]
 async fn m3_projection(client: State<'_, DaemonClient>) -> Result<M3Projection, String> {
     let snapshot = client
@@ -121,6 +138,243 @@ async fn m3_projection(client: State<'_, DaemonClient>) -> Result<M3Projection, 
         .await
         .map_err(|error| error.to_string())?;
     Ok(project_m3(snapshot, graphs.executions))
+}
+
+#[tauri::command]
+async fn run_ready_mvp_nodes(client: State<'_, DaemonClient>) -> Result<M3Projection, String> {
+    let identity = client.catalog().await.map_err(|error| error.to_string())?;
+    let m3 = client
+        .m3_catalog()
+        .await
+        .map_err(|error| error.to_string())?;
+    let executions = client
+        .graph_executions()
+        .await
+        .map_err(|error| error.to_string())?
+        .executions;
+    let execution = executions
+        .into_iter()
+        .find(|execution| {
+            execution
+                .nodes
+                .iter()
+                .any(|node| node.state == bastet_core::GraphNodeState::Pending)
+        })
+        .ok_or_else(|| "no pending MVP graph nodes".to_string())?;
+    let states = execution
+        .nodes
+        .iter()
+        .map(|node| (node.node_id, node.state))
+        .collect::<std::collections::HashMap<_, _>>();
+    let ready = execution
+        .graph
+        .nodes
+        .iter()
+        .filter(|definition| {
+            states.get(&definition.id) == Some(&bastet_core::GraphNodeState::Pending)
+                && definition.needs.iter().all(|dependency| {
+                    states.get(dependency) == Some(&bastet_core::GraphNodeState::Succeeded)
+                })
+        })
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>();
+    if ready.is_empty() {
+        return Err("no graph node is ready; reconcile uncertain or failed work first".into());
+    }
+    let mut catalog_revision = identity.revision;
+    let mut graph_revision = execution.revision;
+    let mut begun = Vec::new();
+    for definition in ready {
+        let receipt = client
+            .begin_graph_node_run(
+                execution.id,
+                bastet_protocol::BeginGraphNodeRunCommand {
+                    expected_catalog_revision: catalog_revision,
+                    expected_graph_revision: graph_revision,
+                    node_id: definition.id,
+                    owner: format!("desktop-provider-{}", definition.id.value()),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        catalog_revision = receipt.catalog_revision;
+        graph_revision = receipt.graph_revision;
+        begun.push(receipt);
+    }
+    let handles = begun
+        .iter()
+        .map(|receipt| {
+            let adapter = receipt.adapter_kind.clone();
+            let model = receipt.model.clone();
+            let prompt = receipt.prompt.clone();
+            let root = PathBuf::from(&receipt.workspace_root);
+            let run_id = receipt.run_id;
+            tauri::async_runtime::spawn_blocking(move || {
+                run_provider(&adapter, run_id, model, prompt, root)
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut outcomes = Vec::new();
+    for handle in handles {
+        outcomes.push(match handle.await {
+            Ok(Ok(outcome)) => outcome,
+            _ => ProviderOutcome {
+                terminal_state: bastet_core::NormalizedRunState::Uncertain,
+                provider_session_id: None,
+                cost: unknown_cost(),
+            },
+        });
+    }
+    let mut m3_revision = m3.revision;
+    for (receipt, outcome) in begun.into_iter().zip(outcomes) {
+        let finished = client
+            .finish_graph_node_run(
+                execution.id,
+                bastet_protocol::FinishGraphNodeRunCommand {
+                    expected_catalog_revision: catalog_revision,
+                    expected_graph_revision: graph_revision,
+                    expected_m3_revision: m3_revision,
+                    node_id: receipt.node_id,
+                    run_id: receipt.run_id,
+                    owner: format!("desktop-provider-{}", receipt.node_id.value()),
+                    terminal_state: outcome.terminal_state,
+                    provider_session_id: outcome.provider_session_id,
+                    cost: outcome.cost,
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        catalog_revision = finished.catalog_revision;
+        graph_revision = finished.graph_revision;
+        m3_revision = finished.m3_revision;
+    }
+    let updated = client
+        .m3_catalog()
+        .await
+        .map_err(|error| error.to_string())?;
+    let graphs = client
+        .graph_executions()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(project_m3(updated, graphs.executions))
+}
+
+fn run_provider(
+    adapter: &str,
+    run_id: bastet_core::RunId,
+    model: String,
+    prompt: String,
+    root: PathBuf,
+) -> Result<ProviderOutcome, String> {
+    match adapter {
+        "codex_cli" => run_codex(run_id, model, prompt, root),
+        "agy_cli" => run_agy(run_id, model, prompt, root),
+        _ => Err(format!("unsupported reference adapter: {adapter}")),
+    }
+}
+
+fn run_codex(
+    run_id: bastet_core::RunId,
+    model: String,
+    prompt: String,
+    root: PathBuf,
+) -> Result<ProviderOutcome, String> {
+    let executable =
+        configured_executable("BASTET_CODEX_BIN", "codex").ok_or("Codex CLI is unavailable")?;
+    let adapter = bastet_adapter_codex::CodexAdapter::new(executable);
+    let mut server = adapter
+        .connect_app_server(Duration::from_secs(120))
+        .map_err(|error| error.to_string())?;
+    let mut started = server
+        .start_tracked_run(bastet_adapter_codex::CodexRunRequest {
+            run_id,
+            model,
+            prompt,
+            cwd: root,
+            approval_policy: bastet_adapter_codex::ApprovalPolicy::Never,
+            sandbox_policy: bastet_adapter_codex::TurnSandboxPolicy::ReadOnly,
+            effort: Some("medium".into()),
+        })
+        .map_err(|error| error.to_string())?;
+    let provider_session_id = Some(started.thread.thread_id.clone());
+    let mut cost = unknown_cost();
+    loop {
+        match started
+            .tracker
+            .next_update(&mut server, &timestamp_ms().to_string())
+            .map_err(|error| error.to_string())?
+        {
+            bastet_adapter_codex::CodexRunUpdate::Evidence(
+                bastet_adapter_codex::CodexRunEvidenceUpdate::Cost(observed),
+            ) => cost = observed,
+            bastet_adapter_codex::CodexRunUpdate::Evidence(_) => {}
+            bastet_adapter_codex::CodexRunUpdate::Lifecycle(event) => match event.event.state {
+                bastet_core::NormalizedRunState::Succeeded
+                | bastet_core::NormalizedRunState::Failed
+                | bastet_core::NormalizedRunState::Cancelled
+                | bastet_core::NormalizedRunState::Blocked
+                | bastet_core::NormalizedRunState::Uncertain => {
+                    return Ok(ProviderOutcome {
+                        terminal_state: event.event.state,
+                        provider_session_id,
+                        cost,
+                    })
+                }
+                _ => {}
+            },
+        }
+    }
+}
+
+fn run_agy(
+    run_id: bastet_core::RunId,
+    model: String,
+    prompt: String,
+    root: PathBuf,
+) -> Result<ProviderOutcome, String> {
+    let executable =
+        configured_executable("BASTET_AGY_BIN", "agy").ok_or("Agy CLI is unavailable")?;
+    let mut process = bastet_adapter_agy::AgyProcess::spawn(
+        executable,
+        bastet_adapter_agy::AgyRunRequest {
+            run_id,
+            model,
+            effort: Some("medium".into()),
+            prompt,
+            cwd: root,
+            read_only: true,
+            timeout: Duration::from_secs(120),
+            conversation_id: None,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let mut cost = unknown_cost();
+    loop {
+        match process
+            .next_update(&timestamp_ms().to_string())
+            .map_err(|error| error.to_string())?
+        {
+            bastet_adapter_agy::AgyRunUpdate::Cost(observed) => cost = observed,
+            bastet_adapter_agy::AgyRunUpdate::WriteReceipt(_) => {
+                return Err("read-only Agy run reported a write".into())
+            }
+            bastet_adapter_agy::AgyRunUpdate::Lifecycle { event, .. } => match event.state {
+                bastet_core::NormalizedRunState::Succeeded
+                | bastet_core::NormalizedRunState::Failed
+                | bastet_core::NormalizedRunState::Cancelled
+                | bastet_core::NormalizedRunState::Blocked
+                | bastet_core::NormalizedRunState::Uncertain => {
+                    return Ok(ProviderOutcome {
+                        terminal_state: event.state,
+                        provider_session_id: process.conversation_id().map(str::to_owned),
+                        cost,
+                    })
+                }
+                _ => {}
+            },
+        }
+    }
 }
 
 #[tauri::command]
@@ -804,6 +1058,7 @@ pub fn run() {
             agent_center_snapshot,
             work_projection,
             m3_projection,
+            run_ready_mvp_nodes,
             prepare_mvp,
             accept_mvp_decision,
             create_mvp_document,

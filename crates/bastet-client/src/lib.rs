@@ -684,7 +684,7 @@ mod tests {
                     node_id: begun.node_id,
                     run_id: begun.run_id,
                     owner: "codex-worker".into(),
-                    succeeded: true,
+                    terminal_state: bastet_core::NormalizedRunState::Succeeded,
                     provider_session_id: Some("provider-thread-client-test".into()),
                     cost: bastet_core::CostEvidence {
                         evidence_class: bastet_core::EvidenceClass::ProviderReported,

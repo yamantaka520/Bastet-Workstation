@@ -204,7 +204,7 @@ pub struct FinishGraphNodeRunCommand {
     pub node_id: bastet_core::GraphNodeId,
     pub run_id: bastet_core::RunId,
     pub owner: String,
-    pub succeeded: bool,
+    pub terminal_state: bastet_core::NormalizedRunState,
     pub provider_session_id: Option<String>,
     pub cost: bastet_core::CostEvidence,
 }

@@ -1610,14 +1610,22 @@ impl Store {
             .ok_or(StoreError::RunNotFound)?
             .provider_model_id
             .clone();
-        execution.complete(command.node_id, &command.owner, command.succeeded)?;
+        let graph_state = match command.terminal_state {
+            bastet_core::NormalizedRunState::Succeeded => GraphNodeState::Succeeded,
+            bastet_core::NormalizedRunState::Failed
+            | bastet_core::NormalizedRunState::Cancelled => GraphNodeState::Failed,
+            bastet_core::NormalizedRunState::Blocked => GraphNodeState::Blocked,
+            bastet_core::NormalizedRunState::Uncertain => GraphNodeState::Uncertain,
+            _ => {
+                return Err(StoreError::InvalidRunState(
+                    format!("{:?}", command.terminal_state).to_lowercase(),
+                ))
+            }
+        };
+        execution.finish_terminal(command.node_id, &command.owner, graph_state)?;
         let now = timestamp();
         let run = &mut identity.runs[run_index];
-        run.state = if command.succeeded {
-            bastet_core::NormalizedRunState::Succeeded
-        } else {
-            bastet_core::NormalizedRunState::Failed
-        };
+        run.state = command.terminal_state;
         run.finished_at = Some(now.clone());
         run.metadata.revision = run
             .metadata
@@ -1656,7 +1664,11 @@ impl Store {
             source: "adapter normalized cost event".into(),
             formula_version: None,
             confidence: command.cost.confidence,
-            reconciliation_state: "observed".into(),
+            reconciliation_state: if graph_state == GraphNodeState::Uncertain {
+                "uncertain".into()
+            } else {
+                "observed".into()
+            },
         });
         identity.validate()?;
         let mut executions = load_graph_executions(&transaction)?;
@@ -1685,7 +1697,7 @@ impl Store {
         )?;
         transaction.execute("UPDATE graph_executions SET revision=?1,execution_json=?2,updated_at=?3 WHERE execution_id=?4",
             params![execution.revision, serde_json::to_string(&execution)?, timestamp(), id.value().to_string()])?;
-        let event = insert_event(&transaction, "graph.node_run_finished", &serde_json::json!({"execution_id": id, "node_id": command.node_id, "run_id": command.run_id, "cost_record_id": cost_record_id, "succeeded": command.succeeded}).to_string())?;
+        let event = insert_event(&transaction, "graph.node_run_finished", &serde_json::json!({"execution_id": id, "node_id": command.node_id, "run_id": command.run_id, "cost_record_id": cost_record_id, "terminal_state": command.terminal_state}).to_string())?;
         transaction.commit()?;
         Ok(FinishGraphNodeRunReceipt {
             protocol_version: PROTOCOL_VERSION,
