@@ -134,4 +134,12 @@ verification status; it does not add scope.
   closed on malformed output, and deliberately withholds execution capabilities until its
   stream/event contract is normalized and tested. An explicit real-CLI canary passed version and
   non-empty catalog inspection against the installed Agy 1.1.25 binary.
+  The official headless protocol documents `init`, repeated `step_update`, and one terminal
+  `result`, plus stdin user envelopes for `--input-format stream-json`. The first run-scoped
+  normalizer accepts that shape, correlates the conversation ID, preserves only lifecycle and
+  provider token counts, and discards cwd, tool inventory, response text, tool details, and raw
+  errors. Unknown events, malformed usage, mismatched conversations, and post-terminal data fail
+  closed. Authentication/quota/permission failures are reduced to typed categories without
+  retaining provider text. Production process execution remains withheld until prompts are sent
+  over stdin rather than exposed through argv.
 - M2.5–M2.8: not started.

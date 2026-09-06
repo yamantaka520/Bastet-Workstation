@@ -1,5 +1,9 @@
 //! Fail-closed discovery and catalog boundary for the Agy CLI reference adapter.
 
+mod stream;
+
+pub use stream::{AgyRunStream, AgyRunUpdate, AgyStreamError};
+
 use std::{
     io,
     path::{Path, PathBuf},
