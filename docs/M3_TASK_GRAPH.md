@@ -40,3 +40,5 @@ verification evidence without adding scope.
 - Daemon schema v5 and the loopback client expose a separately revisioned M3 catalog for Office,
   meetings, documents, costs, and explicit knowledge-delivery records; graph execution remains in
   its dedicated authority table to avoid dual writes.
+- M3.4a provides a five-locale Office projection with an eight-state accessible first-party Pet
+  preview plus revision-guarded apply and rollback; rollback fails closed while assigned.

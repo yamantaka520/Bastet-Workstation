@@ -11,25 +11,28 @@ type ApprovalList = { protocol_version: number; records: ApprovalRecord[] };
 type AgentStatus = { adapter_kind: string; display_name: string; installed: boolean; version: string | null; authenticated: boolean | null; model_count: number | null; reasoning_controls: string[]; operations: string[]; error_key: string | null };
 type AgentCenterSnapshot = { agents: AgentStatus[] };
 type WorkProjection = { revision: number; sessions: number; runs: { run_id: string; session_id: string; state: string; can_cancel: boolean }[] };
-type View = "agents" | "approvals" | "diagnostics";
+type PetProfile = { metadata: { id: string }; name: string; version: number; states: { state_key: string; accessible_label_key: string }[] };
+type M3Projection = { revision: number; pet_profiles: PetProfile[]; pet_assignments: number; rooms: number; meetings: number; documents: number; costs: number };
+type View = "office" | "agents" | "approvals" | "diagnostics";
 
 export function App() {
   const [locale, setLocale] = useState<Locale>("zh-Hant");
-  const [view, setView] = useState<View>("agents");
+  const [view, setView] = useState<View>("office");
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [snapshot, setSnapshot] = useState<DaemonSnapshot | null>(null);
   const [approvals, setApprovals] = useState<ApprovalRecord[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
   const [work, setWork] = useState<WorkProjection>({ revision: 0, sessions: 0, runs: [] });
+  const [m3, setM3] = useState<M3Projection>({ revision: 0, pet_profiles: [], pet_assignments: 0, rooms: 0, meetings: 0, documents: 0, costs: 0 });
   const [actionError, setActionError] = useState(false);
   const [autostart, setAutostart] = useState(false);
 
   const reconnect = useCallback(async () => {
     setConnection("connecting");
     try {
-      const [next, list, agentList, workList] = await Promise.all([invoke<DaemonSnapshot>("daemon_snapshot"), invoke<ApprovalList>("approval_center_snapshot"), invoke<AgentCenterSnapshot>("agent_center_snapshot"), invoke<WorkProjection>("work_projection")]);
+      const [next, list, agentList, workList, m3List] = await Promise.all([invoke<DaemonSnapshot>("daemon_snapshot"), invoke<ApprovalList>("approval_center_snapshot"), invoke<AgentCenterSnapshot>("agent_center_snapshot"), invoke<WorkProjection>("work_projection"), invoke<M3Projection>("m3_projection")]);
       if (next.protocol_version !== 1 || list.protocol_version !== 1) throw new Error("protocol mismatch");
-      setSnapshot(next); setApprovals(list.records); setAgents(agentList.agents); setWork(workList); setConnection("ready");
+      setSnapshot(next); setApprovals(list.records); setAgents(agentList.agents); setWork(workList); setM3(m3List); setConnection("ready");
     } catch { setSnapshot(null); setConnection("offline"); }
   }, []);
   useEffect(() => { void reconnect(); const timer = window.setInterval(() => void reconnect(), 5_000); return () => window.clearInterval(timer); }, [reconnect]);
@@ -45,14 +48,25 @@ export function App() {
     try { await invoke("cancel_run", { runId, expectedCatalogRevision: work.revision }); await reconnect(); }
     catch { setActionError(true); }
   };
+  const changeBuiltinPet = async (apply: boolean) => {
+    setActionError(false);
+    try { setM3(await invoke<M3Projection>(apply ? "apply_builtin_pet" : "rollback_builtin_pet")); }
+    catch { setActionError(true); }
+  };
 
   return <main>
     <header><div><p className="eyebrow">{translate(locale, "milestone")}</p><h1>{translate(locale, "title")}</h1></div>
       <label><span className="sr-only">Language</span><select aria-label="Language" value={locale} onChange={(event) => setLocale(event.target.value as Locale)}>
         {locales.map((candidate) => <option key={candidate} value={candidate}>{candidate}</option>)}</select></label></header>
-    <nav aria-label={translate(locale, "navigation")}>{(["agents", "approvals", "diagnostics"] as const).map((item) =>
+    <nav aria-label={translate(locale, "navigation")}>{(["office", "agents", "approvals", "diagnostics"] as const).map((item) =>
       <button key={item} type="button" aria-current={view === item ? "page" : undefined} onClick={() => setView(item)}>{translate(locale, item)}</button>)}</nav>
     <p role="status" className="connection" data-state={connection}>{translate(locale, connection)}</p>
+
+    {view === "office" && <section aria-labelledby="office-heading"><h2 id="office-heading">{translate(locale, "office")}</h2><p>{translate(locale, "officeHelp")}</p>
+      <dl><dt>{translate(locale, "revision")}</dt><dd>{m3.revision}</dd><dt>{translate(locale, "rooms")}</dt><dd>{m3.rooms}</dd><dt>{translate(locale, "meetings")}</dt><dd>{m3.meetings}</dd><dt>{translate(locale, "documents")}</dt><dd>{m3.documents}</dd><dt>{translate(locale, "costs")}</dt><dd>{m3.costs}</dd></dl>
+      <article><h3>{translate(locale, "builtinPet")}: Bastet Cat</h3><p>{translate(locale, m3.pet_profiles.length ? "applied" : "notApplied")}</p>
+        <ul className="pet-states">{["idle", "thinking", "working", "waiting", "blocked", "approval_required", "succeeded", "failed"].map((state) => <li key={state}><span aria-hidden="true">🐈</span><span>{state}</span></li>)}</ul>
+        <button type="button" onClick={() => void changeBuiltinPet(m3.pet_profiles.length === 0)}>{translate(locale, m3.pet_profiles.length ? "rollbackPet" : "applyPet")}</button></article></section>}
 
     {view === "agents" && <section aria-labelledby="agents-heading"><h2 id="agents-heading">{translate(locale, "agents")}</h2><p>{translate(locale, "agentHelp")}</p>
       <div className="card-grid">{agents.map((agent) => <article key={agent.adapter_kind}><h3>{agent.display_name}</h3><span className="badge">{translate(locale, agent.installed ? "installed" : "notInstalled")}</span>

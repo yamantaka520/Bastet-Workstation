@@ -4,7 +4,10 @@ mod supervisor;
 mod macos_power;
 
 use bastet_client::DaemonClient;
-use bastet_core::{ApprovalDecision, ApprovalRequestId};
+use bastet_core::{
+    ApprovalDecision, ApprovalRequestId, EntityLifecycle, EntityMetadata, PetProfile, PetProfileId,
+    PetStateAsset, Provenance, REQUIRED_PET_STATES,
+};
 use bastet_protocol::{
     ApprovalList, ApprovalReceipt, CheckpointReceipt, DaemonLifecycle, DaemonSnapshot,
     PROTOCOL_VERSION,
@@ -56,6 +59,133 @@ struct WorkProjection {
     revision: u64,
     sessions: usize,
     runs: Vec<RunProjection>,
+}
+
+#[derive(Serialize)]
+struct M3Projection {
+    revision: u64,
+    pet_profiles: Vec<PetProfile>,
+    pet_assignments: usize,
+    rooms: usize,
+    meetings: usize,
+    documents: usize,
+    costs: usize,
+}
+
+#[tauri::command]
+async fn m3_projection(client: State<'_, DaemonClient>) -> Result<M3Projection, String> {
+    let snapshot = client
+        .m3_catalog()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(project_m3(snapshot))
+}
+
+#[tauri::command]
+async fn apply_builtin_pet(client: State<'_, DaemonClient>) -> Result<M3Projection, String> {
+    let mut snapshot = client
+        .m3_catalog()
+        .await
+        .map_err(|error| error.to_string())?;
+    let builtin = builtin_pet_profile();
+    if !snapshot
+        .catalog
+        .office
+        .pet_profiles
+        .iter()
+        .any(|profile| profile.metadata.id == builtin.metadata.id)
+    {
+        snapshot.catalog.office.pet_profiles.push(builtin);
+        client
+            .replace_m3_catalog(bastet_protocol::ReplaceM3CatalogCommand {
+                expected_revision: snapshot.revision,
+                catalog: snapshot.catalog,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let updated = client
+        .m3_catalog()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(project_m3(updated))
+}
+
+#[tauri::command]
+async fn rollback_builtin_pet(client: State<'_, DaemonClient>) -> Result<M3Projection, String> {
+    let mut snapshot = client
+        .m3_catalog()
+        .await
+        .map_err(|error| error.to_string())?;
+    let id = builtin_pet_profile().metadata.id;
+    if snapshot
+        .catalog
+        .office
+        .pet_assignments
+        .iter()
+        .any(|assignment| assignment.pet_profile_id == id)
+    {
+        return Err("pet profile is assigned and cannot be rolled back".into());
+    }
+    let before = snapshot.catalog.office.pet_profiles.len();
+    snapshot
+        .catalog
+        .office
+        .pet_profiles
+        .retain(|profile| profile.metadata.id != id);
+    if snapshot.catalog.office.pet_profiles.len() != before {
+        client
+            .replace_m3_catalog(bastet_protocol::ReplaceM3CatalogCommand {
+                expected_revision: snapshot.revision,
+                catalog: snapshot.catalog,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let updated = client
+        .m3_catalog()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(project_m3(updated))
+}
+
+fn project_m3(snapshot: bastet_protocol::M3CatalogSnapshot) -> M3Projection {
+    M3Projection {
+        revision: snapshot.revision,
+        pet_profiles: snapshot.catalog.office.pet_profiles,
+        pet_assignments: snapshot.catalog.office.pet_assignments.len(),
+        rooms: snapshot.catalog.office.rooms.len(),
+        meetings: snapshot.catalog.meetings.meetings.len(),
+        documents: snapshot.catalog.deliverables.documents.len(),
+        costs: snapshot.catalog.deliverables.costs.len(),
+    }
+}
+
+fn builtin_pet_profile() -> PetProfile {
+    PetProfile {
+        metadata: EntityMetadata {
+            id: PetProfileId::from_bytes([0xBA; 16]),
+            revision: 0,
+            created_at: "builtin-v1".into(),
+            updated_at: "builtin-v1".into(),
+            provenance: Provenance {
+                source_kind: "first_party".into(),
+                source_id: "bastet-cat-v1".into(),
+                recorded_by: "bastet-workstation".into(),
+            },
+            lifecycle: EntityLifecycle::Active,
+        },
+        name: "Bastet Cat".into(),
+        version: 1,
+        states: REQUIRED_PET_STATES
+            .into_iter()
+            .map(|state| PetStateAsset {
+                state_key: state.into(),
+                asset_ref: format!("builtin://bastet-cat/{state}"),
+                accessible_label_key: format!("pet.state.{state}"),
+            })
+            .collect(),
+    }
 }
 
 #[tauri::command]
@@ -407,6 +537,9 @@ pub fn run() {
             daemon_snapshot,
             agent_center_snapshot,
             work_projection,
+            m3_projection,
+            apply_builtin_pet,
+            rollback_builtin_pet,
             cancel_run,
             approval_center_snapshot,
             decide_approval,

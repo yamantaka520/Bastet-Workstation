@@ -12,6 +12,8 @@ const defaultInvoke = (command: string) => Promise.resolve(command === "approval
       ? { agents: [{ adapter_kind: "codex_cli", display_name: "Codex CLI", installed: true, version: "1.0.0", authenticated: true, model_count: 2, reasoning_controls: ["low", "high"], operations: ["start", "cancel"], error_key: null }] }
       : command === "work_projection"
         ? { revision: 3, sessions: 1, runs: [] }
+      : command === "m3_projection"
+        ? { revision: 0, pet_profiles: [], pet_assignments: 0, rooms: 0, meetings: 0, documents: 0, costs: 0 }
       : { protocol_version: 1, daemon_id: "test-daemon", revision: 7, lifecycle: "ready" });
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
@@ -30,7 +32,7 @@ describe("M1 shell", () => {
   it("switches locale using an accessible native control", () => {
     render(<App />);
     fireEvent.change(screen.getByLabelText("Language"), { target: { value: "ja" } });
-    expect(screen.getByText("M2 Agent と承認")).toBeInTheDocument();
+    expect(screen.getByText("M3 Office 垂直スライス")).toBeInTheDocument();
   });
 
   it("projects daemon state after reconnect", async () => {
@@ -50,6 +52,7 @@ describe("M1 shell", () => {
 
   it("offers keyboard-native agent and approval navigation", async () => {
     render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Agents 與模型" }));
     expect(await screen.findByRole("heading", { name: "Agents 與模型" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "核准中心" }));
     expect(screen.getByText("目前沒有待處理或近期核准。")).toBeInTheDocument();
@@ -61,8 +64,19 @@ describe("M1 shell", () => {
       : defaultInvoke(command));
     render(<App />);
 
+    fireEvent.click(screen.getByRole("button", { name: "Agents 與模型" }));
     fireEvent.click(await screen.findByRole("button", { name: "取消" }));
 
     expect(invokeMock).toHaveBeenCalledWith("cancel_run", { runId: "run-1", expectedCatalogRevision: 9 });
+  });
+
+  it("previews every accessible Pet state before applying the built-in profile", async () => {
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: "內建 Pet 目錄: Bastet Cat" })).toBeInTheDocument();
+    for (const state of ["idle", "thinking", "working", "waiting", "blocked", "approval_required", "succeeded", "failed"]) {
+      expect(screen.getByText(state)).toBeInTheDocument();
+    }
+    fireEvent.click(screen.getByRole("button", { name: "套用 Pet" }));
+    expect(invokeMock).toHaveBeenCalledWith("apply_builtin_pet");
   });
 });
