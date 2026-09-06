@@ -1,6 +1,6 @@
 //! Shared wire types. The daemon is authoritative; clients only project this state.
 
-use bastet_core::IdentityCatalog;
+use bastet_core::{ApprovalDecision, ApprovalRequest, ApprovalRequestId, IdentityCatalog};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -66,6 +66,30 @@ pub struct ReplaceCatalogCommand {
 pub struct CatalogReceipt {
     pub protocol_version: u32,
     pub revision: u64,
+    pub event_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateApprovalCommand {
+    pub request: ApprovalRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecideApprovalCommand {
+    pub decision: ApprovalDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRecord {
+    pub protocol_version: u32,
+    pub request: ApprovalRequest,
+    pub decision: Option<ApprovalDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalReceipt {
+    pub protocol_version: u32,
+    pub request_id: ApprovalRequestId,
     pub event_sequence: u64,
 }
 

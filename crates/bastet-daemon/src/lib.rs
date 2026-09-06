@@ -1,19 +1,22 @@
 //! Durable state primitives for the Bastet Workstation local daemon.
 
+pub mod sandbox;
+
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
-use bastet_core::{CatalogError, IdentityCatalog};
+use bastet_core::{ApprovalError, ApprovalRequestId, CatalogError, IdentityCatalog};
 use bastet_protocol::{
-    CatalogReceipt, CatalogSnapshot, CheckpointCommand, CheckpointReceipt, DaemonLifecycle,
-    DaemonSnapshot, EventEnvelope, ReplaceCatalogCommand, PROTOCOL_VERSION,
+    ApprovalReceipt, ApprovalRecord, CatalogReceipt, CatalogSnapshot, CheckpointCommand,
+    CheckpointReceipt, CreateApprovalCommand, DaemonLifecycle, DaemonSnapshot,
+    DecideApprovalCommand, EventEnvelope, ReplaceCatalogCommand, PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
@@ -21,7 +24,7 @@ use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -42,6 +45,12 @@ pub enum StoreError {
     InvalidCatalog(#[from] CatalogError),
     #[error("identity catalog serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("approval is invalid: {0}")]
+    InvalidApproval(#[from] ApprovalError),
+    #[error("approval request was not found")]
+    ApprovalNotFound,
+    #[error("approval request already exists or has already been decided")]
+    ApprovalConflict,
     #[error("state revision overflow")]
     RevisionOverflow,
 }
@@ -76,6 +85,11 @@ fn build_router(store: Store, shutdown_signal: Option<watch::Sender<bool>>) -> R
         .route("/v1/health", get(health))
         .route("/v1/events", get(events))
         .route("/v1/catalog", get(catalog).put(replace_catalog))
+        .route("/v1/approvals", post(create_approval))
+        .route(
+            "/v1/approvals/{request_id}",
+            get(approval).post(decide_approval),
+        )
         .route("/v1/checkpoints", post(checkpoint))
         .route("/v1/power/suspend", post(suspend))
         .route("/v1/power/resume", post(resume))
@@ -115,6 +129,33 @@ async fn replace_catalog(
     Ok(Json(state.store.replace_catalog(command)?))
 }
 
+async fn create_approval(
+    State(state): State<AppState>,
+    Json(command): Json<CreateApprovalCommand>,
+) -> Result<Json<ApprovalReceipt>, ApiError> {
+    Ok(Json(state.store.create_approval(command)?))
+}
+
+async fn approval(
+    State(state): State<AppState>,
+    AxumPath(request_id): AxumPath<Uuid>,
+) -> Result<Json<ApprovalRecord>, ApiError> {
+    Ok(Json(state.store.approval(
+        ApprovalRequestId::from_bytes(*request_id.as_bytes()),
+    )?))
+}
+
+async fn decide_approval(
+    State(state): State<AppState>,
+    AxumPath(request_id): AxumPath<Uuid>,
+    Json(command): Json<DecideApprovalCommand>,
+) -> Result<Json<ApprovalReceipt>, ApiError> {
+    if command.decision.request_id.value() != request_id {
+        return Err(StoreError::InvalidApproval(ApprovalError::HashMismatch).into());
+    }
+    Ok(Json(state.store.decide_approval(command)?))
+}
+
 async fn shutdown(
     State(state): State<AppState>,
     Json(command): Json<CheckpointCommand>,
@@ -151,10 +192,13 @@ impl From<StoreError> for ApiError {
 impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let status = match self.0 {
-            StoreError::RevisionConflict { .. } | StoreError::InvalidLifecycle { .. } => {
-                StatusCode::CONFLICT
-            }
-            StoreError::InvalidCatalog(_) | StoreError::Serialization(_) => StatusCode::BAD_REQUEST,
+            StoreError::RevisionConflict { .. }
+            | StoreError::InvalidLifecycle { .. }
+            | StoreError::ApprovalConflict => StatusCode::CONFLICT,
+            StoreError::ApprovalNotFound => StatusCode::NOT_FOUND,
+            StoreError::InvalidCatalog(_)
+            | StoreError::InvalidApproval(_)
+            | StoreError::Serialization(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (
@@ -284,6 +328,113 @@ impl Store {
         Ok(CatalogReceipt {
             protocol_version: PROTOCOL_VERSION,
             revision,
+            event_sequence: event.sequence,
+        })
+    }
+
+    pub fn create_approval(
+        &self,
+        command: CreateApprovalCommand,
+    ) -> Result<ApprovalReceipt, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let catalog_json: String = transaction.query_row(
+            "SELECT catalog_json FROM identity_catalog WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let catalog: IdentityCatalog = serde_json::from_str(&catalog_json)?;
+        catalog.validate()?;
+        command.request.validate_against(&catalog)?;
+        let request_json = serde_json::to_string(&command.request)?;
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO approval_requests(request_id, request_hash, request_json, expires_at_ms, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                command.request.id.value().to_string(),
+                command.request.request_hash,
+                request_json,
+                command.request.expires_at_ms,
+                timestamp()
+            ],
+        )?;
+        if inserted == 0 {
+            return Err(StoreError::ApprovalConflict);
+        }
+        let event = insert_event(
+            &transaction,
+            "approval.requested",
+            &serde_json::json!({"request_id": command.request.id, "risk": command.request.action.risk}).to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(ApprovalReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: command.request.id,
+            event_sequence: event.sequence,
+        })
+    }
+
+    pub fn approval(&self, request_id: ApprovalRequestId) -> Result<ApprovalRecord, StoreError> {
+        let connection = self.connection()?;
+        let result: Option<(String, Option<String>)> = connection
+            .query_row(
+                "SELECT request_json, decision_json FROM approval_requests WHERE request_id = ?1",
+                [request_id.value().to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (request_json, decision_json) = result.ok_or(StoreError::ApprovalNotFound)?;
+        let request = serde_json::from_str(&request_json)?;
+        let decision = decision_json
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?;
+        Ok(ApprovalRecord {
+            protocol_version: PROTOCOL_VERSION,
+            request,
+            decision,
+        })
+    }
+
+    pub fn decide_approval(
+        &self,
+        command: DecideApprovalCommand,
+    ) -> Result<ApprovalReceipt, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, Option<String>)> = transaction
+            .query_row(
+                "SELECT request_json, decision_json FROM approval_requests WHERE request_id = ?1",
+                [command.decision.request_id.value().to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (request_json, existing_decision) = row.ok_or(StoreError::ApprovalNotFound)?;
+        if existing_decision.is_some() {
+            return Err(StoreError::ApprovalConflict);
+        }
+        let request: bastet_core::ApprovalRequest = serde_json::from_str(&request_json)?;
+        request.validate_unchanged()?;
+        request.verify_decision(&command.decision)?;
+        transaction.execute(
+            "UPDATE approval_requests SET decision_json = ?1, decided_at = ?2 WHERE request_id = ?3 AND decision_json IS NULL",
+            params![
+                serde_json::to_string(&command.decision)?,
+                timestamp(),
+                command.decision.request_id.value().to_string()
+            ],
+        )?;
+        let event = insert_event(
+            &transaction,
+            match command.decision.kind {
+                bastet_core::ApprovalDecisionKind::Approve => "approval.approved",
+                bastet_core::ApprovalDecisionKind::Deny => "approval.denied",
+            },
+            &serde_json::json!({"request_id": command.decision.request_id, "actor": command.decision.actor}).to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(ApprovalReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: command.decision.request_id,
             event_sequence: event.sequence,
         })
     }
@@ -530,6 +681,25 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StoreError> {
         )?;
         transaction.commit()?;
     }
+    if current < 3 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE approval_requests (
+                request_id TEXT PRIMARY KEY,
+                request_hash TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                expires_at_ms INTEGER NOT NULL,
+                decision_json TEXT,
+                created_at TEXT NOT NULL,
+                decided_at TEXT);
+             CREATE UNIQUE INDEX approval_request_hash ON approval_requests(request_hash);",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?1)",
+            [timestamp()],
+        )?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -650,10 +820,11 @@ mod tests {
     use super::*;
     use bastet_core::{
         Account, AccountId, AgentInstance, AgentInstanceId, AgentProvider, AgentProviderId,
-        CredentialBackend, CredentialReference, CredentialReferenceId, EntityLifecycle,
-        EntityMetadata, Model, ModelId, ModelProvider, ModelProviderId, PermissionLevel,
-        PolicyCeiling, PolicyLayer, Project, ProjectId, Provenance, Role, RoleId, Run, RunId,
-        ScopedPolicy, Session, SessionId,
+        ApprovalAction, ApprovalDecision, ApprovalDecisionKind, ApprovalRequest, ApprovalRequestId,
+        ApprovalRisk, ApprovalScope, CredentialBackend, CredentialReference, CredentialReferenceId,
+        EntityLifecycle, EntityMetadata, Model, ModelId, ModelProvider, ModelProviderId,
+        PermissionLevel, PolicyCeiling, PolicyLayer, Project, ProjectId, Provenance, Role, RoleId,
+        Run, RunId, ScopedPolicy, Session, SessionId,
     };
     use tempfile::tempdir;
 
@@ -759,6 +930,44 @@ mod tests {
         }
     }
 
+    fn approval_fixture() -> ApprovalRequest {
+        ApprovalRequest::create(
+            ApprovalRequestId::from_bytes([11; 16]),
+            100,
+            200,
+            ApprovalAction {
+                agent_instance_id: AgentInstanceId::from_bytes([6; 16]),
+                role_id: Some(RoleId::from_bytes([8; 16])),
+                action_key: "agent.write_file".into(),
+                reason_key: "approval.reason.report".into(),
+                consequence_key: "approval.consequence.workspace_change".into(),
+                risk: ApprovalRisk::Medium,
+                scope: ApprovalScope {
+                    project_id: ProjectId::from_bytes([7; 16]),
+                    run_id: Some(RunId::from_bytes([10; 16])),
+                    filesystem_roots: vec!["/fixture".into()],
+                    data_scopes: vec![],
+                    network_destinations: vec![],
+                    credential_reference_ids: vec![],
+                    destination: None,
+                },
+                requested_policy: ScopedPolicy {
+                    layer: PolicyLayer::SingleRun,
+                    ceiling: PolicyCeiling {
+                        filesystem: PermissionLevel::Observe,
+                        network: PermissionLevel::Deny,
+                        process: PermissionLevel::Observe,
+                        device: PermissionLevel::Deny,
+                        credential: PermissionLevel::Deny,
+                        persistent_approval: false,
+                    },
+                },
+            },
+            &catalog_fixture().roles[0].policy,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn enables_wal_and_applies_forward_migration() {
         let directory = tempdir().unwrap();
@@ -797,7 +1006,7 @@ mod tests {
 
         let upgraded = Store::open(&path).unwrap();
         let snapshot = upgraded.snapshot().unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 2);
+        assert_eq!(upgraded.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(snapshot.daemon_id, daemon_id);
         assert_eq!(snapshot.revision, 42);
         assert_eq!(snapshot.lifecycle, DaemonLifecycle::Recovering);
@@ -828,7 +1037,7 @@ mod tests {
             Store::open(&path),
             Err(StoreError::UnsupportedSchemaVersion {
                 actual: 99,
-                supported: 2
+                supported: SCHEMA_VERSION
             })
         ));
     }
@@ -866,7 +1075,7 @@ mod tests {
         drop(fixture);
 
         let upgraded = Store::open(&path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 2);
+        assert_eq!(upgraded.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(upgraded.snapshot().unwrap().daemon_id, daemon_id);
         assert_eq!(upgraded.catalog().unwrap().revision, 0);
         assert_eq!(
@@ -1072,6 +1281,119 @@ mod tests {
         assert_eq!(snapshot.revision, receipt.revision + 1);
         assert_eq!(snapshot.lifecycle, DaemonLifecycle::Ready);
         assert_eq!(resumed.event_type, "daemon.resumed");
+    }
+
+    #[test]
+    fn approval_is_immutable_durable_and_decided_once() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("approvals.db");
+        let store = Store::open(&path).unwrap();
+        store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: 0,
+                catalog: catalog_fixture(),
+            })
+            .unwrap();
+        let request = approval_fixture();
+        store
+            .create_approval(CreateApprovalCommand {
+                request: request.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            store.create_approval(CreateApprovalCommand {
+                request: request.clone()
+            }),
+            Err(StoreError::ApprovalConflict)
+        ));
+        let decision = ApprovalDecision {
+            request_id: request.id,
+            request_hash: request.request_hash.clone(),
+            kind: ApprovalDecisionKind::Deny,
+            decided_at_ms: 150,
+            actor: "local-user".into(),
+        };
+        store
+            .decide_approval(DecideApprovalCommand {
+                decision: decision.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            store.decide_approval(DecideApprovalCommand {
+                decision: decision.clone()
+            }),
+            Err(StoreError::ApprovalConflict)
+        ));
+        drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        let record = reopened.approval(request.id).unwrap();
+        assert_eq!(record.request, request);
+        assert_eq!(record.decision, Some(decision));
+        let events = reopened.events_after(0).unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "approval.requested"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "approval.denied"));
+        assert!(!events
+            .iter()
+            .any(|event| event.payload_json.contains("/fixture")));
+    }
+
+    #[test]
+    fn approval_rejects_changed_content_unknown_references_and_expiry() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("approvals.db")).unwrap();
+        store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: 0,
+                catalog: catalog_fixture(),
+            })
+            .unwrap();
+        let mut changed = approval_fixture();
+        changed.action.scope.destination = Some("external.example".into());
+        assert!(matches!(
+            store.create_approval(CreateApprovalCommand { request: changed }),
+            Err(StoreError::InvalidApproval(ApprovalError::HashMismatch))
+        ));
+        let mut missing = approval_fixture();
+        missing.action.agent_instance_id = AgentInstanceId::new();
+        missing = ApprovalRequest::create(
+            missing.id,
+            missing.created_at_ms,
+            missing.expires_at_ms,
+            missing.action,
+            &catalog_fixture().roles[0].policy,
+        )
+        .unwrap();
+        assert!(matches!(
+            store.create_approval(CreateApprovalCommand { request: missing }),
+            Err(StoreError::InvalidApproval(
+                ApprovalError::MissingReference("agent_instance_id")
+            ))
+        ));
+
+        let request = approval_fixture();
+        store
+            .create_approval(CreateApprovalCommand {
+                request: request.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            store.decide_approval(DecideApprovalCommand {
+                decision: ApprovalDecision {
+                    request_id: request.id,
+                    request_hash: request.request_hash,
+                    kind: ApprovalDecisionKind::Approve,
+                    decided_at_ms: 201,
+                    actor: "local-user".into(),
+                }
+            }),
+            Err(StoreError::InvalidApproval(ApprovalError::Expired))
+        ));
+        assert!(store.approval(request.id).unwrap().decision.is_none());
     }
 
     #[test]

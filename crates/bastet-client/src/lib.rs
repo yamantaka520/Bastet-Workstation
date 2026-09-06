@@ -1,9 +1,10 @@
 use std::{env, time::Duration};
 
-use bastet_core::IdentityCatalog;
+use bastet_core::{ApprovalDecision, ApprovalRequest, ApprovalRequestId, IdentityCatalog};
 use bastet_protocol::{
-    CatalogReceipt, CatalogSnapshot, CheckpointCommand, CheckpointReceipt, DaemonSnapshot,
-    EventEnvelope, ReplaceCatalogCommand, PROTOCOL_VERSION,
+    ApprovalReceipt, ApprovalRecord, CatalogReceipt, CatalogSnapshot, CheckpointCommand,
+    CheckpointReceipt, CreateApprovalCommand, DaemonSnapshot, DecideApprovalCommand, EventEnvelope,
+    ReplaceCatalogCommand, PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -102,6 +103,64 @@ impl DaemonClient {
             .await?
             .error_for_status()?
             .json::<CatalogReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
+    pub async fn create_approval(
+        &self,
+        request: ApprovalRequest,
+    ) -> Result<ApprovalReceipt, ClientError> {
+        let receipt = self
+            .http
+            .post(format!("{}/v1/approvals", self.base_url))
+            .json(&CreateApprovalCommand { request })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<ApprovalReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
+    pub async fn approval(
+        &self,
+        request_id: ApprovalRequestId,
+    ) -> Result<ApprovalRecord, ClientError> {
+        let record = self
+            .http
+            .get(format!(
+                "{}/v1/approvals/{}",
+                self.base_url,
+                request_id.value()
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<ApprovalRecord>()
+            .await?;
+        require_protocol(record.protocol_version)?;
+        Ok(record)
+    }
+
+    pub async fn decide_approval(
+        &self,
+        decision: ApprovalDecision,
+    ) -> Result<ApprovalReceipt, ClientError> {
+        let receipt = self
+            .http
+            .post(format!(
+                "{}/v1/approvals/{}",
+                self.base_url,
+                decision.request_id.value()
+            ))
+            .json(&DecideApprovalCommand { decision })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<ApprovalReceipt>()
             .await?;
         require_protocol(receipt.protocol_version)?;
         Ok(receipt)
