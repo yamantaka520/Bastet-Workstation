@@ -2,8 +2,9 @@
 
 pub mod sandbox;
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -81,6 +82,45 @@ pub trait RunController: Send + Sync + 'static {
 #[error("provider run controller rejected cancellation")]
 pub struct RunControlError;
 
+#[derive(Clone, Default)]
+pub struct RunControllerRegistry {
+    controllers: Arc<RwLock<HashMap<RunId, Arc<dyn RunController>>>>,
+}
+
+impl RunControllerRegistry {
+    pub fn register(
+        &self,
+        run_id: RunId,
+        controller: Arc<dyn RunController>,
+    ) -> Result<(), RunControlError> {
+        let mut controllers = self.controllers.write().map_err(|_| RunControlError)?;
+        if controllers.contains_key(&run_id) {
+            return Err(RunControlError);
+        }
+        controllers.insert(run_id, controller);
+        Ok(())
+    }
+
+    pub fn unregister(&self, run_id: RunId) -> Result<bool, RunControlError> {
+        Ok(self
+            .controllers
+            .write()
+            .map_err(|_| RunControlError)?
+            .remove(&run_id)
+            .is_some())
+    }
+}
+
+impl RunController for RunControllerRegistry {
+    fn cancel(&self, run_id: RunId) -> Result<(), RunControlError> {
+        let controllers = self.controllers.read().map_err(|_| RunControlError)?;
+        controllers
+            .get(&run_id)
+            .ok_or(RunControlError)?
+            .cancel(run_id)
+    }
+}
+
 struct UnavailableRunController;
 impl RunController for UnavailableRunController {
     fn cancel(&self, _run_id: RunId) -> Result<(), RunControlError> {
@@ -108,6 +148,14 @@ fn build_router(store: Store, shutdown_signal: Option<watch::Sender<bool>>) -> R
 
 pub fn router_with_run_controller(store: Store, run_controller: Arc<dyn RunController>) -> Router {
     build_router_with_controller(store, None, run_controller)
+}
+
+pub fn router_with_shutdown_and_run_controller(
+    store: Store,
+    shutdown_signal: watch::Sender<bool>,
+    run_controller: Arc<dyn RunController>,
+) -> Router {
+    build_router_with_controller(store, Some(shutdown_signal), run_controller)
 }
 
 fn build_router_with_controller(
@@ -982,6 +1030,23 @@ mod tests {
         fn cancel(&self, _run_id: RunId) -> Result<(), RunControlError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn run_controller_registry_routes_exactly_one_owned_run() {
+        let registry = RunControllerRegistry::default();
+        let owned = RunId::from_bytes([21; 16]);
+        let unknown = RunId::from_bytes([22; 16]);
+        registry
+            .register(owned, Arc::new(AcceptingRunController))
+            .unwrap();
+        assert!(registry
+            .register(owned, Arc::new(AcceptingRunController))
+            .is_err());
+        assert!(registry.cancel(owned).is_ok());
+        assert!(registry.cancel(unknown).is_err());
+        assert!(registry.unregister(owned).unwrap());
+        assert!(registry.cancel(owned).is_err());
     }
 
     fn metadata<I>(id: I) -> EntityMetadata<I> {

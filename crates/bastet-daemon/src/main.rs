@@ -1,7 +1,7 @@
 use std::{env, net::SocketAddr, path::PathBuf};
 
 use anyhow::Context;
-use bastet_daemon::{router_with_shutdown, Store};
+use bastet_daemon::{router_with_shutdown_and_run_controller, RunControllerRegistry, Store};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -18,24 +18,32 @@ async fn main() -> anyhow::Result<()> {
     println!("bastet-daemon listening on {}", listener.local_addr()?);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let signal_store = store.clone();
-    axum::serve(listener, router_with_shutdown(store, shutdown_tx))
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                result = shutdown_rx.changed() => {
-                    let _ = result;
-                }
-                result = tokio::signal::ctrl_c() => {
-                    if result.is_ok() {
-                        if let Ok(snapshot) = signal_store.snapshot() {
-                            let _ = signal_store.shutdown(bastet_protocol::CheckpointCommand {
-                                expected_revision: snapshot.revision,
-                                reason: "operating system interrupt".into(),
-                            });
-                        }
+    let run_controllers = RunControllerRegistry::default();
+    axum::serve(
+        listener,
+        router_with_shutdown_and_run_controller(
+            store,
+            shutdown_tx,
+            std::sync::Arc::new(run_controllers),
+        ),
+    )
+    .with_graceful_shutdown(async move {
+        tokio::select! {
+            result = shutdown_rx.changed() => {
+                let _ = result;
+            }
+            result = tokio::signal::ctrl_c() => {
+                if result.is_ok() {
+                    if let Ok(snapshot) = signal_store.snapshot() {
+                        let _ = signal_store.shutdown(bastet_protocol::CheckpointCommand {
+                            expected_revision: snapshot.revision,
+                            reason: "operating system interrupt".into(),
+                        });
                     }
                 }
             }
-        })
-        .await?;
+        }
+    })
+    .await?;
     Ok(())
 }
