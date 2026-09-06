@@ -4,7 +4,8 @@ use bastet_core::{ApprovalDecision, ApprovalRequest, ApprovalRequestId, Identity
 use bastet_protocol::{
     ApprovalList, ApprovalReceipt, ApprovalRecord, CancelRunCommand, CancelRunReceipt,
     CatalogReceipt, CatalogSnapshot, CheckpointCommand, CheckpointReceipt, CreateApprovalCommand,
-    DaemonSnapshot, DecideApprovalCommand, EventEnvelope, ReplaceCatalogCommand, PROTOCOL_VERSION,
+    DaemonSnapshot, DecideApprovalCommand, EventEnvelope, M3CatalogSnapshot, ReplaceCatalogCommand,
+    ReplaceM3CatalogCommand, PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -99,6 +100,36 @@ impl DaemonClient {
                 expected_revision,
                 catalog,
             })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<CatalogReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
+    pub async fn m3_catalog(&self) -> Result<M3CatalogSnapshot, ClientError> {
+        let snapshot = self
+            .http
+            .get(format!("{}/v1/m3", self.base_url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<M3CatalogSnapshot>()
+            .await?;
+        require_protocol(snapshot.protocol_version)?;
+        Ok(snapshot)
+    }
+
+    pub async fn replace_m3_catalog(
+        &self,
+        command: ReplaceM3CatalogCommand,
+    ) -> Result<CatalogReceipt, ClientError> {
+        let receipt = self
+            .http
+            .put(format!("{}/v1/m3", self.base_url))
+            .json(&command)
             .send()
             .await?
             .error_for_status()?
@@ -332,13 +363,24 @@ mod tests {
             ClientError::Request(ref error)
                 if error.status() == Some(reqwest::StatusCode::CONFLICT)
         ));
+        let initial_m3 = client.m3_catalog().await.unwrap();
+        assert_eq!(initial_m3.revision, 0);
+        let m3_receipt = client
+            .replace_m3_catalog(ReplaceM3CatalogCommand {
+                expected_revision: 0,
+                catalog: bastet_core::M3Catalog::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(m3_receipt.revision, 1);
+        assert_eq!(client.m3_catalog().await.unwrap().revision, 1);
         let receipt = client
             .checkpoint(initial.revision, "client integration test")
             .await
             .unwrap();
         assert_eq!(receipt.revision, initial.revision + 1);
         assert_eq!(client.snapshot().await.unwrap().revision, receipt.revision);
-        assert_eq!(store.events_after(0).unwrap().len(), 3);
+        assert_eq!(store.events_after(0).unwrap().len(), 4);
         let suspended = client
             .suspend(receipt.revision, "integration simulated sleep")
             .await

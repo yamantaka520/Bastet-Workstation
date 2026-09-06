@@ -9,11 +9,16 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct M3State {
+pub struct M3Catalog {
     pub office: OfficeCatalog,
     pub meetings: MeetingCatalog,
-    pub graph_executions: Vec<GraphExecution>,
     pub deliverables: DeliverableCatalog,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct M3State {
+    pub catalog: M3Catalog,
+    pub graph_executions: Vec<GraphExecution>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -41,9 +46,11 @@ impl M3State {
         identity
             .validate()
             .map_err(|_| M3Error::MissingDeliverableReference)?;
-        self.office.validate(identity)?;
-        self.meetings.validate(identity, &self.office)?;
-        self.deliverables.validate()?;
+        self.catalog.office.validate(identity)?;
+        self.catalog
+            .meetings
+            .validate(identity, &self.catalog.office)?;
+        self.catalog.deliverables.validate()?;
 
         let graph_ids = self
             .graph_executions
@@ -54,6 +61,7 @@ impl M3State {
             return Err(M3Error::DuplicateGraphExecution);
         }
         let baselines = self
+            .catalog
             .meetings
             .decision_baselines
             .iter()
@@ -88,23 +96,25 @@ impl M3State {
             .map(|run| run.metadata.id)
             .collect::<HashSet<_>>();
         let artifact_versions = self
+            .catalog
             .deliverables
             .documents
             .iter()
             .flat_map(|document| document.versions.iter().map(|version| version.id))
             .collect::<HashSet<_>>();
-        if self.deliverables.documents.iter().any(|document| {
+        if self.catalog.deliverables.documents.iter().any(|document| {
             !project_ids.contains(&document.project_id)
                 || document
                     .versions
                     .iter()
                     .flat_map(|version| &version.source_node_ids)
                     .any(|node| !graph_nodes.contains(node))
-        }) || self.deliverables.costs.iter().any(|cost| {
+        }) || self.catalog.deliverables.costs.iter().any(|cost| {
             !project_ids.contains(&cost.project_id)
                 || !run_ids.contains(&cost.run_id)
                 || !graph_nodes.contains(&cost.node_id)
         }) || self
+            .catalog
             .deliverables
             .knowledge_deliveries
             .iter()

@@ -15,12 +15,13 @@ use axum::{
 };
 use bastet_core::{
     ApprovalError, ApprovalRequestId, CatalogError, GraphError, GraphExecution, GraphNodeId,
-    GraphRunId, IdentityCatalog, RunId,
+    GraphRunId, IdentityCatalog, M3Catalog, RunId,
 };
 use bastet_protocol::{
     ApprovalList, ApprovalReceipt, ApprovalRecord, CancelRunReceipt, CatalogReceipt,
     CatalogSnapshot, CheckpointCommand, CheckpointReceipt, CreateApprovalCommand, DaemonLifecycle,
-    DaemonSnapshot, DecideApprovalCommand, EventEnvelope, ReplaceCatalogCommand, PROTOCOL_VERSION,
+    DaemonSnapshot, DecideApprovalCommand, EventEnvelope, M3CatalogSnapshot, ReplaceCatalogCommand,
+    ReplaceM3CatalogCommand, PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
@@ -28,7 +29,7 @@ use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -65,6 +66,8 @@ pub enum StoreError {
     RunControlRejected,
     #[error("graph execution is invalid: {0}")]
     InvalidGraph(#[from] GraphError),
+    #[error("M3 catalog is invalid: {0}")]
+    InvalidM3(String),
     #[error("graph execution was not found")]
     GraphNotFound,
     #[error("graph execution already exists")]
@@ -176,6 +179,7 @@ fn build_router_with_controller(
         .route("/v1/health", get(health))
         .route("/v1/events", get(events))
         .route("/v1/catalog", get(catalog).put(replace_catalog))
+        .route("/v1/m3", get(m3_catalog).put(replace_m3_catalog))
         .route("/v1/approvals", get(approvals).post(create_approval))
         .route(
             "/v1/approvals/{request_id}",
@@ -239,6 +243,17 @@ async fn replace_catalog(
     Json(command): Json<ReplaceCatalogCommand>,
 ) -> Result<Json<CatalogReceipt>, ApiError> {
     Ok(Json(state.store.replace_catalog(command)?))
+}
+
+async fn m3_catalog(State(state): State<AppState>) -> Result<Json<M3CatalogSnapshot>, ApiError> {
+    Ok(Json(state.store.m3_catalog()?))
+}
+
+async fn replace_m3_catalog(
+    State(state): State<AppState>,
+    Json(command): Json<ReplaceM3CatalogCommand>,
+) -> Result<Json<CatalogReceipt>, ApiError> {
+    Ok(Json(state.store.replace_m3_catalog(command)?))
 }
 
 async fn create_approval(
@@ -320,6 +335,7 @@ impl axum::response::IntoResponse for ApiError {
             StoreError::InvalidCatalog(_)
             | StoreError::InvalidApproval(_)
             | StoreError::InvalidGraph(_)
+            | StoreError::InvalidM3(_)
             | StoreError::Serialization(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -444,6 +460,81 @@ impl Store {
                 "projects": command.catalog.projects.len(),
                 "sessions": command.catalog.sessions.len(),
                 "runs": command.catalog.runs.len()
+            })
+            .to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(CatalogReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            revision,
+            event_sequence: event.sequence,
+        })
+    }
+
+    pub fn m3_catalog(&self) -> Result<M3CatalogSnapshot, StoreError> {
+        let connection = self.connection()?;
+        let (revision, catalog_json): (u64, String) = connection.query_row(
+            "SELECT revision, catalog_json FROM m3_catalog WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let catalog: M3Catalog = serde_json::from_str(&catalog_json)?;
+        let identity_json: String = connection.query_row(
+            "SELECT catalog_json FROM identity_catalog WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let identity: IdentityCatalog = serde_json::from_str(&identity_json)?;
+        validate_m3_catalog(&catalog, &identity)?;
+        Ok(M3CatalogSnapshot {
+            protocol_version: PROTOCOL_VERSION,
+            revision,
+            catalog,
+        })
+    }
+
+    pub fn replace_m3_catalog(
+        &self,
+        command: ReplaceM3CatalogCommand,
+    ) -> Result<CatalogReceipt, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let identity_json: String = transaction.query_row(
+            "SELECT catalog_json FROM identity_catalog WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let identity: IdentityCatalog = serde_json::from_str(&identity_json)?;
+        validate_m3_catalog(&command.catalog, &identity)?;
+        let actual: u64 = transaction.query_row(
+            "SELECT revision FROM m3_catalog WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if actual != command.expected_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: command.expected_revision,
+                actual,
+            });
+        }
+        let revision = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
+        transaction.execute(
+            "UPDATE m3_catalog SET revision = ?1, catalog_json = ?2, updated_at = ?3
+             WHERE singleton = 1",
+            params![
+                revision,
+                serde_json::to_string(&command.catalog)?,
+                timestamp()
+            ],
+        )?;
+        let event = insert_event(
+            &transaction,
+            "m3.catalog_replaced",
+            &serde_json::json!({
+                "revision": revision,
+                "pet_profiles": command.catalog.office.pet_profiles.len(),
+                "meetings": command.catalog.meetings.meetings.len(),
+                "documents": command.catalog.deliverables.documents.len()
             })
             .to_string(),
         )?;
@@ -1036,6 +1127,42 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StoreError> {
         )?;
         transaction.commit()?;
     }
+    if current < 5 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE m3_catalog (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                revision INTEGER NOT NULL,
+                catalog_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL);",
+        )?;
+        transaction.execute(
+            "INSERT INTO m3_catalog(singleton, revision, catalog_json, updated_at)
+             VALUES (1, 0, ?1, ?2)",
+            params![serde_json::to_string(&M3Catalog::default())?, timestamp()],
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?1)",
+            [timestamp()],
+        )?;
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
+fn validate_m3_catalog(catalog: &M3Catalog, identity: &IdentityCatalog) -> Result<(), StoreError> {
+    catalog
+        .office
+        .validate(identity)
+        .map_err(|error| StoreError::InvalidM3(error.to_string()))?;
+    catalog
+        .meetings
+        .validate(identity, &catalog.office)
+        .map_err(|error| StoreError::InvalidM3(error.to_string()))?;
+    catalog
+        .deliverables
+        .validate()
+        .map_err(|error| StoreError::InvalidM3(error.to_string()))?;
     Ok(())
 }
 
@@ -1842,6 +1969,39 @@ mod tests {
             event.event_type == "graph.running_nodes_marked_uncertain"
                 && !event.payload_json.contains("worker")
         }));
+    }
+
+    #[test]
+    fn m3_catalog_is_revision_guarded_and_durable() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("m3.db");
+        let store = Store::open(&path).unwrap();
+        let catalog = M3Catalog::default();
+        let receipt = store
+            .replace_m3_catalog(ReplaceM3CatalogCommand {
+                expected_revision: 0,
+                catalog: catalog.clone(),
+            })
+            .unwrap();
+        assert_eq!(receipt.revision, 1);
+        assert!(matches!(
+            store.replace_m3_catalog(ReplaceM3CatalogCommand {
+                expected_revision: 0,
+                catalog: catalog.clone(),
+            }),
+            Err(StoreError::RevisionConflict { .. })
+        ));
+        drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        let snapshot = reopened.m3_catalog().unwrap();
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(snapshot.catalog, catalog);
+        assert!(reopened
+            .events_after(0)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "m3.catalog_replaced"));
     }
 
     #[tokio::test]

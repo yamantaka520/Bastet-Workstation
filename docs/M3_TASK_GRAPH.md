@@ -37,3 +37,6 @@ verification evidence without adding scope.
   evidence class, redacted preview, provenance, and destination receipt semantics.
 - Cross-domain M3 aggregate validation now rejects missing DecisionBaseline, Role, Project, Run,
   graph-node, artifact-version, and duplicate graph-execution references.
+- Daemon schema v5 and the loopback client expose a separately revisioned M3 catalog for Office,
+  meetings, documents, costs, and explicit knowledge-delivery records; graph execution remains in
+  its dedicated authority table to avoid dual writes.
