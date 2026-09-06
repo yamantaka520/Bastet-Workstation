@@ -10,6 +10,7 @@ use bastet_protocol::{
     PROTOCOL_VERSION,
 };
 use serde::Serialize;
+use std::{env, path::PathBuf};
 use supervisor::DaemonSupervisor;
 use tauri::{
     menu::{Menu, MenuItem, Submenu},
@@ -22,6 +23,118 @@ struct BootstrapState {
     product_name: &'static str,
     protocol_version: u32,
     daemon_authoritative: bool,
+}
+
+#[derive(Serialize)]
+struct AgentStatus {
+    adapter_kind: &'static str,
+    display_name: &'static str,
+    installed: bool,
+    version: Option<String>,
+    authenticated: Option<bool>,
+    model_count: Option<usize>,
+    reasoning_controls: Vec<String>,
+    operations: Vec<String>,
+    error_key: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct AgentCenterSnapshot {
+    agents: Vec<AgentStatus>,
+}
+
+#[tauri::command]
+async fn agent_center_snapshot() -> Result<AgentCenterSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(inspect_agents)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn inspect_agents() -> AgentCenterSnapshot {
+    AgentCenterSnapshot {
+        agents: vec![inspect_codex(), inspect_agy()],
+    }
+}
+
+fn inspect_codex() -> AgentStatus {
+    let Some(path) = configured_executable("BASTET_CODEX_BIN", "codex") else {
+        return missing_agent("codex_cli", "Codex CLI");
+    };
+    let adapter = bastet_adapter_codex::CodexAdapter::new(path);
+    let version = adapter.version().ok().map(|report| report.version);
+    let authenticated = adapter
+        .authentication_status()
+        .ok()
+        .map(|status| status.authenticated);
+    let capabilities = adapter.capabilities();
+    AgentStatus {
+        adapter_kind: "codex_cli",
+        display_name: "Codex CLI",
+        installed: true,
+        version,
+        authenticated,
+        model_count: None,
+        reasoning_controls: capabilities.reasoning_controls,
+        operations: capabilities
+            .operations
+            .into_iter()
+            .map(|operation| format!("{operation:?}").to_lowercase())
+            .collect(),
+        error_key: None,
+    }
+}
+
+fn inspect_agy() -> AgentStatus {
+    let Some(path) = configured_executable("BASTET_AGY_BIN", "agy") else {
+        return missing_agent("agy_cli", "Agy CLI");
+    };
+    let adapter = bastet_adapter_agy::AgyAdapter::new(path);
+    let version = adapter.version().ok().map(|report| report.version);
+    let model_count = adapter.list_models().ok().map(|models| models.len());
+    let capabilities = adapter.capabilities();
+    AgentStatus {
+        adapter_kind: "agy_cli",
+        display_name: "Agy CLI",
+        installed: true,
+        version,
+        authenticated: None,
+        model_count,
+        reasoning_controls: capabilities.reasoning_controls,
+        operations: capabilities
+            .operations
+            .into_iter()
+            .map(|operation| format!("{operation:?}").to_lowercase())
+            .collect(),
+        error_key: None,
+    }
+}
+
+fn missing_agent(adapter_kind: &'static str, display_name: &'static str) -> AgentStatus {
+    AgentStatus {
+        adapter_kind,
+        display_name,
+        installed: false,
+        version: None,
+        authenticated: None,
+        model_count: None,
+        reasoning_controls: Vec::new(),
+        operations: Vec::new(),
+        error_key: Some("agent.binary_missing"),
+    }
+}
+
+fn configured_executable(variable: &str, name: &str) -> Option<PathBuf> {
+    if let Some(path) = env::var_os(variable).map(PathBuf::from) {
+        return path.is_file().then_some(path);
+    }
+    env::split_paths(&env::var_os("PATH")?).find_map(|directory| {
+        let candidate = directory.join(if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_owned()
+        });
+        candidate.is_file().then_some(candidate)
+    })
 }
 
 #[tauri::command]
@@ -237,6 +350,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             bootstrap_state,
             daemon_snapshot,
+            agent_center_snapshot,
             approval_center_snapshot,
             decide_approval,
             prepare_for_sleep,

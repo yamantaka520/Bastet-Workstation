@@ -8,6 +8,8 @@ type ConnectionState = "connecting" | "ready" | "offline";
 type DaemonSnapshot = { protocol_version: number; daemon_id: string; revision: number; lifecycle: string };
 type ApprovalRecord = { request: { id: string; request_hash: string; expires_at_ms: number; action: { action_key: string; reason_key: string; consequence_key: string; risk: string } }; decision: { kind: "approve" | "deny" } | null };
 type ApprovalList = { protocol_version: number; records: ApprovalRecord[] };
+type AgentStatus = { adapter_kind: string; display_name: string; installed: boolean; version: string | null; authenticated: boolean | null; model_count: number | null; reasoning_controls: string[]; operations: string[]; error_key: string | null };
+type AgentCenterSnapshot = { agents: AgentStatus[] };
 type View = "agents" | "approvals" | "diagnostics";
 
 export function App() {
@@ -16,14 +18,15 @@ export function App() {
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [snapshot, setSnapshot] = useState<DaemonSnapshot | null>(null);
   const [approvals, setApprovals] = useState<ApprovalRecord[]>([]);
+  const [agents, setAgents] = useState<AgentStatus[]>([]);
   const [autostart, setAutostart] = useState(false);
 
   const reconnect = useCallback(async () => {
     setConnection("connecting");
     try {
-      const [next, list] = await Promise.all([invoke<DaemonSnapshot>("daemon_snapshot"), invoke<ApprovalList>("approval_center_snapshot")]);
+      const [next, list, agentList] = await Promise.all([invoke<DaemonSnapshot>("daemon_snapshot"), invoke<ApprovalList>("approval_center_snapshot"), invoke<AgentCenterSnapshot>("agent_center_snapshot")]);
       if (next.protocol_version !== 1 || list.protocol_version !== 1) throw new Error("protocol mismatch");
-      setSnapshot(next); setApprovals(list.records); setConnection("ready");
+      setSnapshot(next); setApprovals(list.records); setAgents(agentList.agents); setConnection("ready");
     } catch { setSnapshot(null); setConnection("offline"); }
   }, []);
   useEffect(() => { void reconnect(); const timer = window.setInterval(() => void reconnect(), 5_000); return () => window.clearInterval(timer); }, [reconnect]);
@@ -44,10 +47,10 @@ export function App() {
     <p role="status" className="connection" data-state={connection}>{translate(locale, connection)}</p>
 
     {view === "agents" && <section aria-labelledby="agents-heading"><h2 id="agents-heading">{translate(locale, "agents")}</h2><p>{translate(locale, "agentHelp")}</p>
-      <div className="card-grid">{["Codex CLI", "Agy CLI"].map((agent) => <article key={agent}><h3>{agent}</h3><span className="badge">{translate(locale, "configured")}</span>
-        <dl><dt>{translate(locale, "doctor")}</dt><dd>{translate(locale, "available")}</dd><dt>{translate(locale, "authentication")}</dt><dd>{translate(locale, "verifyLocally")}</dd>
-          <dt>{translate(locale, "models")}</dt><dd>{translate(locale, "providerReported")}</dd><dt>{translate(locale, "reasoning")}</dt><dd>low · medium · high</dd>
-          <dt>{translate(locale, "runControl")}</dt><dd>session · run · status · cancel</dd></dl></article>)}</div></section>}
+      <div className="card-grid">{agents.map((agent) => <article key={agent.adapter_kind}><h3>{agent.display_name}</h3><span className="badge">{translate(locale, agent.installed ? "installed" : "notInstalled")}</span>
+        <dl><dt>{translate(locale, "version")}</dt><dd>{agent.version ?? translate(locale, "unknown")}</dd><dt>{translate(locale, "authentication")}</dt><dd>{agent.authenticated == null ? translate(locale, "unknown") : translate(locale, agent.authenticated ? "authenticated" : "notAuthenticated")}</dd>
+          <dt>{translate(locale, "models")}</dt><dd>{agent.model_count ?? translate(locale, "unknown")}</dd><dt>{translate(locale, "reasoning")}</dt><dd>{agent.reasoning_controls.join(" · ") || translate(locale, "unknown")}</dd>
+          <dt>{translate(locale, "runControl")}</dt><dd>{agent.operations.join(" · ") || translate(locale, "unavailable")}</dd></dl></article>)}</div></section>}
 
     {view === "approvals" && <section aria-labelledby="approvals-heading"><h2 id="approvals-heading">{translate(locale, "approvals")}</h2><p>{translate(locale, "approvalHelp")}</p>
       {approvals.length === 0 ? <p>{translate(locale, "noApprovals")}</p> : approvals.map((record) => <article key={record.request.id} className="approval-card"><h3>{record.request.action.action_key}</h3>

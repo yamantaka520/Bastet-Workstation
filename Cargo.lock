@@ -260,6 +260,8 @@ dependencies = [
 name = "bastet-desktop"
 version = "0.1.0"
 dependencies = [
+ "bastet-adapter-agy",
+ "bastet-adapter-codex",
  "bastet-client",
  "bastet-core",
  "bastet-protocol",

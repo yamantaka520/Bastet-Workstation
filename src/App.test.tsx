@@ -7,7 +7,9 @@ import { locales, translate } from "./i18n";
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn((command: string) => Promise.resolve(command === "approval_center_snapshot"
     ? { protocol_version: 1, records: [] }
-    : { protocol_version: 1, daemon_id: "test-daemon", revision: 7, lifecycle: "ready" })),
+    : command === "agent_center_snapshot"
+      ? { agents: [{ adapter_kind: "codex_cli", display_name: "Codex CLI", installed: true, version: "1.0.0", authenticated: true, model_count: 2, reasoning_controls: ["low", "high"], operations: ["start", "cancel"], error_key: null }] }
+      : { protocol_version: 1, daemon_id: "test-daemon", revision: 7, lifecycle: "ready" })),
 }));
 vi.mock("@tauri-apps/plugin-autostart", () => ({
   disable: vi.fn().mockResolvedValue(undefined),
