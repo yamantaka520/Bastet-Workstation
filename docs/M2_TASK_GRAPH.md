@@ -112,5 +112,7 @@ verification status; it does not add scope.
   A run-scoped tracker now owns lifecycle, provider evidence, and the optional workspace snapshot;
   when a writable run reaches a terminal state without provider write evidence, it emits the local
   receipt before releasing the terminal event. This makes evidence ordering part of the adapter
-  boundary instead of a responsibility duplicated by callers.
+  boundary instead of a responsibility duplicated by callers. Cancellation is also tracker-owned:
+  `Cancelling` is emitted only after `turn/interrupt` is accepted, while authoritative `Cancelled`
+  still requires the provider's terminal `interrupted` notification.
 - M2.4–M2.8: not started.

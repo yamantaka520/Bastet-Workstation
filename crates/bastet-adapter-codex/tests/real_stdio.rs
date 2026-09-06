@@ -144,11 +144,16 @@ fn installed_codex_interrupts_a_read_only_turn_over_stdio() {
             effort: model.default_reasoning_effort.clone(),
         })
         .unwrap();
-    let mut stream = CodexRunStream::new(RunId::from_bytes([43; 16]), &turn.turn_id).unwrap();
+    let mut tracker = CodexRunTracker::new(
+        RunId::from_bytes([43; 16]),
+        &thread.thread_id,
+        &turn.turn_id,
+        None,
+    )
+    .unwrap();
     loop {
-        let notification = server.next_notification().unwrap();
-        let Some(event) = stream
-            .ingest(&notification, "2026-09-03T00:00:00Z")
+        let CodexRunUpdate::Lifecycle(event) = tracker
+            .next_update(&mut server, "2026-09-03T00:00:00Z")
             .unwrap()
         else {
             continue;
@@ -157,19 +162,17 @@ fn installed_codex_interrupts_a_read_only_turn_over_stdio() {
         assert_eq!(event.event.sequence, 1);
         break;
     }
-    let requested = stream
-        .cancellation_requested("2026-09-03T00:00:01Z")
-        .unwrap();
+    let CodexRunUpdate::Lifecycle(requested) = tracker
+        .request_cancellation(&mut server, "2026-09-03T00:00:01Z")
+        .unwrap()
+    else {
+        panic!("cancellation request must produce lifecycle evidence");
+    };
     assert_eq!(requested.event.state, NormalizedRunState::Cancelling);
     assert_eq!(requested.event.sequence, 2);
-    server
-        .interrupt_turn(&thread.thread_id, &turn.turn_id)
-        .unwrap();
-
     loop {
-        let notification = server.next_notification().unwrap();
-        let Some(event) = stream
-            .ingest(&notification, "2026-09-03T00:00:02Z")
+        let CodexRunUpdate::Lifecycle(event) = tracker
+            .next_update(&mut server, "2026-09-03T00:00:02Z")
             .unwrap()
         else {
             continue;

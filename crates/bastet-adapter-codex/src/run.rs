@@ -20,6 +20,8 @@ pub enum RunTrackerError {
 }
 
 pub struct CodexRunTracker {
+    provider_thread_id: String,
+    provider_turn_id: String,
     stream: CodexRunStream,
     evidence: CodexRunEvidence,
     before: Option<WorkspaceSnapshot>,
@@ -35,12 +37,25 @@ impl CodexRunTracker {
         workspace_before: Option<WorkspaceSnapshot>,
     ) -> Result<Self, RunTrackerError> {
         Ok(Self {
+            provider_thread_id: provider_thread_id.to_owned(),
+            provider_turn_id: provider_turn_id.to_owned(),
             stream: CodexRunStream::new(run_id, provider_turn_id)?,
             evidence: CodexRunEvidence::new(provider_thread_id, provider_turn_id)?,
             before: workspace_before,
             provider_write_receipt: false,
             pending_terminal: None,
         })
+    }
+
+    pub fn request_cancellation<T: AppServerTransport>(
+        &mut self,
+        server: &mut CodexAppServer<T>,
+        occurred_at: &str,
+    ) -> Result<CodexRunUpdate, RunTrackerError> {
+        server.interrupt_turn(&self.provider_thread_id, &self.provider_turn_id)?;
+        Ok(CodexRunUpdate::Lifecycle(
+            self.stream.cancellation_requested(occurred_at)?,
+        ))
     }
 
     pub fn next_update<T: AppServerTransport>(
@@ -93,13 +108,42 @@ impl CodexRunTracker {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::VecDeque, fs};
 
     use bastet_core::EvidenceClass;
     use serde_json::json;
 
     use super::*;
-    use crate::CodexEventNormalizer;
+    use crate::{AppServerNotification, CodexEventNormalizer, TransportError};
+
+    #[derive(Default)]
+    struct FixtureTransport {
+        responses: VecDeque<Result<serde_json::Value, TransportError>>,
+        requests: Vec<(String, serde_json::Value)>,
+    }
+
+    impl AppServerTransport for FixtureTransport {
+        fn request(
+            &mut self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value, TransportError> {
+            self.requests.push((method.into(), params));
+            self.responses.pop_front().unwrap()
+        }
+
+        fn notify(
+            &mut self,
+            _method: &str,
+            _params: serde_json::Value,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn next_notification(&mut self) -> Result<AppServerNotification, TransportError> {
+            Err(TransportError::Unavailable)
+        }
+    }
 
     fn terminal(run_id: RunId) -> CodexRunUpdate {
         let mut normalizer = CodexEventNormalizer::new(run_id);
@@ -158,5 +202,54 @@ mod tests {
         };
         assert_eq!(event.event.state, NormalizedRunState::Succeeded);
         assert!(tracker.pending_terminal.is_none());
+    }
+
+    #[test]
+    fn cancellation_is_recorded_only_after_interrupt_is_accepted() {
+        let run_id = RunId::from_bytes([10; 16]);
+        let mut tracker = CodexRunTracker::new(run_id, "thr_1", "turn_1", None).unwrap();
+        let mut server = CodexAppServer::new(FixtureTransport {
+            responses: VecDeque::from([Ok(json!({})), Ok(json!({}))]),
+            ..FixtureTransport::default()
+        });
+        server.initialize().unwrap();
+        let CodexRunUpdate::Lifecycle(update) = tracker
+            .request_cancellation(&mut server, "2026-09-06T00:00:00Z")
+            .unwrap()
+        else {
+            panic!("accepted interruption must emit lifecycle evidence");
+        };
+        assert_eq!(update.event.state, NormalizedRunState::Cancelling);
+        let transport = server.into_transport();
+        assert_eq!(transport.requests[1].0, "turn/interrupt");
+        assert_eq!(
+            transport.requests[1].1,
+            json!({"threadId": "thr_1", "turnId": "turn_1"})
+        );
+
+        let mut rejected = CodexAppServer::new(FixtureTransport {
+            responses: VecDeque::from([
+                Ok(json!({})),
+                Err(TransportError::RemoteRejected {
+                    code: 99,
+                    retryable: false,
+                }),
+            ]),
+            ..FixtureTransport::default()
+        });
+        rejected.initialize().unwrap();
+        let mut fresh = CodexRunTracker::new(run_id, "thr_1", "turn_1", None).unwrap();
+        assert!(fresh
+            .request_cancellation(&mut rejected, "2026-09-06T00:00:00Z")
+            .is_err());
+        assert_eq!(
+            fresh
+                .stream
+                .cancellation_requested("later")
+                .unwrap()
+                .event
+                .sequence,
+            1
+        );
     }
 }
