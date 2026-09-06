@@ -1,9 +1,9 @@
 use std::{path::PathBuf, time::Duration};
 
 use bastet_adapter_codex::{
-    ApprovalPolicy, CodexAppServer, CodexRunEvidenceUpdate, CodexRunStream, CodexRunTracker,
-    CodexRunUpdate, StdioTransport, ThreadSandbox, ThreadStartRequest, TurnSandboxPolicy,
-    TurnStartRequest, WorkspaceSnapshot,
+    ApprovalPolicy, CodexAppServer, CodexRunEvidenceUpdate, CodexRunRequest, CodexRunStream,
+    CodexRunTracker, CodexRunUpdate, StdioTransport, ThreadSandbox, ThreadStartRequest,
+    TurnSandboxPolicy, TurnStartRequest,
 };
 use bastet_core::{AdapterFailureKind, NormalizedRunState, RunId};
 
@@ -44,37 +44,23 @@ fn installed_codex_completes_a_read_only_turn_over_stdio() {
         .find(|model| model.is_default)
         .or_else(|| page.models.first())
         .expect("Codex must report at least one visible model");
-    let thread = server
-        .start_thread(ThreadStartRequest {
+    let mut started = server
+        .start_tracked_run(CodexRunRequest {
+            run_id: RunId::from_bytes([42; 16]),
             model: model.model.clone(),
-            cwd: probe_root.clone(),
-            approval_policy: ApprovalPolicy::Never,
-            sandbox: ThreadSandbox::ReadOnly,
-        })
-        .unwrap();
-    let turn = server
-        .start_turn(TurnStartRequest {
-            thread_id: thread.thread_id.clone(),
             prompt: "Reply with exactly BASTET_READ_ONLY_OK. Do not call tools.".into(),
             cwd: probe_root.clone(),
             approval_policy: ApprovalPolicy::Never,
             sandbox_policy: TurnSandboxPolicy::ReadOnly,
-            model: Some(model.model.clone()),
             effort: model.default_reasoning_effort.clone(),
         })
         .unwrap();
-    let mut tracker = CodexRunTracker::new(
-        RunId::from_bytes([42; 16]),
-        &thread.thread_id,
-        &turn.turn_id,
-        None,
-    )
-    .unwrap();
     let mut saw_running = false;
     let mut saw_cost = false;
 
     loop {
-        match tracker
+        match started
+            .tracker
             .next_update(&mut server, "2026-09-03T00:00:00Z")
             .unwrap()
         {
@@ -294,18 +280,10 @@ fn installed_codex_reports_a_bounded_workspace_write_over_stdio() {
         .find(|model| model.is_default)
         .or_else(|| page.models.first())
         .expect("Codex must report at least one visible model");
-    let thread = server
-        .start_thread(ThreadStartRequest {
+    let mut started = server
+        .start_tracked_run(CodexRunRequest {
+            run_id: RunId::from_bytes([46; 16]),
             model: model.model.clone(),
-            cwd: probe_root.clone(),
-            approval_policy: ApprovalPolicy::Never,
-            sandbox: ThreadSandbox::WorkspaceWrite,
-        })
-        .unwrap();
-    let before = WorkspaceSnapshot::capture(&probe_root).unwrap();
-    let turn = server
-        .start_turn(TurnStartRequest {
-            thread_id: thread.thread_id.clone(),
             prompt: concat!(
                 "Create exactly one file named receipt.txt in the current directory. ",
                 "Its content must be exactly BASTET_WRITE_OK followed by one newline. ",
@@ -318,21 +296,14 @@ fn installed_codex_reports_a_bounded_workspace_write_over_stdio() {
                 writable_roots: vec![probe_root.clone()],
                 network_access: false,
             },
-            model: Some(model.model.clone()),
             effort: model.default_reasoning_effort.clone(),
         })
         .unwrap();
-    let mut tracker = CodexRunTracker::new(
-        RunId::from_bytes([46; 16]),
-        &thread.thread_id,
-        &turn.turn_id,
-        Some(before),
-    )
-    .unwrap();
     let mut saw_write_receipt = false;
 
     loop {
-        match tracker
+        match started
+            .tracker
             .next_update(&mut server, "2026-09-03T00:00:00Z")
             .unwrap()
         {

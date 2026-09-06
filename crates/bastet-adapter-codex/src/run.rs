@@ -1,11 +1,31 @@
+use std::path::PathBuf;
+
 use bastet_core::{NormalizedRunState, RunId};
 use thiserror::Error;
 
 use crate::{
-    AppServerError, AppServerTransport, CodexAppServer, CodexRunEvidence, CodexRunEvidenceUpdate,
-    CodexRunStream, CodexRunUpdate, EvidenceError, LifecycleError, ThreadHandle,
-    WorkspaceEvidenceError, WorkspaceSnapshot,
+    AppServerError, AppServerTransport, ApprovalPolicy, CodexAppServer, CodexRunEvidence,
+    CodexRunEvidenceUpdate, CodexRunStream, CodexRunUpdate, EvidenceError, LifecycleError,
+    ThreadHandle, ThreadSandbox, ThreadStartRequest, TurnHandle, TurnSandboxPolicy,
+    TurnStartRequest, WorkspaceEvidenceError, WorkspaceSnapshot,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexRunRequest {
+    pub run_id: RunId,
+    pub model: String,
+    pub prompt: String,
+    pub cwd: PathBuf,
+    pub approval_policy: ApprovalPolicy,
+    pub sandbox_policy: TurnSandboxPolicy,
+    pub effort: Option<String>,
+}
+
+pub struct StartedCodexRun {
+    pub thread: ThreadHandle,
+    pub turn: TurnHandle,
+    pub tracker: CodexRunTracker,
+}
 
 #[derive(Debug, Error)]
 pub enum RunTrackerError {
@@ -118,6 +138,52 @@ impl CodexRunTracker {
     }
 }
 
+impl<T: AppServerTransport> CodexAppServer<T> {
+    pub fn start_tracked_run(
+        &mut self,
+        request: CodexRunRequest,
+    ) -> Result<StartedCodexRun, RunTrackerError> {
+        let (thread_sandbox, before) = match &request.sandbox_policy {
+            TurnSandboxPolicy::ReadOnly => (ThreadSandbox::ReadOnly, None),
+            TurnSandboxPolicy::WorkspaceWrite { writable_roots, .. }
+                if writable_roots.len() == 1 && writable_roots.first() == Some(&request.cwd) =>
+            {
+                (
+                    ThreadSandbox::WorkspaceWrite,
+                    Some(WorkspaceSnapshot::capture(&request.cwd)?),
+                )
+            }
+            TurnSandboxPolicy::WorkspaceWrite { .. } => {
+                return Err(RunTrackerError::Workspace(
+                    WorkspaceEvidenceError::InvalidRoot,
+                ));
+            }
+        };
+        let thread = self.start_thread(ThreadStartRequest {
+            model: request.model.clone(),
+            cwd: request.cwd.clone(),
+            approval_policy: request.approval_policy,
+            sandbox: thread_sandbox,
+        })?;
+        let turn = self.start_turn(TurnStartRequest {
+            thread_id: thread.thread_id.clone(),
+            prompt: request.prompt,
+            cwd: request.cwd,
+            approval_policy: request.approval_policy,
+            sandbox_policy: request.sandbox_policy,
+            model: Some(request.model),
+            effort: request.effort,
+        })?;
+        let tracker =
+            CodexRunTracker::new(request.run_id, &thread.thread_id, &turn.turn_id, before)?;
+        Ok(StartedCodexRun {
+            thread,
+            turn,
+            tracker,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::VecDeque, fs};
@@ -169,6 +235,110 @@ mod tests {
                 .unwrap()
                 .unwrap(),
         )
+    }
+
+    fn initialized_fixture(
+        responses: impl IntoIterator<Item = serde_json::Value>,
+    ) -> CodexAppServer<FixtureTransport> {
+        let mut queued = VecDeque::from([Ok(json!({}))]);
+        queued.extend(responses.into_iter().map(Ok));
+        let mut server = CodexAppServer::new(FixtureTransport {
+            responses: queued,
+            ..FixtureTransport::default()
+        });
+        server.initialize().unwrap();
+        server
+    }
+
+    #[test]
+    fn tracked_read_only_run_uses_one_consistent_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let mut server = initialized_fixture([
+            json!({"thread": {"id": "thr_1", "sessionId": "session_1"}}),
+            json!({"turn": {"id": "turn_1"}}),
+        ]);
+
+        let started = server
+            .start_tracked_run(CodexRunRequest {
+                run_id: RunId::from_bytes([12; 16]),
+                model: "codex-model".into(),
+                prompt: "read only".into(),
+                cwd: root.path().to_path_buf(),
+                approval_policy: ApprovalPolicy::Never,
+                sandbox_policy: TurnSandboxPolicy::ReadOnly,
+                effort: Some("medium".into()),
+            })
+            .unwrap();
+        assert_eq!(started.thread.thread_id, "thr_1");
+        assert_eq!(started.turn.turn_id, "turn_1");
+
+        let transport = server.into_transport();
+        assert_eq!(transport.requests[1].0, "thread/start");
+        assert_eq!(transport.requests[1].1["sandbox"], "read-only");
+        assert_eq!(transport.requests[2].0, "turn/start");
+        assert_eq!(transport.requests[2].1["sandboxPolicy"]["type"], "readOnly");
+    }
+
+    #[test]
+    fn tracked_workspace_write_records_local_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let mut server = initialized_fixture([
+            json!({"thread": {"id": "thr_1", "sessionId": "session_1"}}),
+            json!({"turn": {"id": "turn_1"}}),
+        ]);
+        let mut started = server
+            .start_tracked_run(CodexRunRequest {
+                run_id: RunId::from_bytes([13; 16]),
+                model: "codex-model".into(),
+                prompt: "write bounded output".into(),
+                cwd: root.path().to_path_buf(),
+                approval_policy: ApprovalPolicy::Never,
+                sandbox_policy: TurnSandboxPolicy::WorkspaceWrite {
+                    writable_roots: vec![root.path().to_path_buf()],
+                    network_access: false,
+                },
+                effort: None,
+            })
+            .unwrap();
+        fs::write(root.path().join("receipt.txt"), "secret").unwrap();
+
+        let update = started
+            .tracker
+            .order_update(terminal(RunId::from_bytes([13; 16])))
+            .unwrap();
+        let CodexRunUpdate::Evidence(CodexRunEvidenceUpdate::WriteReceipt(receipt)) = update else {
+            panic!("tracked write must emit a local receipt before terminal state");
+        };
+        assert!(receipt.contains("locally_measured"));
+        assert!(!receipt.contains("receipt.txt"));
+        assert!(!receipt.contains("secret"));
+    }
+
+    #[test]
+    fn tracked_workspace_write_rejects_ambiguous_roots_before_provider_calls() {
+        let root = tempfile::tempdir().unwrap();
+        let mut server = initialized_fixture([]);
+
+        let result = server.start_tracked_run(CodexRunRequest {
+            run_id: RunId::from_bytes([14; 16]),
+            model: "codex-model".into(),
+            prompt: "write".into(),
+            cwd: root.path().to_path_buf(),
+            approval_policy: ApprovalPolicy::Never,
+            sandbox_policy: TurnSandboxPolicy::WorkspaceWrite {
+                writable_roots: vec![root.path().to_path_buf(), root.path().join("nested")],
+                network_access: false,
+            },
+            effort: None,
+        });
+        let Err(error) = result else {
+            panic!("ambiguous roots must be rejected");
+        };
+        assert!(matches!(
+            error,
+            RunTrackerError::Workspace(WorkspaceEvidenceError::InvalidRoot)
+        ));
+        assert_eq!(server.into_transport().requests.len(), 1);
     }
 
     #[test]

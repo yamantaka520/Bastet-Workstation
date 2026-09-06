@@ -117,4 +117,10 @@ verification status; it does not add scope.
   still requires the provider's terminal `interrupted` notification. Resume follows the same
   fail-closed rule: `Recovering` is emitted only after `thread/resume` returns a valid matching
   thread handle, and its sequence remains owned by the run tracker.
+  A production-shaped `start_tracked_run` façade now derives both thread and turn sandbox policy
+  from one request, captures writable-workspace evidence before `turn/start`, and rejects ambiguous
+  multi-root write policy rather than starting a run whose writes cannot be fully evidenced. Unit
+  fixtures prove both serialized policies and rejection before provider calls. Explicit real stdio
+  canaries then passed read-only and bounded single-file workspace-write runs through this façade;
+  the write canary retained the existing redacted locally-measured fallback receipt.
 - M2.4–M2.8: not started.

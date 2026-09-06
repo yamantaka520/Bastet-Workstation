@@ -15,7 +15,7 @@ pub use app_server::{
 };
 pub use evidence::{CodexRunEvidence, CodexRunEvidenceUpdate, EvidenceError};
 pub use lifecycle::{CodexEventNormalizer, CodexRunStream, LifecycleError, NormalizedCodexEvent};
-pub use run::{CodexRunTracker, RunTrackerError};
+pub use run::{CodexRunRequest, CodexRunTracker, RunTrackerError, StartedCodexRun};
 pub use stdio::StdioTransport;
 pub use workspace::{WorkspaceEvidenceError, WorkspaceSnapshot};
 
