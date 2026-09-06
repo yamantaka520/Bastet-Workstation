@@ -52,3 +52,7 @@ verification evidence without adding scope.
 - The daemon now persists MVP preparation atomically across identity and M3 catalogs, then persists
   the exact human-accepted DecisionBaseline and compiled graph in a second atomic transaction.
   Restart tests prove Project, three PetAssignments, accepted meeting, and graph survive reopen.
+- The five-locale Office UI now authors the prepared Project/meeting from an explicit absolute
+  workspace and displays the durable meeting summary after reconnect. A separate enabled-only-
+  with-content action records human DecisionBaseline acceptance and compiles the graph. The real
+  loopback client test covers prepare → accept → graph list → checkpoint/shutdown.

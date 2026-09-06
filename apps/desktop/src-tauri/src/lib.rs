@@ -5,8 +5,8 @@ mod macos_power;
 
 use bastet_client::DaemonClient;
 use bastet_core::{
-    ApprovalDecision, ApprovalRequestId, EntityLifecycle, EntityMetadata, PetProfile, PetProfileId,
-    PetStateAsset, Provenance, REQUIRED_PET_STATES,
+    ApprovalDecision, ApprovalRequestId, EntityLifecycle, EntityMetadata, MeetingId, PetProfile,
+    PetProfileId, PetStateAsset, Provenance, REQUIRED_PET_STATES,
 };
 use bastet_protocol::{
     ApprovalList, ApprovalReceipt, CheckpointReceipt, DaemonLifecycle, DaemonSnapshot,
@@ -71,6 +71,7 @@ struct M3Projection {
     documents: usize,
     costs: usize,
     graph_nodes: Vec<GraphNodeProjection>,
+    awaiting_meetings: Vec<MeetingProjection>,
 }
 
 #[derive(Serialize)]
@@ -78,6 +79,12 @@ struct GraphNodeProjection {
     title: String,
     state: String,
     pet_state: &'static str,
+}
+
+#[derive(Serialize)]
+struct MeetingProjection {
+    meeting_id: String,
+    summary: String,
 }
 
 #[tauri::command]
@@ -91,6 +98,57 @@ async fn m3_projection(client: State<'_, DaemonClient>) -> Result<M3Projection, 
         .await
         .map_err(|error| error.to_string())?;
     Ok(project_m3(snapshot, graphs.executions))
+}
+
+#[tauri::command]
+async fn prepare_mvp(
+    client: State<'_, DaemonClient>,
+    project_name: String,
+    workspace_root: String,
+) -> Result<bastet_protocol::PrepareMvpReceipt, String> {
+    let identity = client.catalog().await.map_err(|error| error.to_string())?;
+    let m3 = client
+        .m3_catalog()
+        .await
+        .map_err(|error| error.to_string())?;
+    client
+        .prepare_mvp(bastet_protocol::PrepareMvpCommand {
+            expected_catalog_revision: identity.revision,
+            expected_m3_revision: m3.revision,
+            project_name,
+            workspace_root,
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn accept_mvp_decision(
+    client: State<'_, DaemonClient>,
+    meeting_id: MeetingId,
+    content: String,
+) -> Result<bastet_protocol::AcceptDecisionBaselineReceipt, String> {
+    let m3 = client
+        .m3_catalog()
+        .await
+        .map_err(|error| error.to_string())?;
+    client
+        .accept_mvp_decision(bastet_protocol::AcceptDecisionBaselineCommand {
+            expected_m3_revision: m3.revision,
+            meeting_id,
+            content,
+            accepted_by: "local-desktop-user".into(),
+            accepted_at: timestamp_ms().to_string(),
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn timestamp_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after Unix epoch")
+        .as_millis()
 }
 
 #[tauri::command]
@@ -173,6 +231,21 @@ fn project_m3(
     snapshot: bastet_protocol::M3CatalogSnapshot,
     executions: Vec<bastet_core::GraphExecution>,
 ) -> M3Projection {
+    let awaiting_meetings = snapshot
+        .catalog
+        .meetings
+        .meetings
+        .iter()
+        .filter(|meeting| meeting.state == bastet_core::MeetingState::AwaitingDecision)
+        .map(|meeting| MeetingProjection {
+            meeting_id: meeting.metadata.id.value().to_string(),
+            summary: meeting
+                .rounds
+                .last()
+                .map(|round| round.summary.clone())
+                .unwrap_or_default(),
+        })
+        .collect();
     let graph_nodes = executions
         .into_iter()
         .flat_map(|execution| {
@@ -199,6 +272,7 @@ fn project_m3(
         documents: snapshot.catalog.deliverables.documents.len(),
         costs: snapshot.catalog.deliverables.costs.len(),
         graph_nodes,
+        awaiting_meetings,
     }
 }
 
@@ -590,6 +664,8 @@ pub fn run() {
             agent_center_snapshot,
             work_projection,
             m3_projection,
+            prepare_mvp,
+            accept_mvp_decision,
             apply_builtin_pet,
             rollback_builtin_pet,
             cancel_run,

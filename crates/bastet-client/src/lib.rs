@@ -2,11 +2,12 @@ use std::{env, time::Duration};
 
 use bastet_core::{ApprovalDecision, ApprovalRequest, ApprovalRequestId, IdentityCatalog, RunId};
 use bastet_protocol::{
-    ApprovalList, ApprovalReceipt, ApprovalRecord, CancelRunCommand, CancelRunReceipt,
-    CatalogReceipt, CatalogSnapshot, CheckpointCommand, CheckpointReceipt, CreateApprovalCommand,
-    CreateGraphExecutionCommand, DaemonSnapshot, DecideApprovalCommand, EventEnvelope,
-    GraphExecutionList, GraphExecutionReceipt, M3CatalogSnapshot, ReplaceCatalogCommand,
-    ReplaceM3CatalogCommand, PROTOCOL_VERSION,
+    AcceptDecisionBaselineCommand, AcceptDecisionBaselineReceipt, ApprovalList, ApprovalReceipt,
+    ApprovalRecord, CancelRunCommand, CancelRunReceipt, CatalogReceipt, CatalogSnapshot,
+    CheckpointCommand, CheckpointReceipt, CreateApprovalCommand, CreateGraphExecutionCommand,
+    DaemonSnapshot, DecideApprovalCommand, EventEnvelope, GraphExecutionList,
+    GraphExecutionReceipt, M3CatalogSnapshot, PrepareMvpCommand, PrepareMvpReceipt,
+    ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -148,6 +149,40 @@ impl DaemonClient {
             .await?
             .error_for_status()?
             .json::<GraphExecutionReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
+    pub async fn prepare_mvp(
+        &self,
+        command: PrepareMvpCommand,
+    ) -> Result<PrepareMvpReceipt, ClientError> {
+        let receipt = self
+            .http
+            .post(format!("{}/v1/mvp/prepare", self.base_url))
+            .json(&command)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<PrepareMvpReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
+    pub async fn accept_mvp_decision(
+        &self,
+        command: AcceptDecisionBaselineCommand,
+    ) -> Result<AcceptDecisionBaselineReceipt, ClientError> {
+        let receipt = self
+            .http
+            .post(format!("{}/v1/mvp/accept-decision", self.base_url))
+            .json(&command)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<AcceptDecisionBaselineReceipt>()
             .await?;
         require_protocol(receipt.protocol_version)?;
         Ok(receipt)
@@ -405,13 +440,34 @@ mod tests {
             .unwrap();
         assert_eq!(m3_receipt.revision, 1);
         assert_eq!(client.m3_catalog().await.unwrap().revision, 1);
+        let prepared = client
+            .prepare_mvp(PrepareMvpCommand {
+                expected_catalog_revision: 1,
+                expected_m3_revision: 1,
+                project_name: "Client MVP".into(),
+                workspace_root: directory.path().to_string_lossy().into_owned(),
+            })
+            .await
+            .unwrap();
+        let accepted = client
+            .accept_mvp_decision(AcceptDecisionBaselineCommand {
+                expected_m3_revision: prepared.m3_revision,
+                meeting_id: prepared.meeting_id,
+                content: "Two research branches and one explicit document join.".into(),
+                accepted_by: "test-user".into(),
+                accepted_at: "2026-09-07T00:00:00Z".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(accepted.m3_revision, prepared.m3_revision + 1);
+        assert_eq!(client.graph_executions().await.unwrap().executions.len(), 1);
         let receipt = client
             .checkpoint(initial.revision, "client integration test")
             .await
             .unwrap();
         assert_eq!(receipt.revision, initial.revision + 1);
         assert_eq!(client.snapshot().await.unwrap().revision, receipt.revision);
-        assert_eq!(store.events_after(0).unwrap().len(), 4);
+        assert_eq!(store.events_after(0).unwrap().len(), 6);
         let suspended = client
             .suspend(receipt.revision, "integration simulated sleep")
             .await
