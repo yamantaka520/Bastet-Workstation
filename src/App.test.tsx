@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import { locales, translate } from "./i18n";
+import { hasExplicitWorkflowTranslation, locales, translate, workflowKeys } from "./i18n";
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 
@@ -28,6 +28,14 @@ describe("M1 shell", () => {
   it("has every required locale and no missing critical keys", () => {
     expect(locales).toEqual(["zh-Hant", "zh-Hans", "en", "ja", "ko"]);
     for (const locale of locales) expect(translate(locale, "ready")).not.toMatch(/^\[missing:/);
+  });
+  it("has explicit workflow translations for all five locales", () => {
+    for (const locale of locales) {
+      for (const key of workflowKeys) {
+        expect(hasExplicitWorkflowTranslation(locale, key)).toBe(true);
+        expect(translate(locale, key)).not.toMatch(/^\[missing:/);
+      }
+    }
   });
   it("switches locale using an accessible native control", () => {
     render(<App />);
