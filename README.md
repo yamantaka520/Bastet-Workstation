@@ -2,13 +2,14 @@
 
 Bastet Workstation is a local-first desktop workspace for personal Agent Teams. It is designed for macOS, Windows, and Linux and keeps one human in control of agent execution, approvals, artifacts, costs, memory, and project knowledge.
 
-M0 is committed locally. Development is now in **M1: desktop and daemon foundation**. The current slice contains a versioned Rust protocol, SQLite WAL/event journal persistence and online backup, a loopback daemon API with durable graceful shutdown, a supervised daemon with crash diagnostics, opt-in auto-start, and a five-locale React/Tauri shell. Local macOS graceful-shutdown and forced-kill recovery smoke tests pass. It does not yet satisfy the complete M1 three-platform recovery gate.
+Development is now closing **M3: Office vertical slice**. M0–M2 are complete. The current slice contains the versioned Rust protocol, supervised local daemon and SQLite recovery foundation; Codex/Agy reference adapters; typed Projects, Roles, Role-bound Pets and meetings; a human-accepted DecisionBaseline; durable two-branch execution plus explicit join; versioned accepted documents; cost evidence; and explicit AgentMemoryOS/BastetMind delivery. Automated and real-provider gates pass locally. M3 remains open until the final cross-platform CI and the five-locale non-technical usability protocol in `docs/M3_VALIDATION.md` pass on the exact delivery commit.
 
 ## Authoritative plan
 
 [`docs/MASTER_PLAN.md`](docs/MASTER_PLAN.md) is the single authority for product scope, architecture, milestones, gates, and accepted decisions. Architecture decisions under [`docs/adr`](docs/adr) record the M0 baseline without replacing that plan.
 
-Current M1 test evidence and explicitly pending gates are tracked in [`docs/M1_VALIDATION.md`](docs/M1_VALIDATION.md).
+M1 evidence is tracked in [`docs/M1_VALIDATION.md`](docs/M1_VALIDATION.md); the active M3 automated
+and human gate is tracked in [`docs/M3_VALIDATION.md`](docs/M3_VALIDATION.md).
 
 ## M0 checks
 

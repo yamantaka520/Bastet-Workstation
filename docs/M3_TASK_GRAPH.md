@@ -73,3 +73,38 @@ verification evidence without adding scope.
 - Safety correction: the one-shot MVP initializer now accepts only a pristine state or the same
   unassigned built-in Pet profile. Existing Projects, meetings, assignments, documents, costs, or
   deliveries cause a fail-closed error; the initializer never replaces user data.
+- Provider execution now binds each ready Graph node to its Role-bound PetAssignment, persists its
+  Session/Run in the same transaction as the node claim, and returns the selected adapter, exact
+  discovered model, workspace, and DecisionBaseline-derived prompt. Terminal provider state,
+  provider session receipt, Graph state, and normalized cost evidence commit atomically. An
+  uncertain outcome releases ownership without unlocking the join; stale revisions roll back the
+  whole transition.
+- The desktop dispatches both ready research branches concurrently through the real Codex and Agy
+  reference adapters, then exposes the explicit join only after both succeed. A real opt-in gate on
+  commit `5d4ff2b` completed Codex + Agy research concurrently, ran the Codex join, persisted three
+  Runs and cost records, created and accepted the joined document, completed both durable delivery
+  records, reopened SQLite, and verified the entire state remained intact (1/1 in 60.03 seconds).
+  Independent real read-only canaries also passed 1/1 for each adapter.
+- MVP preparation no longer stores placeholder model names. It requires model IDs discovered from
+  each installed adapter and presents native model selectors before creating the Project.
+- AgentMemoryOS and BastetMind now have narrow first-party delivery connectors. Both reconcile a
+  stable delivery marker before retry; AgentMemoryOS requires a real CLI memory-id receipt, while
+  BastetMind uses create-new output files and idempotently updates its required `index.md` and
+  append-only `log.md`. Only then does the daemon mark the prepared delivery `Delivered`.
+- All M3 workflow and delivery controls have explicit zh-Hant, zh-Hans, English, Japanese, and
+  Korean strings. Node 22 CI for `c8b49bb` passed the frontend tests and build. Long-running provider
+  and delivery actions are disabled while active and expose localized status/error announcements.
+
+## Current gate evidence
+
+- Local automated regression after `c1bb50a`: core 37/37, daemon 23/23, client real-loopback 1/1,
+  desktop 5/5 with the real-provider scenario intentionally ignored by default, workspace Clippy
+  with warnings denied, TypeScript, and Vite production build all pass.
+- GitHub Actions is the cross-platform authority: closing commits `5d4ff2b` and `c1bb50a`, plus all
+  preceding M3 commits, passed the full Ubuntu/macOS/Windows Rust/Tauri matrix, recovery smoke, and
+  Node 22 frontend job.
+- The only non-automatable gate evidence still outstanding is a human, non-technical usability pass
+  of the complete MVP workflow in all five locales. Automated translation coverage, keyboard-native
+  controls, accessible status/alert semantics, Pet text fallbacks, and restart tests do not replace
+  that human evidence; M3 must not be declared complete until it is recorded using
+  `docs/M3_VALIDATION.md`.

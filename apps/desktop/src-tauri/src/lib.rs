@@ -1496,7 +1496,7 @@ mod tests {
             joined.terminal_state,
             bastet_core::NormalizedRunState::Succeeded
         );
-        store
+        let joined_done = store
             .finish_graph_node_run(
                 graph.id,
                 bastet_protocol::FinishGraphNodeRunCommand {
@@ -1512,6 +1512,56 @@ mod tests {
                 },
             )
             .unwrap();
+        let document = store
+            .create_mvp_document(bastet_protocol::CreateDocumentCommand {
+                expected_m3_revision: joined_done.m3_revision,
+                graph_execution_id: graph.id,
+                title: "Real provider report".into(),
+                markdown: "# Real provider report\n\nThe two provider branches and explicit join completed.".into(),
+            })
+            .unwrap();
+        let accepted_document = store
+            .accept_mvp_document(bastet_protocol::AcceptDocumentCommand {
+                expected_m3_revision: document.m3_revision,
+                artifact_id: document.artifact_id,
+                version_id: document.version_id,
+                content_hash: document.content_hash,
+                accepted_by: "m3-real-gate".into(),
+                accepted_at: "2026-09-07T00:01:00Z".into(),
+            })
+            .unwrap();
+        let memory = store
+            .prepare_knowledge_delivery(bastet_protocol::PrepareKnowledgeDeliveryCommand {
+                expected_m3_revision: accepted_document.m3_revision,
+                project_id: prepared.project_id,
+                artifact_version_id: document.version_id,
+                target: bastet_core::KnowledgeTarget::AgentMemoryOs,
+                preview: "Redacted real-provider result".into(),
+            })
+            .unwrap();
+        let memory = store
+            .complete_knowledge_delivery(bastet_protocol::CompleteKnowledgeDeliveryCommand {
+                expected_m3_revision: memory.m3_revision,
+                delivery_id: memory.delivery_id,
+                destination_receipt: "agent-memory:m3-real-gate-fixture".into(),
+            })
+            .unwrap();
+        let mind = store
+            .prepare_knowledge_delivery(bastet_protocol::PrepareKnowledgeDeliveryCommand {
+                expected_m3_revision: memory.m3_revision,
+                project_id: prepared.project_id,
+                artifact_version_id: document.version_id,
+                target: bastet_core::KnowledgeTarget::BastetMind,
+                preview: "Redacted real-provider result".into(),
+            })
+            .unwrap();
+        store
+            .complete_knowledge_delivery(bastet_protocol::CompleteKnowledgeDeliveryCommand {
+                expected_m3_revision: mind.m3_revision,
+                delivery_id: mind.delivery_id,
+                destination_receipt: "bastetmind:m3-real-gate-fixture".into(),
+            })
+            .unwrap();
         drop(store);
         let reopened = bastet_daemon::Store::open(&database).unwrap();
         assert!(reopened
@@ -1521,15 +1571,16 @@ mod tests {
             .iter()
             .all(|node| node.state == bastet_core::GraphNodeState::Succeeded));
         assert_eq!(reopened.catalog().unwrap().catalog.runs.len(), 3);
-        assert_eq!(
-            reopened
-                .m3_catalog()
-                .unwrap()
-                .catalog
-                .deliverables
-                .costs
-                .len(),
-            3
-        );
+        let reopened_m3 = reopened.m3_catalog().unwrap().catalog;
+        assert_eq!(reopened_m3.deliverables.costs.len(), 3);
+        assert!(reopened_m3.deliverables.documents[0].versions[0]
+            .accepted_by
+            .is_some());
+        assert_eq!(reopened_m3.deliverables.knowledge_deliveries.len(), 2);
+        assert!(reopened_m3
+            .deliverables
+            .knowledge_deliveries
+            .iter()
+            .all(|delivery| delivery.state == bastet_core::DeliveryState::Delivered));
     }
 }
