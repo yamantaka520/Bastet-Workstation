@@ -5,7 +5,9 @@ use crate::{NormalizedRunState, ScopedPolicy};
 
 macro_rules! stable_id {
     ($name:ident) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+        )]
         #[serde(transparent)]
         pub struct $name(Uuid);
 
@@ -47,6 +49,8 @@ stable_id!(PetAssignmentId);
 stable_id!(RoomId);
 stable_id!(MeetingId);
 stable_id!(DecisionBaselineId);
+stable_id!(GraphNodeId);
+stable_id!(GraphRunId);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

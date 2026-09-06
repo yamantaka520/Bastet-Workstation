@@ -28,3 +28,5 @@ verification evidence without adding scope.
 - M3.1a started: typed PetProfile, PetAssignment, and Room domain contracts with required all-state
   accessibility metadata and fail-closed relationship validation.
 - M3.2a started: bounded meeting and immutable, human-accepted DecisionBaseline contracts.
+- M3.3a started: validated two-branch research DAG and ownership-checked in-memory runtime with an
+  explicit join and failed-dependency blocking. Durable daemon persistence remains next.
