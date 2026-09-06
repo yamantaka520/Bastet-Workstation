@@ -12,11 +12,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use bastet_core::{ApprovalError, ApprovalRequestId, CatalogError, IdentityCatalog};
+use bastet_core::{ApprovalError, ApprovalRequestId, CatalogError, IdentityCatalog, RunId};
 use bastet_protocol::{
-    ApprovalList, ApprovalReceipt, ApprovalRecord, CatalogReceipt, CatalogSnapshot,
-    CheckpointCommand, CheckpointReceipt, CreateApprovalCommand, DaemonLifecycle, DaemonSnapshot,
-    DecideApprovalCommand, EventEnvelope, ReplaceCatalogCommand, PROTOCOL_VERSION,
+    ApprovalList, ApprovalReceipt, ApprovalRecord, CancelRunReceipt, CatalogReceipt,
+    CatalogSnapshot, CheckpointCommand, CheckpointReceipt, CreateApprovalCommand, DaemonLifecycle,
+    DaemonSnapshot, DecideApprovalCommand, EventEnvelope, ReplaceCatalogCommand, PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
@@ -53,6 +53,10 @@ pub enum StoreError {
     ApprovalConflict,
     #[error("state revision overflow")]
     RevisionOverflow,
+    #[error("run was not found")]
+    RunNotFound,
+    #[error("run cannot be cancelled from state {0}")]
+    InvalidRunState(String),
 }
 
 #[derive(Clone)]
@@ -332,6 +336,65 @@ impl Store {
         Ok(CatalogReceipt {
             protocol_version: PROTOCOL_VERSION,
             revision,
+            event_sequence: event.sequence,
+        })
+    }
+
+    /// Persists cancellation only after the daemon-owned provider controller accepted interrupt.
+    pub fn record_provider_cancel_accepted(
+        &self,
+        run_id: RunId,
+        expected_catalog_revision: u64,
+    ) -> Result<CancelRunReceipt, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (actual, catalog_json): (u64, String) = transaction.query_row(
+            "SELECT revision, catalog_json FROM identity_catalog WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if actual != expected_catalog_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: expected_catalog_revision,
+                actual,
+            });
+        }
+        let mut catalog: IdentityCatalog = serde_json::from_str(&catalog_json)?;
+        let run = catalog
+            .runs
+            .iter_mut()
+            .find(|run| run.metadata.id == run_id)
+            .ok_or(StoreError::RunNotFound)?;
+        if !matches!(
+            run.state,
+            bastet_core::NormalizedRunState::Starting
+                | bastet_core::NormalizedRunState::Running
+                | bastet_core::NormalizedRunState::Recovering
+        ) {
+            return Err(StoreError::InvalidRunState(
+                format!("{:?}", run.state).to_lowercase(),
+            ));
+        }
+        run.state = bastet_core::NormalizedRunState::Cancelling;
+        run.metadata.revision = run
+            .metadata
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::RevisionOverflow)?;
+        run.metadata.updated_at = timestamp();
+        catalog.validate()?;
+        let revision = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
+        transaction.execute("UPDATE identity_catalog SET revision=?1, catalog_json=?2, updated_at=?3 WHERE singleton=1", params![revision, serde_json::to_string(&catalog)?, timestamp()])?;
+        let event = insert_event(
+            &transaction,
+            "run.cancel_accepted",
+            &serde_json::json!({"run_id": run_id}).to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(CancelRunReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            run_id,
+            catalog_revision: revision,
             event_sequence: event.sequence,
         })
     }
@@ -1370,6 +1433,36 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| event.payload_json.contains("/fixture")));
+    }
+
+    #[test]
+    fn provider_accepted_cancel_is_revision_guarded_and_durable() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("cancel.db")).unwrap();
+        let mut catalog = catalog_fixture();
+        catalog.runs[0].state = bastet_core::NormalizedRunState::Running;
+        catalog.runs[0].started_at = Some("2026-09-06T00:00:01Z".into());
+        let run_id = catalog.runs[0].metadata.id;
+        store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: 0,
+                catalog,
+            })
+            .unwrap();
+        let receipt = store.record_provider_cancel_accepted(run_id, 1).unwrap();
+        assert_eq!(receipt.catalog_revision, 2);
+        assert_eq!(
+            store.catalog().unwrap().catalog.runs[0].state,
+            bastet_core::NormalizedRunState::Cancelling
+        );
+        assert!(matches!(
+            store.record_provider_cancel_accepted(run_id, 1),
+            Err(StoreError::RevisionConflict { .. })
+        ));
+        assert_eq!(
+            store.events_after(0).unwrap().last().unwrap().event_type,
+            "run.cancel_accepted"
+        );
     }
 
     #[test]
