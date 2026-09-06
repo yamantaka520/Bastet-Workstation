@@ -141,6 +141,36 @@ pub struct AcceptDecisionBaselineReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimGraphNodesCommand {
+    pub expected_revision: u64,
+    pub owner: String,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimGraphNodesReceipt {
+    pub protocol_version: u32,
+    pub execution_id: bastet_core::GraphRunId,
+    pub revision: u64,
+    pub claimed: Vec<bastet_core::GraphNodeId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteGraphNodeCommand {
+    pub expected_revision: u64,
+    pub node_id: bastet_core::GraphNodeId,
+    pub owner: String,
+    pub succeeded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteGraphNodeReceipt {
+    pub protocol_version: u32,
+    pub execution_id: bastet_core::GraphRunId,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateApprovalCommand {
     pub request: ApprovalRequest,
 }

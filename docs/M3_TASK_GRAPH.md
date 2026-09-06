@@ -56,3 +56,7 @@ verification evidence without adding scope.
   workspace and displays the durable meeting summary after reconnect. A separate enabled-only-
   with-content action records human DecisionBaseline acceptance and compiles the graph. The real
   loopback client test covers prepare → accept → graph list → checkpoint/shutdown.
+- Graph runtime claim/complete commands are now versioned daemon APIs. The loopback integration
+  test claims both research branches together, completes each with revision CAS, proves the join
+  becomes claimable only afterward, completes it under a distinct owner, then checkpoints and
+  shuts down cleanly.

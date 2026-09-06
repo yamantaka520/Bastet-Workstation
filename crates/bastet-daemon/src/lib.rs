@@ -20,7 +20,8 @@ use bastet_core::{
 use bastet_protocol::{
     AcceptDecisionBaselineCommand, AcceptDecisionBaselineReceipt, ApprovalList, ApprovalReceipt,
     ApprovalRecord, CancelRunReceipt, CatalogReceipt, CatalogSnapshot, CheckpointCommand,
-    CheckpointReceipt, CreateApprovalCommand, CreateGraphExecutionCommand, DaemonLifecycle,
+    CheckpointReceipt, ClaimGraphNodesCommand, ClaimGraphNodesReceipt, CompleteGraphNodeCommand,
+    CompleteGraphNodeReceipt, CreateApprovalCommand, CreateGraphExecutionCommand, DaemonLifecycle,
     DaemonSnapshot, DecideApprovalCommand, EventEnvelope, GraphExecutionList,
     GraphExecutionReceipt, M3CatalogSnapshot, PrepareMvpCommand, PrepareMvpReceipt,
     ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
@@ -188,6 +189,11 @@ fn build_router_with_controller(
             "/v1/graphs",
             get(graph_executions).post(create_graph_execution),
         )
+        .route("/v1/graphs/{execution_id}/claim", post(claim_graph_nodes))
+        .route(
+            "/v1/graphs/{execution_id}/complete",
+            post(complete_graph_node),
+        )
         .route("/v1/mvp/prepare", post(prepare_mvp))
         .route(
             "/v1/mvp/accept-decision",
@@ -299,6 +305,47 @@ async fn accept_mvp_decision_baseline(
     Json(command): Json<AcceptDecisionBaselineCommand>,
 ) -> Result<Json<AcceptDecisionBaselineReceipt>, ApiError> {
     Ok(Json(state.store.accept_mvp_decision(command)?))
+}
+
+async fn claim_graph_nodes(
+    State(state): State<AppState>,
+    AxumPath(execution_id): AxumPath<Uuid>,
+    Json(command): Json<ClaimGraphNodesCommand>,
+) -> Result<Json<ClaimGraphNodesReceipt>, ApiError> {
+    let id = GraphRunId::from_bytes(*execution_id.as_bytes());
+    let claimed = state.store.claim_graph_nodes(
+        id,
+        command.expected_revision,
+        &command.owner,
+        command.limit,
+    )?;
+    let revision = state.store.graph_execution(id)?.revision;
+    Ok(Json(ClaimGraphNodesReceipt {
+        protocol_version: PROTOCOL_VERSION,
+        execution_id: id,
+        revision,
+        claimed,
+    }))
+}
+
+async fn complete_graph_node(
+    State(state): State<AppState>,
+    AxumPath(execution_id): AxumPath<Uuid>,
+    Json(command): Json<CompleteGraphNodeCommand>,
+) -> Result<Json<CompleteGraphNodeReceipt>, ApiError> {
+    let id = GraphRunId::from_bytes(*execution_id.as_bytes());
+    state.store.complete_graph_node(
+        id,
+        command.expected_revision,
+        command.node_id,
+        &command.owner,
+        command.succeeded,
+    )?;
+    Ok(Json(CompleteGraphNodeReceipt {
+        protocol_version: PROTOCOL_VERSION,
+        execution_id: id,
+        revision: state.store.graph_execution(id)?.revision,
+    }))
 }
 
 async fn create_approval(

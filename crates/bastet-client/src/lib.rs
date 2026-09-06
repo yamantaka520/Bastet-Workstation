@@ -4,10 +4,11 @@ use bastet_core::{ApprovalDecision, ApprovalRequest, ApprovalRequestId, Identity
 use bastet_protocol::{
     AcceptDecisionBaselineCommand, AcceptDecisionBaselineReceipt, ApprovalList, ApprovalReceipt,
     ApprovalRecord, CancelRunCommand, CancelRunReceipt, CatalogReceipt, CatalogSnapshot,
-    CheckpointCommand, CheckpointReceipt, CreateApprovalCommand, CreateGraphExecutionCommand,
-    DaemonSnapshot, DecideApprovalCommand, EventEnvelope, GraphExecutionList,
-    GraphExecutionReceipt, M3CatalogSnapshot, PrepareMvpCommand, PrepareMvpReceipt,
-    ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
+    CheckpointCommand, CheckpointReceipt, ClaimGraphNodesCommand, ClaimGraphNodesReceipt,
+    CompleteGraphNodeCommand, CompleteGraphNodeReceipt, CreateApprovalCommand,
+    CreateGraphExecutionCommand, DaemonSnapshot, DecideApprovalCommand, EventEnvelope,
+    GraphExecutionList, GraphExecutionReceipt, M3CatalogSnapshot, PrepareMvpCommand,
+    PrepareMvpReceipt, ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -183,6 +184,50 @@ impl DaemonClient {
             .await?
             .error_for_status()?
             .json::<AcceptDecisionBaselineReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
+    pub async fn claim_graph_nodes(
+        &self,
+        execution_id: bastet_core::GraphRunId,
+        command: ClaimGraphNodesCommand,
+    ) -> Result<ClaimGraphNodesReceipt, ClientError> {
+        let receipt = self
+            .http
+            .post(format!(
+                "{}/v1/graphs/{}/claim",
+                self.base_url,
+                execution_id.value()
+            ))
+            .json(&command)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<ClaimGraphNodesReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
+    pub async fn complete_graph_node(
+        &self,
+        execution_id: bastet_core::GraphRunId,
+        command: CompleteGraphNodeCommand,
+    ) -> Result<CompleteGraphNodeReceipt, ClientError> {
+        let receipt = self
+            .http
+            .post(format!(
+                "{}/v1/graphs/{}/complete",
+                self.base_url,
+                execution_id.value()
+            ))
+            .json(&command)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<CompleteGraphNodeReceipt>()
             .await?;
         require_protocol(receipt.protocol_version)?;
         Ok(receipt)
@@ -460,14 +505,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(accepted.m3_revision, prepared.m3_revision + 1);
-        assert_eq!(client.graph_executions().await.unwrap().executions.len(), 1);
+        let execution_id = accepted.graph_execution_id;
+        let graph = client
+            .graph_executions()
+            .await
+            .unwrap()
+            .executions
+            .remove(0);
+        let branches = client
+            .claim_graph_nodes(
+                execution_id,
+                ClaimGraphNodesCommand {
+                    expected_revision: graph.revision,
+                    owner: "research".into(),
+                    limit: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(branches.claimed.len(), 2);
+        let mut revision = branches.revision;
+        for node_id in branches.claimed {
+            revision = client
+                .complete_graph_node(
+                    execution_id,
+                    CompleteGraphNodeCommand {
+                        expected_revision: revision,
+                        node_id,
+                        owner: "research".into(),
+                        succeeded: true,
+                    },
+                )
+                .await
+                .unwrap()
+                .revision;
+        }
+        let join = client
+            .claim_graph_nodes(
+                execution_id,
+                ClaimGraphNodesCommand {
+                    expected_revision: revision,
+                    owner: "integrator".into(),
+                    limit: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(join.claimed.len(), 1);
+        client
+            .complete_graph_node(
+                execution_id,
+                CompleteGraphNodeCommand {
+                    expected_revision: join.revision,
+                    node_id: join.claimed[0],
+                    owner: "integrator".into(),
+                    succeeded: true,
+                },
+            )
+            .await
+            .unwrap();
         let receipt = client
             .checkpoint(initial.revision, "client integration test")
             .await
             .unwrap();
         assert_eq!(receipt.revision, initial.revision + 1);
         assert_eq!(client.snapshot().await.unwrap().revision, receipt.revision);
-        assert_eq!(store.events_after(0).unwrap().len(), 6);
+        assert_eq!(store.events_after(0).unwrap().len(), 11);
         let suspended = client
             .suspend(receipt.revision, "integration simulated sleep")
             .await
