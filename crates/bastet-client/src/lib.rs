@@ -8,7 +8,8 @@ use bastet_protocol::{
     CheckpointCommand, CheckpointReceipt, ClaimGraphNodesCommand, ClaimGraphNodesReceipt,
     CompleteGraphNodeCommand, CompleteGraphNodeReceipt, CompleteKnowledgeDeliveryCommand,
     CostReceipt, CreateApprovalCommand, CreateDocumentCommand, CreateGraphExecutionCommand,
-    DaemonSnapshot, DecideApprovalCommand, DocumentReceipt, EventEnvelope, GraphExecutionList,
+    DaemonSnapshot, DecideApprovalCommand, DocumentReceipt, EventEnvelope,
+    FinishGraphNodeRunCommand, FinishGraphNodeRunReceipt, GraphExecutionList,
     GraphExecutionReceipt, KnowledgeDeliveryReceipt, M3CatalogSnapshot,
     PrepareKnowledgeDeliveryCommand, PrepareMvpCommand, PrepareMvpReceipt, RecordCostCommand,
     ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
@@ -231,6 +232,28 @@ impl DaemonClient {
             .await?
             .error_for_status()?
             .json::<BeginGraphNodeRunReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
+    pub async fn finish_graph_node_run(
+        &self,
+        execution_id: bastet_core::GraphRunId,
+        command: FinishGraphNodeRunCommand,
+    ) -> Result<FinishGraphNodeRunReceipt, ClientError> {
+        let receipt = self
+            .http
+            .post(format!(
+                "{}/v1/graphs/{}/runs/finish",
+                self.base_url,
+                execution_id.value()
+            ))
+            .json(&command)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<FinishGraphNodeRunReceipt>()
             .await?;
         require_protocol(receipt.protocol_version)?;
         Ok(receipt)
@@ -649,19 +672,31 @@ mod tests {
             .unwrap();
         assert_eq!(branches.claimed.len(), 1);
         let mut revision = branches.revision;
-        revision = client
-            .complete_graph_node(
+        let finished = client
+            .finish_graph_node_run(
                 execution_id,
-                CompleteGraphNodeCommand {
-                    expected_revision: revision,
+                FinishGraphNodeRunCommand {
+                    expected_catalog_revision: begun.catalog_revision,
+                    expected_graph_revision: revision,
+                    expected_m3_revision: accepted.m3_revision,
                     node_id: begun.node_id,
+                    run_id: begun.run_id,
                     owner: "codex-worker".into(),
                     succeeded: true,
+                    provider_session_id: Some("provider-thread-client-test".into()),
+                    cost: bastet_core::CostEvidence {
+                        evidence_class: bastet_core::EvidenceClass::ProviderReported,
+                        currency: None,
+                        amount: None,
+                        input_tokens: Some(8),
+                        output_tokens: Some(2),
+                        confidence: 1.0,
+                    },
                 },
             )
             .await
-            .unwrap()
-            .revision;
+            .unwrap();
+        revision = finished.graph_revision;
         for node_id in branches.claimed {
             revision = client
                 .complete_graph_node(
@@ -703,7 +738,7 @@ mod tests {
             .unwrap();
         let document = client
             .create_mvp_document(CreateDocumentCommand {
-                expected_m3_revision: accepted.m3_revision,
+                expected_m3_revision: finished.m3_revision,
                 graph_execution_id: execution_id,
                 title: "Client report".into(),
                 markdown: "# Client report\n\nJoined evidence.".into(),

@@ -26,10 +26,10 @@ use bastet_protocol::{
     CheckpointReceipt, ClaimGraphNodesCommand, ClaimGraphNodesReceipt, CompleteGraphNodeCommand,
     CompleteGraphNodeReceipt, CompleteKnowledgeDeliveryCommand, CostReceipt, CreateApprovalCommand,
     CreateDocumentCommand, CreateGraphExecutionCommand, DaemonLifecycle, DaemonSnapshot,
-    DecideApprovalCommand, DocumentReceipt, EventEnvelope, GraphExecutionList,
-    GraphExecutionReceipt, KnowledgeDeliveryReceipt, M3CatalogSnapshot,
-    PrepareKnowledgeDeliveryCommand, PrepareMvpCommand, PrepareMvpReceipt, RecordCostCommand,
-    ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
+    DecideApprovalCommand, DocumentReceipt, EventEnvelope, FinishGraphNodeRunCommand,
+    FinishGraphNodeRunReceipt, GraphExecutionList, GraphExecutionReceipt, KnowledgeDeliveryReceipt,
+    M3CatalogSnapshot, PrepareKnowledgeDeliveryCommand, PrepareMvpCommand, PrepareMvpReceipt,
+    RecordCostCommand, ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
@@ -201,6 +201,10 @@ fn build_router_with_controller(
         .route("/v1/graphs/{execution_id}/claim", post(claim_graph_nodes))
         .route("/v1/graphs/{execution_id}/runs", post(begin_graph_node_run))
         .route(
+            "/v1/graphs/{execution_id}/runs/finish",
+            post(finish_graph_node_run),
+        )
+        .route(
             "/v1/graphs/{execution_id}/complete",
             post(complete_graph_node),
         )
@@ -355,6 +359,17 @@ async fn begin_graph_node_run(
     Json(command): Json<BeginGraphNodeRunCommand>,
 ) -> Result<Json<BeginGraphNodeRunReceipt>, ApiError> {
     Ok(Json(state.store.begin_graph_node_run(
+        GraphRunId::from_bytes(*execution_id.as_bytes()),
+        command,
+    )?))
+}
+
+async fn finish_graph_node_run(
+    State(state): State<AppState>,
+    AxumPath(execution_id): AxumPath<Uuid>,
+    Json(command): Json<FinishGraphNodeRunCommand>,
+) -> Result<Json<FinishGraphNodeRunReceipt>, ApiError> {
+    Ok(Json(state.store.finish_graph_node_run(
         GraphRunId::from_bytes(*execution_id.as_bytes()),
         command,
     )?))
@@ -1489,6 +1504,193 @@ impl Store {
             prompt,
             catalog_revision: next_catalog_revision,
             graph_revision: execution.revision,
+            event_sequence: event.sequence,
+        })
+    }
+
+    pub fn finish_graph_node_run(
+        &self,
+        id: GraphRunId,
+        command: FinishGraphNodeRunCommand,
+    ) -> Result<FinishGraphNodeRunReceipt, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (catalog_revision, identity_json): (u64, String) = transaction.query_row(
+            "SELECT revision, catalog_json FROM identity_catalog WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if catalog_revision != command.expected_catalog_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: command.expected_catalog_revision,
+                actual: catalog_revision,
+            });
+        }
+        let (m3_revision, m3_json): (u64, String) = transaction.query_row(
+            "SELECT revision, catalog_json FROM m3_catalog WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if m3_revision != command.expected_m3_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: command.expected_m3_revision,
+                actual: m3_revision,
+            });
+        }
+        let (graph_revision, graph_json): (u64, String) = transaction
+            .query_row(
+                "SELECT revision, execution_json FROM graph_executions WHERE execution_id=?1",
+                [id.value().to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::GraphNotFound)?;
+        if graph_revision != command.expected_graph_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: command.expected_graph_revision,
+                actual: graph_revision,
+            });
+        }
+        let mut identity: IdentityCatalog = serde_json::from_str(&identity_json)?;
+        let mut m3: M3Catalog = serde_json::from_str(&m3_json)?;
+        let mut execution: GraphExecution = serde_json::from_str(&graph_json)?;
+        let run_index = identity
+            .runs
+            .iter()
+            .position(|run| run.metadata.id == command.run_id)
+            .ok_or(StoreError::RunNotFound)?;
+        if !matches!(
+            identity.runs[run_index].state,
+            bastet_core::NormalizedRunState::Starting | bastet_core::NormalizedRunState::Running
+        ) {
+            return Err(StoreError::InvalidRunState(
+                format!("{:?}", identity.runs[run_index].state).to_lowercase(),
+            ));
+        }
+        let session_id = identity.runs[run_index].session_id;
+        let model_id = identity.runs[run_index].model_id;
+        let session_index = identity
+            .sessions
+            .iter()
+            .position(|session| session.metadata.id == session_id)
+            .ok_or(StoreError::RunNotFound)?;
+        let agent_id = identity.sessions[session_index].agent_instance_id;
+        let project_id = identity.sessions[session_index].project_id;
+        let agent = identity
+            .agent_instances
+            .iter()
+            .find(|agent| agent.metadata.id == agent_id)
+            .ok_or(StoreError::RunNotFound)?;
+        let provider = identity
+            .agent_providers
+            .iter()
+            .find(|provider| provider.metadata.id == agent.agent_provider_id)
+            .ok_or(StoreError::RunNotFound)?
+            .adapter_kind
+            .clone();
+        let account = agent
+            .account_id
+            .and_then(|account_id| {
+                identity
+                    .accounts
+                    .iter()
+                    .find(|account| account.metadata.id == account_id)
+            })
+            .map(|account| account.provider_identity.clone())
+            .unwrap_or_else(|| "local-default".into());
+        let model = identity
+            .models
+            .iter()
+            .find(|model| model.metadata.id == model_id)
+            .ok_or(StoreError::RunNotFound)?
+            .provider_model_id
+            .clone();
+        execution.complete(command.node_id, &command.owner, command.succeeded)?;
+        let now = timestamp();
+        let run = &mut identity.runs[run_index];
+        run.state = if command.succeeded {
+            bastet_core::NormalizedRunState::Succeeded
+        } else {
+            bastet_core::NormalizedRunState::Failed
+        };
+        run.finished_at = Some(now.clone());
+        run.metadata.revision = run
+            .metadata
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::RevisionOverflow)?;
+        run.metadata.updated_at = now.clone();
+        if let Some(provider_session_id) = command.provider_session_id {
+            if provider_session_id.trim().is_empty() {
+                return Err(StoreError::InvalidRunState(
+                    "empty provider session id".into(),
+                ));
+            }
+            identity.sessions[session_index].provider_session_id = Some(provider_session_id);
+            identity.sessions[session_index].metadata.revision = identity.sessions[session_index]
+                .metadata
+                .revision
+                .checked_add(1)
+                .ok_or(StoreError::RevisionOverflow)?;
+            identity.sessions[session_index].metadata.updated_at = now;
+        }
+        let cost_record_id = bastet_core::CostRecordId::new();
+        m3.deliverables.costs.push(bastet_core::CostLedgerRecord {
+            metadata: entity_metadata(cost_record_id, "provider_cost_event"),
+            project_id,
+            node_id: command.node_id,
+            run_id: command.run_id,
+            provider,
+            account,
+            model,
+            currency: command.cost.currency,
+            amount: command.cost.amount,
+            input_tokens: command.cost.input_tokens,
+            output_tokens: command.cost.output_tokens,
+            evidence_class: command.cost.evidence_class,
+            source: "adapter normalized cost event".into(),
+            formula_version: None,
+            confidence: command.cost.confidence,
+            reconciliation_state: "observed".into(),
+        });
+        identity.validate()?;
+        let mut executions = load_graph_executions(&transaction)?;
+        let persisted = executions
+            .iter_mut()
+            .find(|candidate| candidate.id == id)
+            .ok_or(StoreError::GraphNotFound)?;
+        *persisted = execution.clone();
+        M3State {
+            catalog: m3.clone(),
+            graph_executions: executions,
+        }
+        .validate(&identity)
+        .map_err(|error| StoreError::InvalidM3(error.to_string()))?;
+        let next_catalog_revision = catalog_revision
+            .checked_add(1)
+            .ok_or(StoreError::RevisionOverflow)?;
+        let next_m3_revision = m3_revision
+            .checked_add(1)
+            .ok_or(StoreError::RevisionOverflow)?;
+        transaction.execute("UPDATE identity_catalog SET revision=?1,catalog_json=?2,updated_at=?3 WHERE singleton=1",
+            params![next_catalog_revision, serde_json::to_string(&identity)?, timestamp()])?;
+        transaction.execute(
+            "UPDATE m3_catalog SET revision=?1,catalog_json=?2,updated_at=?3 WHERE singleton=1",
+            params![next_m3_revision, serde_json::to_string(&m3)?, timestamp()],
+        )?;
+        transaction.execute("UPDATE graph_executions SET revision=?1,execution_json=?2,updated_at=?3 WHERE execution_id=?4",
+            params![execution.revision, serde_json::to_string(&execution)?, timestamp(), id.value().to_string()])?;
+        let event = insert_event(&transaction, "graph.node_run_finished", &serde_json::json!({"execution_id": id, "node_id": command.node_id, "run_id": command.run_id, "cost_record_id": cost_record_id, "succeeded": command.succeeded}).to_string())?;
+        transaction.commit()?;
+        Ok(FinishGraphNodeRunReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            execution_id: id,
+            node_id: command.node_id,
+            run_id: command.run_id,
+            cost_record_id,
+            catalog_revision: next_catalog_revision,
+            graph_revision: execution.revision,
+            m3_revision: next_m3_revision,
             event_sequence: event.sequence,
         })
     }

@@ -194,6 +194,32 @@ pub struct BeginGraphNodeRunReceipt {
     pub event_sequence: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FinishGraphNodeRunCommand {
+    pub expected_catalog_revision: u64,
+    pub expected_graph_revision: u64,
+    pub expected_m3_revision: u64,
+    pub node_id: bastet_core::GraphNodeId,
+    pub run_id: bastet_core::RunId,
+    pub owner: String,
+    pub succeeded: bool,
+    pub provider_session_id: Option<String>,
+    pub cost: bastet_core::CostEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinishGraphNodeRunReceipt {
+    pub protocol_version: u32,
+    pub execution_id: bastet_core::GraphRunId,
+    pub node_id: bastet_core::GraphNodeId,
+    pub run_id: bastet_core::RunId,
+    pub cost_record_id: bastet_core::CostRecordId,
+    pub catalog_revision: u64,
+    pub graph_revision: u64,
+    pub m3_revision: u64,
+    pub event_sequence: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateDocumentCommand {
     pub expected_m3_revision: u64,
