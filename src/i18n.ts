@@ -1,15 +1,12 @@
 export const locales = ["zh-Hant", "zh-Hans", "en", "ja", "ko"] as const;
 export type Locale = (typeof locales)[number];
-
-const messages = {
-  "zh-Hant": { title: "Bastet Workstation", milestone: "M1 桌面與背景服務基礎", status: "正在建立可復原的本機工作空間", connecting: "正在連接本機服務", ready: "本機服務已連線", offline: "本機服務無法連線", retry: "重新連線", autostart: "登入時自動啟動（選用）" },
-  "zh-Hans": { title: "Bastet Workstation", milestone: "M1 桌面与后台服务基础", status: "正在建立可恢复的本地工作空间", connecting: "正在连接本地服务", ready: "本地服务已连接", offline: "无法连接本地服务", retry: "重新连接", autostart: "登录时自动启动（可选）" },
-  en: { title: "Bastet Workstation", milestone: "M1 desktop and daemon foundation", status: "Building a recoverable local workspace", connecting: "Connecting to local daemon", ready: "Local daemon connected", offline: "Local daemon unavailable", retry: "Reconnect", autostart: "Start automatically at login (opt-in)" },
-  ja: { title: "Bastet Workstation", milestone: "M1 デスクトップとデーモン基盤", status: "復元可能なローカルワークスペースを構築中", connecting: "ローカルデーモンに接続中", ready: "ローカルデーモンに接続しました", offline: "ローカルデーモンに接続できません", retry: "再接続", autostart: "ログイン時に自動起動（任意）" },
-  ko: { title: "Bastet Workstation", milestone: "M1 데스크톱 및 데몬 기반", status: "복구 가능한 로컬 작업 공간을 구축하는 중", connecting: "로컬 데몬에 연결 중", ready: "로컬 데몬 연결됨", offline: "로컬 데몬에 연결할 수 없음", retry: "다시 연결", autostart: "로그인 시 자동 시작(선택 사항)" },
-} as const satisfies Record<Locale, Record<string, string>>;
-
-export type MessageKey = keyof (typeof messages)["en"];
-export function translate(locale: Locale, key: MessageKey): string {
-  return messages[locale]?.[key] ?? messages.en[key] ?? `[missing:${key}]`;
-}
+const en = { title: "Bastet Workstation", milestone: "M2 agents and approvals", navigation: "Primary navigation", agents: "Agents and Models", approvals: "Approval Center", diagnostics: "Diagnostics", agentHelp: "Review installation, health, authentication, models, reasoning, and run controls before starting work.", approvalHelp: "Approval cards show the exact immutable action, reason, consequence, risk, and expiry.", noApprovals: "No pending or recent approvals.", configured: "Reference adapter", doctor: "Doctor", authentication: "Authentication", models: "Models", reasoning: "Reasoning", runControl: "Run controls", available: "Available after local check", verifyLocally: "Verify locally", providerReported: "Provider reported", risk: "Risk", expires: "Expires", approve: "Approve", deny: "Deny", approved: "Approved", denied: "Denied", connecting: "Connecting to local daemon", ready: "Local daemon connected", offline: "Local daemon unavailable", retry: "Reconnect", autostart: "Start automatically at login (opt-in)" } as const;
+export type MessageKey = keyof typeof en;
+const messages: Record<Locale, Record<MessageKey, string>> = {
+  en,
+  "zh-Hant": { ...en, milestone: "M2 Agent 與核准", navigation: "主要導覽", agents: "Agents 與模型", approvals: "核准中心", diagnostics: "診斷", agentHelp: "開始工作前，請檢查安裝、健康狀態、驗證、模型、推理與執行控制。", approvalHelp: "核准卡會顯示不可變更的動作、原因、後果、風險與到期時間。", noApprovals: "目前沒有待處理或近期核准。", configured: "參考 Adapter", doctor: "健康檢查", authentication: "驗證", models: "模型", reasoning: "推理", runControl: "執行控制", available: "本機檢查後可用", verifyLocally: "在本機驗證", providerReported: "供應商回報", risk: "風險", expires: "到期", approve: "核准", deny: "拒絕", approved: "已核准", denied: "已拒絕", connecting: "正在連接本機服務", ready: "本機服務已連線", offline: "本機服務無法連線", retry: "重新連線", autostart: "登入時自動啟動（選用）" },
+  "zh-Hans": { ...en, milestone: "M2 Agent 与批准", navigation: "主导航", agents: "Agents 与模型", approvals: "批准中心", diagnostics: "诊断", noApprovals: "没有待处理或近期批准。", approve: "批准", deny: "拒绝", approved: "已批准", denied: "已拒绝" },
+  ja: { ...en, milestone: "M2 Agent と承認", navigation: "メインナビゲーション", agents: "Agents とモデル", approvals: "承認センター", diagnostics: "診断", noApprovals: "保留中または最近の承認はありません。", approve: "承認", deny: "拒否", approved: "承認済み", denied: "拒否済み" },
+  ko: { ...en, milestone: "M2 Agent 및 승인", navigation: "기본 탐색", agents: "Agents 및 모델", approvals: "승인 센터", diagnostics: "진단", noApprovals: "대기 중이거나 최근 승인이 없습니다.", approve: "승인", deny: "거부", approved: "승인됨", denied: "거부됨" },
+};
+export function translate(locale: Locale, key: MessageKey): string { return messages[locale]?.[key] ?? messages.en[key] ?? `[missing:${key}]`; }

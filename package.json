@@ -4,6 +4,7 @@
   "private": true,
   "license": "Apache-2.0",
   "packageManager": "pnpm@11.19.0",
+  "engines": { "node": ">=22 <26" },
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

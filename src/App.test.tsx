@@ -5,12 +5,9 @@ import { App } from "./App";
 import { locales, translate } from "./i18n";
 
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn().mockResolvedValue({
-    protocol_version: 1,
-    daemon_id: "test-daemon",
-    revision: 7,
-    lifecycle: "ready",
-  }),
+  invoke: vi.fn((command: string) => Promise.resolve(command === "approval_center_snapshot"
+    ? { protocol_version: 1, records: [] }
+    : { protocol_version: 1, daemon_id: "test-daemon", revision: 7, lifecycle: "ready" })),
 }));
 vi.mock("@tauri-apps/plugin-autostart", () => ({
   disable: vi.fn().mockResolvedValue(undefined),
@@ -26,7 +23,7 @@ describe("M1 shell", () => {
   it("switches locale using an accessible native control", () => {
     render(<App />);
     fireEvent.change(screen.getByLabelText("Language"), { target: { value: "ja" } });
-    expect(screen.getByText("M1 デスクトップとデーモン基盤")).toBeInTheDocument();
+    expect(screen.getByText("M2 Agent と承認")).toBeInTheDocument();
   });
 
   it("projects daemon state after reconnect", async () => {
@@ -38,7 +35,15 @@ describe("M1 shell", () => {
 
   it("exposes autostart as an unchecked opt-in preference", async () => {
     render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "診斷" }));
     const control = await screen.findByRole("checkbox", { name: /自動啟動/ });
     expect(control).not.toBeChecked();
+  });
+
+  it("offers keyboard-native agent and approval navigation", async () => {
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: "Agents 與模型" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "核准中心" }));
+    expect(screen.getByText("目前沒有待處理或近期核准。")).toBeInTheDocument();
   });
 });
