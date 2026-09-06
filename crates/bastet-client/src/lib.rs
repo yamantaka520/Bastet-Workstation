@@ -2,13 +2,14 @@ use std::{env, time::Duration};
 
 use bastet_core::{ApprovalDecision, ApprovalRequest, ApprovalRequestId, IdentityCatalog, RunId};
 use bastet_protocol::{
-    AcceptDecisionBaselineCommand, AcceptDecisionBaselineReceipt, ApprovalList, ApprovalReceipt,
-    ApprovalRecord, CancelRunCommand, CancelRunReceipt, CatalogReceipt, CatalogSnapshot,
-    CheckpointCommand, CheckpointReceipt, ClaimGraphNodesCommand, ClaimGraphNodesReceipt,
-    CompleteGraphNodeCommand, CompleteGraphNodeReceipt, CreateApprovalCommand,
-    CreateGraphExecutionCommand, DaemonSnapshot, DecideApprovalCommand, EventEnvelope,
-    GraphExecutionList, GraphExecutionReceipt, M3CatalogSnapshot, PrepareMvpCommand,
-    PrepareMvpReceipt, ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
+    AcceptDecisionBaselineCommand, AcceptDecisionBaselineReceipt, AcceptDocumentCommand,
+    ApprovalList, ApprovalReceipt, ApprovalRecord, CancelRunCommand, CancelRunReceipt,
+    CatalogReceipt, CatalogSnapshot, CheckpointCommand, CheckpointReceipt, ClaimGraphNodesCommand,
+    ClaimGraphNodesReceipt, CompleteGraphNodeCommand, CompleteGraphNodeReceipt,
+    CreateApprovalCommand, CreateDocumentCommand, CreateGraphExecutionCommand, DaemonSnapshot,
+    DecideApprovalCommand, DocumentReceipt, EventEnvelope, GraphExecutionList,
+    GraphExecutionReceipt, M3CatalogSnapshot, PrepareMvpCommand, PrepareMvpReceipt,
+    ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -228,6 +229,40 @@ impl DaemonClient {
             .await?
             .error_for_status()?
             .json::<CompleteGraphNodeReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
+    pub async fn create_mvp_document(
+        &self,
+        command: CreateDocumentCommand,
+    ) -> Result<DocumentReceipt, ClientError> {
+        let receipt = self
+            .http
+            .post(format!("{}/v1/mvp/document", self.base_url))
+            .json(&command)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<DocumentReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
+    pub async fn accept_mvp_document(
+        &self,
+        command: AcceptDocumentCommand,
+    ) -> Result<DocumentReceipt, ClientError> {
+        let receipt = self
+            .http
+            .post(format!("{}/v1/mvp/document/accept", self.base_url))
+            .json(&command)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<DocumentReceipt>()
             .await?;
         require_protocol(receipt.protocol_version)?;
         Ok(receipt)
@@ -564,13 +599,33 @@ mod tests {
             )
             .await
             .unwrap();
+        let document = client
+            .create_mvp_document(CreateDocumentCommand {
+                expected_m3_revision: accepted.m3_revision,
+                graph_execution_id: execution_id,
+                title: "Client report".into(),
+                markdown: "# Client report\n\nJoined evidence.".into(),
+            })
+            .await
+            .unwrap();
+        client
+            .accept_mvp_document(AcceptDocumentCommand {
+                expected_m3_revision: document.m3_revision,
+                artifact_id: document.artifact_id,
+                version_id: document.version_id,
+                content_hash: document.content_hash,
+                accepted_by: "test-user".into(),
+                accepted_at: "2026-09-07T00:01:00Z".into(),
+            })
+            .await
+            .unwrap();
         let receipt = client
             .checkpoint(initial.revision, "client integration test")
             .await
             .unwrap();
         assert_eq!(receipt.revision, initial.revision + 1);
         assert_eq!(client.snapshot().await.unwrap().revision, receipt.revision);
-        assert_eq!(store.events_after(0).unwrap().len(), 11);
+        assert_eq!(store.events_after(0).unwrap().len(), 13);
         let suspended = client
             .suspend(receipt.revision, "integration simulated sleep")
             .await

@@ -72,13 +72,25 @@ struct M3Projection {
     costs: usize,
     graph_nodes: Vec<GraphNodeProjection>,
     awaiting_meetings: Vec<MeetingProjection>,
+    document_versions: Vec<DocumentProjection>,
 }
 
 #[derive(Serialize)]
 struct GraphNodeProjection {
+    execution_id: String,
     title: String,
     state: String,
     pet_state: &'static str,
+}
+
+#[derive(Serialize)]
+struct DocumentProjection {
+    artifact_id: String,
+    version_id: String,
+    title: String,
+    markdown: String,
+    content_hash: String,
+    accepted: bool,
 }
 
 #[derive(Serialize)]
@@ -137,6 +149,52 @@ async fn accept_mvp_decision(
             expected_m3_revision: m3.revision,
             meeting_id,
             content,
+            accepted_by: "local-desktop-user".into(),
+            accepted_at: timestamp_ms().to_string(),
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn create_mvp_document(
+    client: State<'_, DaemonClient>,
+    graph_execution_id: bastet_core::GraphRunId,
+    title: String,
+    markdown: String,
+) -> Result<bastet_protocol::DocumentReceipt, String> {
+    let m3 = client
+        .m3_catalog()
+        .await
+        .map_err(|error| error.to_string())?;
+    client
+        .create_mvp_document(bastet_protocol::CreateDocumentCommand {
+            expected_m3_revision: m3.revision,
+            graph_execution_id,
+            title,
+            markdown,
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn accept_mvp_document(
+    client: State<'_, DaemonClient>,
+    artifact_id: bastet_core::ArtifactId,
+    version_id: bastet_core::ArtifactVersionId,
+    content_hash: String,
+) -> Result<bastet_protocol::DocumentReceipt, String> {
+    let m3 = client
+        .m3_catalog()
+        .await
+        .map_err(|error| error.to_string())?;
+    client
+        .accept_mvp_document(bastet_protocol::AcceptDocumentCommand {
+            expected_m3_revision: m3.revision,
+            artifact_id,
+            version_id,
+            content_hash,
             accepted_by: "local-desktop-user".into(),
             accepted_at: timestamp_ms().to_string(),
         })
@@ -246,6 +304,22 @@ fn project_m3(
                 .unwrap_or_default(),
         })
         .collect();
+    let document_versions = snapshot
+        .catalog
+        .deliverables
+        .documents
+        .iter()
+        .flat_map(|document| {
+            document.versions.iter().map(|version| DocumentProjection {
+                artifact_id: document.metadata.id.value().to_string(),
+                version_id: version.id.value().to_string(),
+                title: document.title.clone(),
+                markdown: version.markdown.clone(),
+                content_hash: version.content_hash.clone(),
+                accepted: version.accepted_by.is_some(),
+            })
+        })
+        .collect();
     let graph_nodes = executions
         .into_iter()
         .flat_map(|execution| {
@@ -256,6 +330,7 @@ fn project_m3(
                     .iter()
                     .find(|definition| definition.id == node.node_id)?;
                 Some(GraphNodeProjection {
+                    execution_id: execution.id.value().to_string(),
                     title: definition.title.clone(),
                     state: format!("{:?}", node.state).to_lowercase(),
                     pet_state: pet_state(node.state),
@@ -273,6 +348,7 @@ fn project_m3(
         costs: snapshot.catalog.deliverables.costs.len(),
         graph_nodes,
         awaiting_meetings,
+        document_versions,
     }
 }
 
@@ -666,6 +742,8 @@ pub fn run() {
             m3_projection,
             prepare_mvp,
             accept_mvp_decision,
+            create_mvp_document,
+            accept_mvp_document,
             apply_builtin_pet,
             rollback_builtin_pet,
             cancel_run,

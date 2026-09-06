@@ -63,3 +63,6 @@ verification evidence without adding scope.
 - Completed graphs can now create a versioned Markdown document only when every node succeeded;
   the version records the two research node ids and a content hash. A separate exact-hash human
   acceptance transaction is required. Restart verification proves the accepted version survives.
+- The desktop now renders the exact Markdown and hash, authors a document only after the graph is
+  fully successful, and exposes a separate exact-version acceptance action. The client loopback
+  test covers both document transactions through HTTP before checkpoint/shutdown.

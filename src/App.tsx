@@ -12,7 +12,7 @@ type AgentStatus = { adapter_kind: string; display_name: string; installed: bool
 type AgentCenterSnapshot = { agents: AgentStatus[] };
 type WorkProjection = { revision: number; sessions: number; runs: { run_id: string; session_id: string; state: string; can_cancel: boolean }[] };
 type PetProfile = { metadata: { id: string }; name: string; version: number; states: { state_key: string; accessible_label_key: string }[] };
-type M3Projection = { revision: number; pet_profiles: PetProfile[]; pet_assignments: number; rooms: number; meetings: number; documents: number; costs: number; graph_nodes: { title: string; state: string; pet_state: string }[]; awaiting_meetings: { meeting_id: string; summary: string }[] };
+type M3Projection = { revision: number; pet_profiles: PetProfile[]; pet_assignments: number; rooms: number; meetings: number; documents: number; costs: number; graph_nodes: { execution_id: string; title: string; state: string; pet_state: string }[]; awaiting_meetings: { meeting_id: string; summary: string }[]; document_versions: { artifact_id: string; version_id: string; title: string; markdown: string; content_hash: string; accepted: boolean }[] };
 type View = "office" | "agents" | "approvals" | "diagnostics";
 
 export function App() {
@@ -23,10 +23,12 @@ export function App() {
   const [approvals, setApprovals] = useState<ApprovalRecord[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
   const [work, setWork] = useState<WorkProjection>({ revision: 0, sessions: 0, runs: [] });
-  const [m3, setM3] = useState<M3Projection>({ revision: 0, pet_profiles: [], pet_assignments: 0, rooms: 0, meetings: 0, documents: 0, costs: 0, graph_nodes: [], awaiting_meetings: [] });
+  const [m3, setM3] = useState<M3Projection>({ revision: 0, pet_profiles: [], pet_assignments: 0, rooms: 0, meetings: 0, documents: 0, costs: 0, graph_nodes: [], awaiting_meetings: [], document_versions: [] });
   const [projectName, setProjectName] = useState("");
   const [workspaceRoot, setWorkspaceRoot] = useState("");
   const [decision, setDecision] = useState("");
+  const [documentTitle, setDocumentTitle] = useState("");
+  const [documentMarkdown, setDocumentMarkdown] = useState("");
   const [actionError, setActionError] = useState(false);
   const [autostart, setAutostart] = useState(false);
 
@@ -66,6 +68,18 @@ export function App() {
     try { await invoke("accept_mvp_decision", { meetingId, content: decision }); await reconnect(); }
     catch { setActionError(true); }
   };
+  const completedExecution = m3.graph_nodes.length > 0 && m3.graph_nodes.every((node) => node.state === "succeeded") ? m3.graph_nodes[0].execution_id : null;
+  const createDocument = async () => {
+    if (!completedExecution) return;
+    setActionError(false);
+    try { await invoke("create_mvp_document", { graphExecutionId: completedExecution, title: documentTitle, markdown: documentMarkdown }); await reconnect(); }
+    catch { setActionError(true); }
+  };
+  const acceptDocument = async (document: M3Projection["document_versions"][number]) => {
+    setActionError(false);
+    try { await invoke("accept_mvp_document", { artifactId: document.artifact_id, versionId: document.version_id, contentHash: document.content_hash }); await reconnect(); }
+    catch { setActionError(true); }
+  };
 
   return <main>
     <header><div><p className="eyebrow">{translate(locale, "milestone")}</p><h1>{translate(locale, "title")}</h1></div>
@@ -82,6 +96,8 @@ export function App() {
         <button type="button" onClick={() => void changeBuiltinPet(m3.pet_profiles.length === 0)}>{translate(locale, m3.pet_profiles.length ? "rollbackPet" : "applyPet")}</button></article>
       {m3.meetings === 0 && <form onSubmit={(event) => { event.preventDefault(); void prepareMvp(); }}><h3>{translate(locale, "prepareMvp")}</h3><label>{translate(locale, "projectName")}<input required value={projectName} onChange={(event) => setProjectName(event.target.value)} /></label><label>{translate(locale, "workspaceRoot")}<input required value={workspaceRoot} onChange={(event) => setWorkspaceRoot(event.target.value)} /></label><button type="submit">{translate(locale, "prepare")}</button></form>}
       {m3.awaiting_meetings.map((meeting) => <article key={meeting.meeting_id}><h3>{translate(locale, "decisionBaseline")}</h3><p>{meeting.summary}</p><label>{translate(locale, "decisionBaseline")}<textarea required value={decision} onChange={(event) => setDecision(event.target.value)} /></label><button type="button" disabled={!decision.trim()} onClick={() => void acceptDecision(meeting.meeting_id)}>{translate(locale, "acceptDecision")}</button></article>)}
+      {completedExecution && m3.document_versions.length === 0 && <form onSubmit={(event) => { event.preventDefault(); void createDocument(); }}><label>{translate(locale, "documentTitle")}<input required value={documentTitle} onChange={(event) => setDocumentTitle(event.target.value)} /></label><label>{translate(locale, "documentMarkdown")}<textarea required value={documentMarkdown} onChange={(event) => setDocumentMarkdown(event.target.value)} /></label><button type="submit">{translate(locale, "createDocument")}</button></form>}
+      {m3.document_versions.map((document) => <article key={document.version_id}><h3>{document.title}</h3><pre>{document.markdown}</pre><code>{document.content_hash}</code>{document.accepted ? <p>{translate(locale, "approved")}</p> : <button type="button" onClick={() => void acceptDocument(document)}>{translate(locale, "acceptDocument")}</button>}</article>)}
       {m3.graph_nodes.length > 0 && <ul>{m3.graph_nodes.map((node) => <li key={`${node.title}-${node.state}`}><span aria-hidden="true">🐈</span> {node.title} — {node.state} <span className="sr-only">{node.pet_state}</span></li>)}</ul>}</section>}
 
     {view === "agents" && <section aria-labelledby="agents-heading"><h2 id="agents-heading">{translate(locale, "agents")}</h2><p>{translate(locale, "agentHelp")}</p>
