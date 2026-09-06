@@ -111,6 +111,18 @@ On `Test-Prj`, retrying only Agy succeeded and persisted 7,439 characters while 
 original 2,911-character Codex answer and old failure history. Human document acceptance and
 publishing remain separate actions; this is still not full M3 acceptance.
 
+Final operator recovery evidence for code commit `5354964328c138df157b9adc67fbdd021b1c0ac5`:
+the existing project's join completed and its 3,395-character Markdown was visibly prefilled,
+then saved through the desktop as `羅技與雷蛇旗艦級滑鼠整合研究報告`. After closing and reopening
+the final debug bundle, the same document remains unaccepted and its document hash equals the
+join-source hash (`sha256:035468b45aaf7959c1b80f655339d3f24475adf0841ddf8f3fbea7dc4ae00323`).
+The old filename-only accepted artifact and its prior delivery remain unchanged. No new user
+document was accepted, exported, or published by the operator. macOS debug executable SHA-256:
+`dd107c51a57669e5e684737221b58faff3c9e94f5088a35f8cb81ec0ad9ba443`.
+GitHub Actions run `34053296763` for that code commit completed successfully: frontend, all three
+Rust/Tauri platforms, and six M0 baseline matrix jobs. This closes the recovery-fix automated gate,
+not the outstanding M3 human usability gate.
+
 2026-09-07 blocking finding: after applying the built-in Pet, preparing `Test-Prj` failed.
 Desktop and core constructed identical Pet assets with different metadata timestamps, so the daemon
 rejected the desktop profile as existing data. The global error was outside the scrolled form.
