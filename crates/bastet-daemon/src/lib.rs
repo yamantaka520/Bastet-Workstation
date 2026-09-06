@@ -647,6 +647,23 @@ impl Store {
             [],
             |row| row.get(0),
         )?;
+        let existing_identity: IdentityCatalog =
+            serde_json::from_str(&transaction.query_row::<String, _, _>(
+                "SELECT catalog_json FROM identity_catalog WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?)?;
+        let existing_m3: M3Catalog =
+            serde_json::from_str(&transaction.query_row::<String, _, _>(
+                "SELECT catalog_json FROM m3_catalog WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?)?;
+        if existing_identity != IdentityCatalog::default() || !m3_is_unconfigured(&existing_m3) {
+            return Err(StoreError::InvalidMvp(
+                "MVP initializer refuses to replace existing project data".into(),
+            ));
+        }
         if catalog_revision != command.expected_catalog_revision {
             return Err(StoreError::RevisionConflict {
                 expected: command.expected_catalog_revision,
@@ -1757,6 +1774,17 @@ fn validate_m3_catalog(catalog: &M3Catalog, identity: &IdentityCatalog) -> Resul
     Ok(())
 }
 
+fn m3_is_unconfigured(catalog: &M3Catalog) -> bool {
+    if catalog == &M3Catalog::default() {
+        return true;
+    }
+    catalog.office.pet_profiles == vec![bastet_core::builtin_pet_profile()]
+        && catalog.office.pet_assignments.is_empty()
+        && catalog.office.rooms.is_empty()
+        && catalog.meetings == bastet_core::MeetingCatalog::default()
+        && catalog.deliverables == bastet_core::DeliverableCatalog::default()
+}
+
 fn load_graph_executions(
     transaction: &rusqlite::Transaction<'_>,
 ) -> Result<Vec<GraphExecution>, StoreError> {
@@ -2642,6 +2670,19 @@ mod tests {
             })
             .unwrap();
         assert_eq!((prepared.catalog_revision, prepared.m3_revision), (1, 1));
+        assert!(matches!(
+            store.prepare_mvp(PrepareMvpCommand {
+                expected_catalog_revision: 1,
+                expected_m3_revision: 1,
+                project_name: "replacement".into(),
+                workspace_root: workspace.path().to_string_lossy().into_owned(),
+            }),
+            Err(StoreError::InvalidMvp(_))
+        ));
+        assert_eq!(
+            store.catalog().unwrap().catalog.projects[0].name,
+            "MVP fixture"
+        );
         assert!(store.graph_executions().unwrap().is_empty());
         let accepted = store
             .accept_mvp_decision(AcceptDecisionBaselineCommand {

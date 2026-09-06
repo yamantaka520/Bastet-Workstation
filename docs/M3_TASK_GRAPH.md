@@ -70,3 +70,6 @@ verification evidence without adding scope.
   create a redacted `Prepared` delivery, and only a non-empty external destination receipt changes
   it to `Delivered`. AgentMemoryOS and BastetMind targets remain separate records. Restart tests
   prove both completed delivery receipts survive without journaling preview content or receipts.
+- Safety correction: the one-shot MVP initializer now accepts only a pristine state or the same
+  unassigned built-in Pet profile. Existing Projects, meetings, assignments, documents, costs, or
+  deliveries cause a fail-closed error; the initializer never replaces user data.
