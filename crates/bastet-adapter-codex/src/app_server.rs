@@ -3,7 +3,10 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-use crate::lifecycle::{CodexRunStream, NormalizedCodexEvent};
+use crate::{
+    evidence::{CodexRunEvidence, CodexRunEvidenceUpdate},
+    lifecycle::{CodexRunStream, NormalizedCodexEvent},
+};
 
 pub trait AppServerTransport {
     fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError>;
@@ -15,6 +18,12 @@ pub trait AppServerTransport {
 pub struct AppServerNotification {
     pub method: String,
     pub params: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CodexRunUpdate {
+    Lifecycle(NormalizedCodexEvent),
+    Evidence(CodexRunEvidenceUpdate),
 }
 
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
@@ -313,6 +322,44 @@ impl<T: AppServerTransport> CodexAppServer<T> {
                 .map_err(|_| AppServerError::ProtocolDrift)?
             {
                 return Ok(event);
+            }
+        }
+    }
+
+    pub fn next_run_update(
+        &mut self,
+        stream: &mut CodexRunStream,
+        evidence: &CodexRunEvidence,
+        occurred_at: &str,
+    ) -> Result<CodexRunUpdate, AppServerError> {
+        loop {
+            let notification = match self.next_notification() {
+                Ok(notification) => notification,
+                Err(AppServerError::Transport(TransportError::TimedOut)) => {
+                    return stream
+                        .deadline_exceeded(occurred_at)
+                        .map(CodexRunUpdate::Lifecycle)
+                        .map_err(|_| AppServerError::ProtocolDrift);
+                }
+                Err(AppServerError::Transport(TransportError::Unavailable)) => {
+                    return stream
+                        .transport_lost(occurred_at)
+                        .map(CodexRunUpdate::Lifecycle)
+                        .map_err(|_| AppServerError::ProtocolDrift);
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(event) = stream
+                .ingest(&notification, occurred_at)
+                .map_err(|_| AppServerError::ProtocolDrift)?
+            {
+                return Ok(CodexRunUpdate::Lifecycle(event));
+            }
+            if let Some(update) = evidence
+                .ingest(&notification)
+                .map_err(|_| AppServerError::ProtocolDrift)?
+            {
+                return Ok(CodexRunUpdate::Evidence(update));
             }
         }
     }
@@ -830,5 +877,119 @@ mod tests {
             completed.event.state,
             bastet_core::NormalizedRunState::Succeeded
         );
+    }
+
+    #[test]
+    fn unified_run_updates_preserve_evidence_and_lifecycle_order() {
+        let notifications = [
+            AppServerNotification {
+                method: "thread/tokenUsage/updated".into(),
+                params: json!({
+                    "threadId": "thr_1",
+                    "turnId": "turn_1",
+                    "tokenUsage": {
+                        "last": {"inputTokens": 3, "outputTokens": 5, "totalTokens": 8}
+                    }
+                }),
+            },
+            AppServerNotification {
+                method: "turn/started".into(),
+                params: json!({"turn": {"id": "turn_1", "status": "inProgress"}}),
+            },
+        ];
+        let transport = FixtureTransport {
+            responses: VecDeque::from([Ok(json!({}))]),
+            incoming_notifications: notifications.into_iter().map(Ok).collect(),
+            ..FixtureTransport::default()
+        };
+        let mut server = CodexAppServer::new(transport);
+        server.initialize().unwrap();
+        let mut stream =
+            CodexRunStream::new(bastet_core::RunId::from_bytes([5; 16]), "turn_1").unwrap();
+        let evidence = CodexRunEvidence::new("thr_1", "turn_1").unwrap();
+
+        let CodexRunUpdate::Evidence(CodexRunEvidenceUpdate::Cost(cost)) = server
+            .next_run_update(&mut stream, &evidence, "2026-09-03T00:00:00Z")
+            .unwrap()
+        else {
+            panic!("first update must preserve provider cost evidence");
+        };
+        assert_eq!(cost.input_tokens, Some(3));
+        assert_eq!(cost.output_tokens, Some(5));
+
+        let CodexRunUpdate::Lifecycle(started) = server
+            .next_run_update(&mut stream, &evidence, "2026-09-03T00:00:01Z")
+            .unwrap()
+        else {
+            panic!("second update must preserve lifecycle state");
+        };
+        assert_eq!(started.event.sequence, 1);
+        assert_eq!(
+            started.event.state,
+            bastet_core::NormalizedRunState::Running
+        );
+    }
+
+    #[test]
+    fn local_notification_failures_become_distinct_terminal_events() {
+        for (failure, expected_state, expected_kind) in [
+            (
+                TransportError::TimedOut,
+                bastet_core::NormalizedRunState::Failed,
+                bastet_core::AdapterFailureKind::Timeout,
+            ),
+            (
+                TransportError::Unavailable,
+                bastet_core::NormalizedRunState::Uncertain,
+                bastet_core::AdapterFailureKind::Crashed,
+            ),
+        ] {
+            let transport = FixtureTransport {
+                responses: VecDeque::from([Ok(json!({}))]),
+                incoming_notifications: VecDeque::from([Err(failure)]),
+                ..FixtureTransport::default()
+            };
+            let mut server = CodexAppServer::new(transport);
+            server.initialize().unwrap();
+            let mut stream =
+                CodexRunStream::new(bastet_core::RunId::from_bytes([6; 16]), "turn_1").unwrap();
+            let evidence = CodexRunEvidence::new("thr_1", "turn_1").unwrap();
+
+            let CodexRunUpdate::Lifecycle(update) = server
+                .next_run_update(&mut stream, &evidence, "2026-09-03T00:00:00Z")
+                .unwrap()
+            else {
+                panic!("transport failure must become lifecycle evidence");
+            };
+            assert_eq!(update.event.state, expected_state);
+            assert_eq!(update.failure.unwrap().kind, expected_kind);
+        }
+    }
+
+    #[test]
+    fn protocol_and_remote_notification_failures_still_fail_closed() {
+        for failure in [
+            TransportError::ProtocolDrift,
+            TransportError::RemoteRejected {
+                code: -32001,
+                retryable: true,
+            },
+        ] {
+            let transport = FixtureTransport {
+                responses: VecDeque::from([Ok(json!({}))]),
+                incoming_notifications: VecDeque::from([Err(failure)]),
+                ..FixtureTransport::default()
+            };
+            let mut server = CodexAppServer::new(transport);
+            server.initialize().unwrap();
+            let mut stream =
+                CodexRunStream::new(bastet_core::RunId::from_bytes([7; 16]), "turn_1").unwrap();
+            let evidence = CodexRunEvidence::new("thr_1", "turn_1").unwrap();
+
+            assert_eq!(
+                server.next_run_update(&mut stream, &evidence, "2026-09-03T00:00:00Z"),
+                Err(AppServerError::Transport(failure))
+            );
+        }
     }
 }

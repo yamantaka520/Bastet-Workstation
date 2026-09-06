@@ -95,5 +95,9 @@ verification status; it does not add scope.
   or remote rejection. Remote rejection retains only its numeric code and whether it is retryable;
   provider message/data are discarded. The documented overloaded code `-32001` is retryable, while
   unknown rejection codes are not guessed to be retryable. This classification reaches the public
-  app-server boundary without exposing provider detail.
+  app-server boundary without exposing provider detail. A unified run-update boundary now consumes
+  each app-server notification exactly once and routes it to lifecycle or redacted evidence
+  normalization. Locally observed notification timeout becomes a terminal timeout event and
+  transport loss becomes an uncertain crash event; protocol drift and remote rejection still fail
+  closed instead of being mislabeled as runtime state.
 - M2.4–M2.8: not started.

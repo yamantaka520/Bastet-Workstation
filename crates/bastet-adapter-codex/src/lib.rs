@@ -7,8 +7,9 @@ mod stdio;
 
 pub use app_server::{
     AppServerError, AppServerNotification, AppServerTransport, ApprovalPolicy, CodexAppServer,
-    ModelCatalogPage, ModelDescriptor, ReasoningEffort, ThreadHandle, ThreadSandbox,
-    ThreadStartRequest, TransportError, TurnHandle, TurnSandboxPolicy, TurnStartRequest,
+    CodexRunUpdate, ModelCatalogPage, ModelDescriptor, ReasoningEffort, ThreadHandle,
+    ThreadSandbox, ThreadStartRequest, TransportError, TurnHandle, TurnSandboxPolicy,
+    TurnStartRequest,
 };
 pub use evidence::{CodexRunEvidence, CodexRunEvidenceUpdate, EvidenceError};
 pub use lifecycle::{CodexEventNormalizer, CodexRunStream, LifecycleError, NormalizedCodexEvent};
