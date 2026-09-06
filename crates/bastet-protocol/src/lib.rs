@@ -171,6 +171,34 @@ pub struct CompleteGraphNodeReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateDocumentCommand {
+    pub expected_m3_revision: u64,
+    pub graph_execution_id: bastet_core::GraphRunId,
+    pub title: String,
+    pub markdown: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentReceipt {
+    pub protocol_version: u32,
+    pub artifact_id: bastet_core::ArtifactId,
+    pub version_id: bastet_core::ArtifactVersionId,
+    pub content_hash: String,
+    pub m3_revision: u64,
+    pub event_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptDocumentCommand {
+    pub expected_m3_revision: u64,
+    pub artifact_id: bastet_core::ArtifactId,
+    pub version_id: bastet_core::ArtifactVersionId,
+    pub content_hash: String,
+    pub accepted_by: String,
+    pub accepted_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateApprovalCommand {
     pub request: ApprovalRequest,
 }

@@ -14,15 +14,18 @@ use axum::{
     Json, Router,
 };
 use bastet_core::{
-    accept_mvp_decision, ApprovalError, ApprovalRequestId, CatalogError, GraphError,
-    GraphExecution, GraphNodeId, GraphRunId, IdentityCatalog, M3Catalog, M3State, MvpDraft, RunId,
+    accept_mvp_decision, ApprovalError, ApprovalRequestId, ArtifactId, ArtifactVersionId,
+    CatalogError, DocumentArtifact, DocumentVersion, EntityLifecycle, EntityMetadata, GraphError,
+    GraphExecution, GraphNodeId, GraphNodeKind, GraphNodeState, GraphRunId, IdentityCatalog,
+    M3Catalog, M3State, MvpDraft, Provenance, RunId,
 };
 use bastet_protocol::{
-    AcceptDecisionBaselineCommand, AcceptDecisionBaselineReceipt, ApprovalList, ApprovalReceipt,
-    ApprovalRecord, CancelRunReceipt, CatalogReceipt, CatalogSnapshot, CheckpointCommand,
-    CheckpointReceipt, ClaimGraphNodesCommand, ClaimGraphNodesReceipt, CompleteGraphNodeCommand,
-    CompleteGraphNodeReceipt, CreateApprovalCommand, CreateGraphExecutionCommand, DaemonLifecycle,
-    DaemonSnapshot, DecideApprovalCommand, EventEnvelope, GraphExecutionList,
+    AcceptDecisionBaselineCommand, AcceptDecisionBaselineReceipt, AcceptDocumentCommand,
+    ApprovalList, ApprovalReceipt, ApprovalRecord, CancelRunReceipt, CatalogReceipt,
+    CatalogSnapshot, CheckpointCommand, CheckpointReceipt, ClaimGraphNodesCommand,
+    ClaimGraphNodesReceipt, CompleteGraphNodeCommand, CompleteGraphNodeReceipt,
+    CreateApprovalCommand, CreateDocumentCommand, CreateGraphExecutionCommand, DaemonLifecycle,
+    DaemonSnapshot, DecideApprovalCommand, DocumentReceipt, EventEnvelope, GraphExecutionList,
     GraphExecutionReceipt, M3CatalogSnapshot, PrepareMvpCommand, PrepareMvpReceipt,
     ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
 };
@@ -73,6 +76,8 @@ pub enum StoreError {
     InvalidM3(String),
     #[error("MVP workflow is invalid: {0}")]
     InvalidMvp(String),
+    #[error("document workflow is invalid: {0}")]
+    InvalidDocument(String),
     #[error("graph execution was not found")]
     GraphNotFound,
     #[error("graph execution already exists")]
@@ -199,6 +204,8 @@ fn build_router_with_controller(
             "/v1/mvp/accept-decision",
             post(accept_mvp_decision_baseline),
         )
+        .route("/v1/mvp/document", post(create_mvp_document))
+        .route("/v1/mvp/document/accept", post(accept_mvp_document))
         .route("/v1/approvals", get(approvals).post(create_approval))
         .route(
             "/v1/approvals/{request_id}",
@@ -348,6 +355,20 @@ async fn complete_graph_node(
     }))
 }
 
+async fn create_mvp_document(
+    State(state): State<AppState>,
+    Json(command): Json<CreateDocumentCommand>,
+) -> Result<Json<DocumentReceipt>, ApiError> {
+    Ok(Json(state.store.create_mvp_document(command)?))
+}
+
+async fn accept_mvp_document(
+    State(state): State<AppState>,
+    Json(command): Json<AcceptDocumentCommand>,
+) -> Result<Json<DocumentReceipt>, ApiError> {
+    Ok(Json(state.store.accept_mvp_document(command)?))
+}
+
 async fn create_approval(
     State(state): State<AppState>,
     Json(command): Json<CreateApprovalCommand>,
@@ -429,6 +450,7 @@ impl axum::response::IntoResponse for ApiError {
             | StoreError::InvalidGraph(_)
             | StoreError::InvalidM3(_)
             | StoreError::InvalidMvp(_)
+            | StoreError::InvalidDocument(_)
             | StoreError::Serialization(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -717,6 +739,164 @@ impl Store {
             protocol_version: PROTOCOL_VERSION,
             baseline_id,
             graph_execution_id: execution.id,
+            m3_revision: revision,
+            event_sequence: event.sequence,
+        })
+    }
+
+    pub fn create_mvp_document(
+        &self,
+        command: CreateDocumentCommand,
+    ) -> Result<DocumentReceipt, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let identity: IdentityCatalog =
+            serde_json::from_str(&transaction.query_row::<String, _, _>(
+                "SELECT catalog_json FROM identity_catalog WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?)?;
+        let (actual, json): (u64, String) = transaction.query_row(
+            "SELECT revision, catalog_json FROM m3_catalog WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if actual != command.expected_m3_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: command.expected_m3_revision,
+                actual,
+            });
+        }
+        let mut catalog: M3Catalog = serde_json::from_str(&json)?;
+        let executions = load_graph_executions(&transaction)?;
+        let execution = executions
+            .iter()
+            .find(|item| item.id == command.graph_execution_id)
+            .ok_or(StoreError::GraphNotFound)?;
+        if execution
+            .nodes
+            .iter()
+            .any(|node| node.state != GraphNodeState::Succeeded)
+        {
+            return Err(StoreError::InvalidDocument("graph is not complete".into()));
+        }
+        let source_node_ids = execution
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == GraphNodeKind::Research)
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        let meeting_id = catalog
+            .meetings
+            .decision_baselines
+            .iter()
+            .find(|baseline| baseline.metadata.id == execution.graph.decision_baseline_id)
+            .ok_or_else(|| StoreError::InvalidDocument("DecisionBaseline not found".into()))?
+            .meeting_id;
+        let project_id = catalog
+            .meetings
+            .meetings
+            .iter()
+            .find(|meeting| meeting.metadata.id == meeting_id)
+            .ok_or_else(|| StoreError::InvalidDocument("meeting not found".into()))?
+            .project_id;
+        let artifact_id = ArtifactId::new();
+        let version_id = ArtifactVersionId::new();
+        let version =
+            DocumentVersion::create(version_id, 1, None, command.markdown, source_node_ids)
+                .map_err(|error| StoreError::InvalidDocument(error.to_string()))?;
+        let content_hash = version.content_hash.clone();
+        catalog.deliverables.documents.push(DocumentArtifact {
+            metadata: entity_metadata(artifact_id, "mvp_document"),
+            project_id,
+            title: command.title,
+            versions: vec![version],
+        });
+        M3State {
+            catalog: catalog.clone(),
+            graph_executions: executions,
+        }
+        .validate(&identity)
+        .map_err(|error| StoreError::InvalidDocument(error.to_string()))?;
+        let revision = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
+        transaction.execute(
+            "UPDATE m3_catalog SET revision=?1, catalog_json=?2, updated_at=?3 WHERE singleton=1",
+            params![revision, serde_json::to_string(&catalog)?, timestamp()],
+        )?;
+        let event = insert_event(&transaction, "artifact.document_created", &serde_json::json!({"artifact_id": artifact_id, "version_id": version_id, "content_hash": content_hash}).to_string())?;
+        transaction.commit()?;
+        Ok(DocumentReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            artifact_id,
+            version_id,
+            content_hash,
+            m3_revision: revision,
+            event_sequence: event.sequence,
+        })
+    }
+
+    pub fn accept_mvp_document(
+        &self,
+        command: AcceptDocumentCommand,
+    ) -> Result<DocumentReceipt, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let identity: IdentityCatalog =
+            serde_json::from_str(&transaction.query_row::<String, _, _>(
+                "SELECT catalog_json FROM identity_catalog WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?)?;
+        let (actual, json): (u64, String) = transaction.query_row(
+            "SELECT revision, catalog_json FROM m3_catalog WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if actual != command.expected_m3_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: command.expected_m3_revision,
+                actual,
+            });
+        }
+        let mut catalog: M3Catalog = serde_json::from_str(&json)?;
+        let version = catalog
+            .deliverables
+            .documents
+            .iter_mut()
+            .find(|document| document.metadata.id == command.artifact_id)
+            .and_then(|document| {
+                document
+                    .versions
+                    .iter_mut()
+                    .find(|version| version.id == command.version_id)
+            })
+            .ok_or_else(|| StoreError::InvalidDocument("artifact version not found".into()))?;
+        if version.content_hash != command.content_hash {
+            return Err(StoreError::InvalidDocument("content hash mismatch".into()));
+        }
+        version
+            .accept(&command.accepted_by, &command.accepted_at)
+            .map_err(|error| StoreError::InvalidDocument(error.to_string()))?;
+        let executions = load_graph_executions(&transaction)?;
+        M3State {
+            catalog: catalog.clone(),
+            graph_executions: executions,
+        }
+        .validate(&identity)
+        .map_err(|error| StoreError::InvalidDocument(error.to_string()))?;
+        let revision = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
+        transaction.execute(
+            "UPDATE m3_catalog SET revision=?1, catalog_json=?2, updated_at=?3 WHERE singleton=1",
+            params![revision, serde_json::to_string(&catalog)?, timestamp()],
+        )?;
+        let event = insert_event(&transaction, "artifact.document_accepted", &serde_json::json!({"artifact_id": command.artifact_id, "version_id": command.version_id, "content_hash": command.content_hash}).to_string())?;
+        transaction.commit()?;
+        Ok(DocumentReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            artifact_id: command.artifact_id,
+            version_id: command.version_id,
+            content_hash: command.content_hash,
             m3_revision: revision,
             event_sequence: event.sequence,
         })
@@ -1587,6 +1767,22 @@ fn timestamp() -> String {
         .to_string()
 }
 
+fn entity_metadata<I>(id: I, source_id: &str) -> EntityMetadata<I> {
+    let now = timestamp();
+    EntityMetadata {
+        id,
+        revision: 0,
+        created_at: now.clone(),
+        updated_at: now,
+        provenance: Provenance {
+            source_kind: "local_user".into(),
+            source_id: source_id.into(),
+            recorded_by: "bastet-daemon".into(),
+        },
+        lifecycle: EntityLifecycle::Active,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2300,7 +2496,43 @@ mod tests {
             })
             .unwrap();
         assert_eq!(accepted.m3_revision, 2);
-        assert_eq!(store.graph_executions().unwrap().len(), 1);
+        let execution_id = accepted.graph_execution_id;
+        let branches = store
+            .claim_graph_nodes(execution_id, 0, "research", 2)
+            .unwrap();
+        let mut graph_revision = 1;
+        for node_id in branches {
+            store
+                .complete_graph_node(execution_id, graph_revision, node_id, "research", true)
+                .unwrap();
+            graph_revision += 1;
+        }
+        let join = store
+            .claim_graph_nodes(execution_id, graph_revision, "integrator", 1)
+            .unwrap();
+        graph_revision += 1;
+        store
+            .complete_graph_node(execution_id, graph_revision, join[0], "integrator", true)
+            .unwrap();
+        let document = store
+            .create_mvp_document(CreateDocumentCommand {
+                expected_m3_revision: 2,
+                graph_execution_id: execution_id,
+                title: "MVP report".into(),
+                markdown: "# MVP report\n\nJoined evidence.".into(),
+            })
+            .unwrap();
+        assert_eq!(document.m3_revision, 3);
+        store
+            .accept_mvp_document(AcceptDocumentCommand {
+                expected_m3_revision: 3,
+                artifact_id: document.artifact_id,
+                version_id: document.version_id,
+                content_hash: document.content_hash,
+                accepted_by: "local-user".into(),
+                accepted_at: "2026-09-07T00:01:00Z".into(),
+            })
+            .unwrap();
         drop(store);
 
         let reopened = Store::open(&path).unwrap();
@@ -2316,6 +2548,15 @@ mod tests {
             3
         );
         assert_eq!(reopened.graph_executions().unwrap().len(), 1);
+        assert!(reopened
+            .m3_catalog()
+            .unwrap()
+            .catalog
+            .deliverables
+            .documents[0]
+            .versions[0]
+            .accepted_by
+            .is_some());
     }
 
     #[tokio::test]

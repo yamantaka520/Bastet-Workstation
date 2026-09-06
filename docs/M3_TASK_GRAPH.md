@@ -60,3 +60,6 @@ verification evidence without adding scope.
   test claims both research branches together, completes each with revision CAS, proves the join
   becomes claimable only afterward, completes it under a distinct owner, then checkpoints and
   shuts down cleanly.
+- Completed graphs can now create a versioned Markdown document only when every node succeeded;
+  the version records the two research node ids and a content hash. A separate exact-hash human
+  acceptance transaction is required. Restart verification proves the accepted version survives.
