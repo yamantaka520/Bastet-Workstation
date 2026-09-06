@@ -73,6 +73,7 @@ struct M3Projection {
     graph_nodes: Vec<GraphNodeProjection>,
     awaiting_meetings: Vec<MeetingProjection>,
     document_versions: Vec<DocumentProjection>,
+    knowledge_deliveries: Vec<KnowledgeDeliveryProjection>,
 }
 
 #[derive(Serialize)]
@@ -85,12 +86,21 @@ struct GraphNodeProjection {
 
 #[derive(Serialize)]
 struct DocumentProjection {
+    project_id: String,
     artifact_id: String,
     version_id: String,
     title: String,
     markdown: String,
     content_hash: String,
     accepted: bool,
+}
+
+#[derive(Serialize)]
+struct KnowledgeDeliveryProjection {
+    delivery_id: String,
+    target: String,
+    preview: String,
+    state: String,
 }
 
 #[derive(Serialize)]
@@ -197,6 +207,30 @@ async fn accept_mvp_document(
             content_hash,
             accepted_by: "local-desktop-user".into(),
             accepted_at: timestamp_ms().to_string(),
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn prepare_knowledge_delivery(
+    client: State<'_, DaemonClient>,
+    project_id: bastet_core::ProjectId,
+    artifact_version_id: bastet_core::ArtifactVersionId,
+    target: bastet_core::KnowledgeTarget,
+    preview: String,
+) -> Result<bastet_protocol::KnowledgeDeliveryReceipt, String> {
+    let m3 = client
+        .m3_catalog()
+        .await
+        .map_err(|error| error.to_string())?;
+    client
+        .prepare_knowledge_delivery(bastet_protocol::PrepareKnowledgeDeliveryCommand {
+            expected_m3_revision: m3.revision,
+            project_id,
+            artifact_version_id,
+            target,
+            preview,
         })
         .await
         .map_err(|error| error.to_string())
@@ -311,6 +345,7 @@ fn project_m3(
         .iter()
         .flat_map(|document| {
             document.versions.iter().map(|version| DocumentProjection {
+                project_id: document.project_id.value().to_string(),
                 artifact_id: document.metadata.id.value().to_string(),
                 version_id: version.id.value().to_string(),
                 title: document.title.clone(),
@@ -318,6 +353,18 @@ fn project_m3(
                 content_hash: version.content_hash.clone(),
                 accepted: version.accepted_by.is_some(),
             })
+        })
+        .collect();
+    let knowledge_deliveries = snapshot
+        .catalog
+        .deliverables
+        .knowledge_deliveries
+        .iter()
+        .map(|delivery| KnowledgeDeliveryProjection {
+            delivery_id: delivery.metadata.id.value().to_string(),
+            target: format!("{:?}", delivery.target).to_lowercase(),
+            preview: delivery.preview.clone(),
+            state: format!("{:?}", delivery.state).to_lowercase(),
         })
         .collect();
     let graph_nodes = executions
@@ -349,6 +396,7 @@ fn project_m3(
         graph_nodes,
         awaiting_meetings,
         document_versions,
+        knowledge_deliveries,
     }
 }
 
@@ -744,6 +792,7 @@ pub fn run() {
             accept_mvp_decision,
             create_mvp_document,
             accept_mvp_document,
+            prepare_knowledge_delivery,
             apply_builtin_pet,
             rollback_builtin_pet,
             cancel_run,

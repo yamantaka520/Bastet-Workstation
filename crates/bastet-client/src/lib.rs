@@ -6,9 +6,10 @@ use bastet_protocol::{
     ApprovalList, ApprovalReceipt, ApprovalRecord, CancelRunCommand, CancelRunReceipt,
     CatalogReceipt, CatalogSnapshot, CheckpointCommand, CheckpointReceipt, ClaimGraphNodesCommand,
     ClaimGraphNodesReceipt, CompleteGraphNodeCommand, CompleteGraphNodeReceipt,
-    CreateApprovalCommand, CreateDocumentCommand, CreateGraphExecutionCommand, DaemonSnapshot,
-    DecideApprovalCommand, DocumentReceipt, EventEnvelope, GraphExecutionList,
-    GraphExecutionReceipt, M3CatalogSnapshot, PrepareMvpCommand, PrepareMvpReceipt,
+    CompleteKnowledgeDeliveryCommand, CreateApprovalCommand, CreateDocumentCommand,
+    CreateGraphExecutionCommand, DaemonSnapshot, DecideApprovalCommand, DocumentReceipt,
+    EventEnvelope, GraphExecutionList, GraphExecutionReceipt, KnowledgeDeliveryReceipt,
+    M3CatalogSnapshot, PrepareKnowledgeDeliveryCommand, PrepareMvpCommand, PrepareMvpReceipt,
     ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
 };
 use thiserror::Error;
@@ -263,6 +264,40 @@ impl DaemonClient {
             .await?
             .error_for_status()?
             .json::<DocumentReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
+    pub async fn prepare_knowledge_delivery(
+        &self,
+        command: PrepareKnowledgeDeliveryCommand,
+    ) -> Result<KnowledgeDeliveryReceipt, ClientError> {
+        let receipt = self
+            .http
+            .post(format!("{}/v1/mvp/knowledge/prepare", self.base_url))
+            .json(&command)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<KnowledgeDeliveryReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
+    pub async fn complete_knowledge_delivery(
+        &self,
+        command: CompleteKnowledgeDeliveryCommand,
+    ) -> Result<KnowledgeDeliveryReceipt, ClientError> {
+        let receipt = self
+            .http
+            .post(format!("{}/v1/mvp/knowledge/complete", self.base_url))
+            .json(&command)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<KnowledgeDeliveryReceipt>()
             .await?;
         require_protocol(receipt.protocol_version)?;
         Ok(receipt)
@@ -608,7 +643,7 @@ mod tests {
             })
             .await
             .unwrap();
-        client
+        let accepted_document = client
             .accept_mvp_document(AcceptDocumentCommand {
                 expected_m3_revision: document.m3_revision,
                 artifact_id: document.artifact_id,
@@ -619,13 +654,52 @@ mod tests {
             })
             .await
             .unwrap();
+        let memory = client
+            .prepare_knowledge_delivery(PrepareKnowledgeDeliveryCommand {
+                expected_m3_revision: accepted_document.m3_revision,
+                project_id: prepared.project_id,
+                artifact_version_id: document.version_id,
+                target: bastet_core::KnowledgeTarget::AgentMemoryOs,
+                preview: "Redacted durable project result.".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(memory.state, bastet_core::DeliveryState::Prepared);
+        let memory = client
+            .complete_knowledge_delivery(CompleteKnowledgeDeliveryCommand {
+                expected_m3_revision: memory.m3_revision,
+                delivery_id: memory.delivery_id,
+                destination_receipt: "agent-memory://client-test".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(memory.state, bastet_core::DeliveryState::Delivered);
+        let mind = client
+            .prepare_knowledge_delivery(PrepareKnowledgeDeliveryCommand {
+                expected_m3_revision: memory.m3_revision,
+                project_id: prepared.project_id,
+                artifact_version_id: document.version_id,
+                target: bastet_core::KnowledgeTarget::BastetMind,
+                preview: "Redacted sourced project result.".into(),
+            })
+            .await
+            .unwrap();
+        let mind = client
+            .complete_knowledge_delivery(CompleteKnowledgeDeliveryCommand {
+                expected_m3_revision: mind.m3_revision,
+                delivery_id: mind.delivery_id,
+                destination_receipt: "bastet-mind://client-test".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(mind.state, bastet_core::DeliveryState::Delivered);
         let receipt = client
             .checkpoint(initial.revision, "client integration test")
             .await
             .unwrap();
         assert_eq!(receipt.revision, initial.revision + 1);
         assert_eq!(client.snapshot().await.unwrap().revision, receipt.revision);
-        assert_eq!(store.events_after(0).unwrap().len(), 13);
+        assert_eq!(store.events_after(0).unwrap().len(), 17);
         let suspended = client
             .suspend(receipt.revision, "integration simulated sleep")
             .await
