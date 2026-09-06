@@ -91,4 +91,9 @@ verification status; it does not add scope.
   `approvalPolicy=never`, and `networkAccess=false`. It requires exactly one `receipt.txt` with
   exact fixture content, a successful terminal, and at least one redacted write receipt that
   contains neither the path nor content. The temporary evidence file is removed after verification.
+  JSON-RPC transport failures are now safely classified as unavailable, timed out, protocol drift,
+  or remote rejection. Remote rejection retains only its numeric code and whether it is retryable;
+  provider message/data are discarded. The documented overloaded code `-32001` is retryable, while
+  unknown rejection codes are not guessed to be retryable. This classification reaches the public
+  app-server boundary without exposing provider detail.
 - M2.4–M2.8: not started.

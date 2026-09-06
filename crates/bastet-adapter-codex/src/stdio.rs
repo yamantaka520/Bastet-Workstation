@@ -25,7 +25,7 @@ pub struct StdioTransport {
 impl StdioTransport {
     pub fn spawn(executable: &Path, timeout: Duration) -> Result<Self, TransportError> {
         if timeout.is_zero() {
-            return Err(TransportError);
+            return Err(TransportError::ProtocolDrift);
         }
         let mut child = Command::new(executable)
             .args(["app-server", "--listen", "stdio://"])
@@ -33,15 +33,17 @@ impl StdioTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|_| TransportError)?;
-        let stdin = child.stdin.take().ok_or(TransportError)?;
-        let stdout = child.stdout.take().ok_or(TransportError)?;
+            .map_err(|_| TransportError::Unavailable)?;
+        let stdin = child.stdin.take().ok_or(TransportError::Unavailable)?;
+        let stdout = child.stdout.take().ok_or(TransportError::Unavailable)?;
         let (sender, responses) = mpsc::channel();
         let reader = thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let response = line
-                    .map_err(|_| TransportError)
-                    .and_then(|line| serde_json::from_str(&line).map_err(|_| TransportError));
+                    .map_err(|_| TransportError::Unavailable)
+                    .and_then(|line| {
+                        serde_json::from_str(&line).map_err(|_| TransportError::ProtocolDrift)
+                    });
                 let failed = response.is_err();
                 if sender.send(response).is_err() || failed {
                     break;
@@ -79,19 +81,22 @@ impl StdioTransport {
     }
 
     fn write_message(&mut self, message: &Value) -> Result<(), TransportError> {
-        let stdin = self.stdin.as_mut().ok_or(TransportError)?;
-        serde_json::to_writer(&mut *stdin, message).map_err(|_| TransportError)?;
-        stdin.write_all(b"\n").map_err(|_| TransportError)?;
-        stdin.flush().map_err(|_| TransportError)
+        let stdin = self.stdin.as_mut().ok_or(TransportError::Unavailable)?;
+        serde_json::to_writer(&mut *stdin, message).map_err(|_| TransportError::ProtocolDrift)?;
+        stdin
+            .write_all(b"\n")
+            .map_err(|_| TransportError::Unavailable)?;
+        stdin.flush().map_err(|_| TransportError::Unavailable)
     }
 
     fn receive_message(&self, deadline: Instant) -> Result<Value, TransportError> {
         let remaining = deadline
             .checked_duration_since(Instant::now())
-            .ok_or(TransportError)?;
+            .ok_or(TransportError::TimedOut)?;
         match self.responses.recv_timeout(remaining) {
             Ok(message) => message,
-            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => Err(TransportError),
+            Err(RecvTimeoutError::Timeout) => Err(TransportError::TimedOut),
+            Err(RecvTimeoutError::Disconnected) => Err(TransportError::Unavailable),
         }
     }
 }
@@ -99,7 +104,10 @@ impl StdioTransport {
 impl AppServerTransport for StdioTransport {
     fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError> {
         let request_id = self.next_request_id;
-        self.next_request_id = self.next_request_id.checked_add(1).ok_or(TransportError)?;
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or(TransportError::ProtocolDrift)?;
         self.write_message(&json!({
             "method": method,
             "id": request_id,
@@ -149,6 +157,7 @@ impl Drop for StdioTransport {
     }
 }
 
+#[derive(Debug)]
 enum ResponseDisposition {
     Notification(AppServerNotification),
     Result(Value),
@@ -162,28 +171,45 @@ fn decode_response(
         return decode_notification(message).map(ResponseDisposition::Notification);
     };
     if id.as_u64() != Some(expected_id) {
-        return Err(TransportError);
+        return Err(TransportError::ProtocolDrift);
     }
-    if message.get("error").is_some() {
-        return Err(TransportError);
+    if let Some(error) = message.get("error") {
+        let code = error
+            .get("code")
+            .and_then(Value::as_i64)
+            .ok_or(TransportError::ProtocolDrift)?;
+        if error
+            .get("message")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(TransportError::ProtocolDrift);
+        }
+        return Err(TransportError::RemoteRejected {
+            code,
+            retryable: code == -32001,
+        });
     }
     message
         .get("result")
         .cloned()
         .map(ResponseDisposition::Result)
-        .ok_or(TransportError)
+        .ok_or(TransportError::ProtocolDrift)
 }
 
 fn decode_notification(message: Value) -> Result<AppServerNotification, TransportError> {
     if message.get("id").is_some() {
-        return Err(TransportError);
+        return Err(TransportError::ProtocolDrift);
     }
     let method = message
         .get("method")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .ok_or(TransportError)?;
-    let params = message.get("params").cloned().ok_or(TransportError)?;
+        .ok_or(TransportError::ProtocolDrift)?;
+    let params = message
+        .get("params")
+        .cloned()
+        .ok_or(TransportError::ProtocolDrift)?;
     Ok(AppServerNotification {
         method: method.into(),
         params,
@@ -240,15 +266,50 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_ids_and_remote_errors_fail_closed() {
-        assert!(decode_response(json!({"id": 8, "result": {}}), 7).is_err());
-        assert!(decode_response(
-            json!({"id": 7, "error": {"code": 1, "message": "private"}}),
-            7
-        )
-        .is_err());
+    fn mismatched_ids_and_malformed_remote_errors_fail_closed() {
+        assert_eq!(
+            decode_response(json!({"id": 8, "result": {}}), 7).unwrap_err(),
+            TransportError::ProtocolDrift
+        );
+        assert_eq!(
+            decode_response(json!({"id": 7, "error": {"code": 1}}), 7).unwrap_err(),
+            TransportError::ProtocolDrift
+        );
         assert!(decode_notification(json!({"method": "", "params": {}})).is_err());
         assert!(decode_notification(json!({"method": "turn/started"})).is_err());
         assert!(decode_notification(json!({"id": 3, "method": "approval"})).is_err());
+    }
+
+    #[test]
+    fn remote_rejections_keep_only_code_and_retryability() {
+        let private = "private provider detail must not survive";
+        let rejected = decode_response(
+            json!({"id": 7, "error": {"code": 123, "message": private, "data": private}}),
+            7,
+        )
+        .unwrap_err();
+        assert_eq!(
+            rejected,
+            TransportError::RemoteRejected {
+                code: 123,
+                retryable: false
+            }
+        );
+        assert!(!rejected.to_string().contains(private));
+
+        assert_eq!(
+            decode_response(
+                json!({"id": 7, "error": {
+                    "code": -32001,
+                    "message": "Server overloaded; retry later."
+                }}),
+                7,
+            )
+            .unwrap_err(),
+            TransportError::RemoteRejected {
+                code: -32001,
+                retryable: true
+            }
+        );
     }
 }

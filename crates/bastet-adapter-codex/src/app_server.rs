@@ -18,13 +18,21 @@ pub struct AppServerNotification {
 }
 
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
-#[error("Codex app-server transport failed")]
-pub struct TransportError;
+pub enum TransportError {
+    #[error("Codex app-server transport is unavailable")]
+    Unavailable,
+    #[error("Codex app-server transport timed out")]
+    TimedOut,
+    #[error("Codex app-server transport violated the expected protocol")]
+    ProtocolDrift,
+    #[error("Codex app-server rejected the request with JSON-RPC code {code}")]
+    RemoteRejected { code: i64, retryable: bool },
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AppServerError {
-    #[error("Codex app-server transport failed")]
-    Transport,
+    #[error(transparent)]
+    Transport(TransportError),
     #[error("Codex app-server connection is not initialized")]
     NotInitialized,
     #[error("Codex app-server output did not match the expected protocol")]
@@ -139,13 +147,13 @@ impl<T: AppServerTransport> CodexAppServer<T> {
                     }
                 }),
             )
-            .map_err(|_| AppServerError::Transport)?;
+            .map_err(AppServerError::Transport)?;
         if !result.is_object() {
             return Err(AppServerError::ProtocolDrift);
         }
         self.transport
             .notify("initialized", json!({}))
-            .map_err(|_| AppServerError::Transport)?;
+            .map_err(AppServerError::Transport)?;
         self.initialized = true;
         Ok(())
     }
@@ -171,7 +179,7 @@ impl<T: AppServerTransport> CodexAppServer<T> {
                     "includeHidden": false
                 }),
             )
-            .map_err(|_| AppServerError::Transport)?;
+            .map_err(AppServerError::Transport)?;
         let wire: ModelPageWire =
             serde_json::from_value(result).map_err(|_| AppServerError::ProtocolDrift)?;
         let models = wire
@@ -210,7 +218,7 @@ impl<T: AppServerTransport> CodexAppServer<T> {
                     "sandbox": request.sandbox
                 }),
             )
-            .map_err(|_| AppServerError::Transport)?;
+            .map_err(AppServerError::Transport)?;
         parse_thread_handle(result)
     }
 
@@ -220,7 +228,7 @@ impl<T: AppServerTransport> CodexAppServer<T> {
         let result = self
             .transport
             .request("thread/resume", json!({ "threadId": thread_id }))
-            .map_err(|_| AppServerError::Transport)?;
+            .map_err(AppServerError::Transport)?;
         parse_thread_handle(result)
     }
 
@@ -260,7 +268,7 @@ impl<T: AppServerTransport> CodexAppServer<T> {
         let result = self
             .transport
             .request("turn/start", params)
-            .map_err(|_| AppServerError::Transport)?;
+            .map_err(AppServerError::Transport)?;
         let wire: TurnResultWire =
             serde_json::from_value(result).map_err(|_| AppServerError::ProtocolDrift)?;
         require_text(&wire.turn.id)?;
@@ -279,7 +287,7 @@ impl<T: AppServerTransport> CodexAppServer<T> {
                 "turn/interrupt",
                 json!({ "threadId": thread_id, "turnId": turn_id }),
             )
-            .map_err(|_| AppServerError::Transport)?;
+            .map_err(AppServerError::Transport)?;
         if result.as_object().is_none_or(|object| !object.is_empty()) {
             return Err(AppServerError::ProtocolDrift);
         }
@@ -290,7 +298,7 @@ impl<T: AppServerTransport> CodexAppServer<T> {
         self.require_initialized()?;
         self.transport
             .next_notification()
-            .map_err(|_| AppServerError::Transport)
+            .map_err(AppServerError::Transport)
     }
 
     pub fn next_run_event(
@@ -538,6 +546,23 @@ mod tests {
         );
         assert_eq!(transport.requests[1].0, "model/list");
         assert_eq!(transport.requests[1].1["includeHidden"], false);
+    }
+
+    #[test]
+    fn transport_classification_reaches_the_adapter_boundary() {
+        let rejection = TransportError::RemoteRejected {
+            code: -32001,
+            retryable: true,
+        };
+        let transport = FixtureTransport {
+            responses: VecDeque::from([Err(rejection)]),
+            ..FixtureTransport::default()
+        };
+        let mut server = CodexAppServer::new(transport);
+        assert_eq!(
+            server.initialize(),
+            Err(AppServerError::Transport(rejection))
+        );
     }
 
     #[test]
