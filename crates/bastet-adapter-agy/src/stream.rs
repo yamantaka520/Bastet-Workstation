@@ -12,6 +12,7 @@ pub enum AgyRunUpdate {
         failure: Option<AdapterFailure>,
     },
     Cost(CostEvidence),
+    WriteReceipt(String),
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -26,6 +27,8 @@ pub struct AgyRunStream {
     run_id: RunId,
     sequence: u64,
     conversation_id: Option<String>,
+    expected_conversation_id: Option<String>,
+    initialized: bool,
     closed: bool,
 }
 
@@ -35,12 +38,91 @@ impl AgyRunStream {
             run_id,
             sequence: 0,
             conversation_id: None,
+            expected_conversation_id: None,
+            initialized: false,
             closed: false,
         }
     }
 
+    pub fn resuming(
+        run_id: RunId,
+        conversation_id: impl Into<String>,
+    ) -> Result<Self, AgyStreamError> {
+        let conversation_id = conversation_id.into();
+        if conversation_id.trim().is_empty() {
+            return Err(AgyStreamError::ProtocolDrift);
+        }
+        Ok(Self {
+            run_id,
+            sequence: 0,
+            conversation_id: None,
+            expected_conversation_id: Some(conversation_id),
+            initialized: false,
+            closed: false,
+        })
+    }
+
     pub fn conversation_id(&self) -> Option<&str> {
         self.conversation_id.as_deref()
+    }
+
+    pub fn recovery_started(&mut self, occurred_at: &str) -> Result<AgyRunUpdate, AgyStreamError> {
+        if self.expected_conversation_id.is_none() || self.initialized || self.closed {
+            return Err(AgyStreamError::ProtocolDrift);
+        }
+        self.lifecycle_with_evidence(
+            NormalizedRunState::Recovering,
+            "run.recovering",
+            occurred_at,
+            None,
+            EvidenceClass::LocallyMeasured,
+        )
+    }
+
+    pub fn cancellation_started(
+        &mut self,
+        occurred_at: &str,
+    ) -> Result<AgyRunUpdate, AgyStreamError> {
+        if !self.initialized || self.closed {
+            return Err(AgyStreamError::ProtocolDrift);
+        }
+        self.lifecycle_with_evidence(
+            NormalizedRunState::Cancelling,
+            "run.cancelling",
+            occurred_at,
+            None,
+            EvidenceClass::LocallyMeasured,
+        )
+    }
+
+    pub fn cancelled(&mut self, occurred_at: &str) -> Result<AgyRunUpdate, AgyStreamError> {
+        self.local_terminal(
+            NormalizedRunState::Cancelled,
+            "run.cancelled",
+            AdapterFailureKind::Cancelled,
+            "adapter.agy.cancelled",
+            occurred_at,
+        )
+    }
+
+    pub fn timed_out(&mut self, occurred_at: &str) -> Result<AgyRunUpdate, AgyStreamError> {
+        self.local_terminal(
+            NormalizedRunState::Failed,
+            "run.timed_out",
+            AdapterFailureKind::Timeout,
+            "adapter.agy.timed_out",
+            occurred_at,
+        )
+    }
+
+    pub fn crashed(&mut self, occurred_at: &str) -> Result<AgyRunUpdate, AgyStreamError> {
+        self.local_terminal(
+            NormalizedRunState::Uncertain,
+            "run.crashed",
+            AdapterFailureKind::Crashed,
+            "adapter.agy.crashed",
+            occurred_at,
+        )
     }
 
     pub fn consume_line(
@@ -65,11 +147,19 @@ impl AgyRunStream {
         value: &Value,
         occurred_at: &str,
     ) -> Result<AgyRunUpdate, AgyStreamError> {
-        if self.conversation_id.is_some() {
+        if self.initialized {
             return Err(AgyStreamError::ProtocolDrift);
         }
         let conversation_id = required_text(value, "conversation_id")?;
+        if self
+            .expected_conversation_id
+            .as_deref()
+            .is_some_and(|expected| expected != conversation_id)
+        {
+            return Err(AgyStreamError::ProtocolDrift);
+        }
         self.conversation_id = Some(conversation_id.into());
+        self.initialized = true;
         self.lifecycle(
             NormalizedRunState::Running,
             "run.started",
@@ -110,17 +200,47 @@ impl AgyRunStream {
         }
         let (state, event_type, failure) = match status {
             "SUCCESS" => (NormalizedRunState::Succeeded, "run.succeeded", None),
-            "ERROR" => (
-                NormalizedRunState::Failed,
-                "run.failed",
+            "ERROR" => {
+                let kind = classify_error(result.get("error").and_then(Value::as_str));
+                (
+                    NormalizedRunState::Failed,
+                    "run.failed",
+                    Some(AdapterFailure {
+                        kind,
+                        message_key: "adapter.agy.failed".into(),
+                        retryable: matches!(
+                            kind,
+                            AdapterFailureKind::Quota | AdapterFailureKind::Timeout
+                        ),
+                        provider_code: None,
+                        redacted_detail: None,
+                    }),
+                )
+            }
+            "CANCELED" | "INTERRUPTED" => (
+                NormalizedRunState::Cancelled,
+                "run.cancelled",
                 Some(AdapterFailure {
-                    kind: classify_error(result.get("error").and_then(Value::as_str)),
-                    message_key: "adapter.agy.failed".into(),
+                    kind: AdapterFailureKind::Cancelled,
+                    message_key: "adapter.agy.cancelled".into(),
                     retryable: false,
                     provider_code: None,
                     redacted_detail: None,
                 }),
             ),
+            "INVALID" => (
+                NormalizedRunState::Failed,
+                "run.failed",
+                Some(AdapterFailure {
+                    kind: AdapterFailureKind::MalformedOutput,
+                    message_key: "adapter.agy.invalid_state".into(),
+                    retryable: false,
+                    provider_code: None,
+                    redacted_detail: None,
+                }),
+            ),
+            "WAITING" => (NormalizedRunState::Blocked, "run.blocked", None),
+            "RUNNING" => (NormalizedRunState::Uncertain, "run.uncertain", None),
             _ => return Err(AgyStreamError::ProtocolDrift),
         };
         self.closed = true;
@@ -145,6 +265,23 @@ impl AgyRunStream {
         occurred_at: &str,
         failure: Option<AdapterFailure>,
     ) -> Result<AgyRunUpdate, AgyStreamError> {
+        self.lifecycle_with_evidence(
+            state,
+            event_type,
+            occurred_at,
+            failure,
+            EvidenceClass::ProviderReported,
+        )
+    }
+
+    fn lifecycle_with_evidence(
+        &mut self,
+        state: NormalizedRunState,
+        event_type: &str,
+        occurred_at: &str,
+        failure: Option<AdapterFailure>,
+        evidence_class: EvidenceClass,
+    ) -> Result<AgyRunUpdate, AgyStreamError> {
         if occurred_at.trim().is_empty() {
             return Err(AgyStreamError::ProtocolDrift);
         }
@@ -160,12 +297,39 @@ impl AgyRunStream {
                 state,
                 event_type: event_type.into(),
                 occurred_at: occurred_at.into(),
-                evidence_class: EvidenceClass::ProviderReported,
+                evidence_class,
                 provider_event_id: None,
                 redacted_payload_json: json!({"provider": ADAPTER_PROVIDER}).to_string(),
             },
             failure,
         })
+    }
+
+    fn local_terminal(
+        &mut self,
+        state: NormalizedRunState,
+        event_type: &str,
+        kind: AdapterFailureKind,
+        message_key: &str,
+        occurred_at: &str,
+    ) -> Result<AgyRunUpdate, AgyStreamError> {
+        if self.closed {
+            return Err(AgyStreamError::Closed);
+        }
+        self.closed = true;
+        self.lifecycle_with_evidence(
+            state,
+            event_type,
+            occurred_at,
+            Some(AdapterFailure {
+                kind,
+                message_key: message_key.into(),
+                retryable: kind == AdapterFailureKind::Crashed,
+                provider_code: None,
+                redacted_detail: None,
+            }),
+            EvidenceClass::LocallyMeasured,
+        )
     }
 }
 
@@ -205,6 +369,8 @@ fn classify_error(error: Option<&str>) -> AdapterFailureKind {
         AdapterFailureKind::Authentication
     } else if lower.contains("quota") || lower.contains("rate limit") {
         AdapterFailureKind::Quota
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        AdapterFailureKind::Timeout
     } else if lower.contains("permission") {
         AdapterFailureKind::PermissionDenied
     } else {
@@ -284,6 +450,7 @@ mod tests {
         for (error, expected) in [
             ("Not logged in: secret", AdapterFailureKind::Authentication),
             ("Quota exhausted: secret", AdapterFailureKind::Quota),
+            ("request timed out: secret", AdapterFailureKind::Timeout),
             ("unexpected secret", AdapterFailureKind::Unknown),
         ] {
             let mut stream = stream();
@@ -352,5 +519,51 @@ mod tests {
         ] {
             assert_eq!(parse_usage(&usage), Err(AgyStreamError::ProtocolDrift));
         }
+    }
+
+    #[test]
+    fn local_recovery_cancel_timeout_and_crash_have_monotonic_evidence() {
+        let mut recovering = AgyRunStream::resuming(RunId::from_bytes([22; 16]), ID).unwrap();
+        let AgyRunUpdate::Lifecycle { event, .. } = recovering.recovery_started("now").unwrap()
+        else {
+            panic!("recovery must be lifecycle")
+        };
+        assert_eq!(event.state, NormalizedRunState::Recovering);
+        assert_eq!(event.evidence_class, EvidenceClass::LocallyMeasured);
+        recovering
+            .consume_line(
+                &json!({"event":"init","conversation_id":ID,"init":{}}).to_string(),
+                "later",
+            )
+            .unwrap();
+        let AgyRunUpdate::Lifecycle { event, .. } =
+            recovering.cancellation_started("later").unwrap()
+        else {
+            panic!("cancel request must be lifecycle")
+        };
+        assert_eq!(event.sequence, 3);
+        assert_eq!(event.state, NormalizedRunState::Cancelling);
+        let AgyRunUpdate::Lifecycle { event, failure } = recovering.cancelled("end").unwrap()
+        else {
+            panic!("cancel must be lifecycle")
+        };
+        assert_eq!(event.sequence, 4);
+        assert_eq!(failure.unwrap().kind, AdapterFailureKind::Cancelled);
+
+        let mut timeout = stream();
+        let AgyRunUpdate::Lifecycle { event, failure } = timeout.timed_out("end").unwrap() else {
+            panic!("timeout must be lifecycle")
+        };
+        assert_eq!(event.state, NormalizedRunState::Failed);
+        assert_eq!(failure.unwrap().kind, AdapterFailureKind::Timeout);
+
+        let mut crash = stream();
+        let AgyRunUpdate::Lifecycle { event, failure } = crash.crashed("end").unwrap() else {
+            panic!("crash must be lifecycle")
+        };
+        assert_eq!(event.state, NormalizedRunState::Uncertain);
+        let failure = failure.unwrap();
+        assert_eq!(failure.kind, AdapterFailureKind::Crashed);
+        assert!(failure.retryable);
     }
 }

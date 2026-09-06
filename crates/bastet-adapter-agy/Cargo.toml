@@ -14,4 +14,5 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+bastet-adapter-conformance = { path = "../bastet-adapter-conformance" }
 tempfile.workspace = true

@@ -128,7 +128,7 @@ verification status; it does not add scope.
   verified execution boundaries (start, attach/resume, status/wait, cancel, usage export,
   read-only, bounded write, and structured events); installation and interactive authentication
   remain undeclared. A real model-list canary passed through this production connection boundary.
-- M2.4 Agy CLI reference adapter: in progress. Read-only local discovery established that Agy
+- M2.4 Agy CLI reference adapter: complete locally. Read-only local discovery established that Agy
   1.1.25 exposes a single-line version and a tab-delimited model catalog. The initial adapter
   boundary accepts only numeric triplet versions and allowlisted non-empty model records, fails
   closed on malformed output, and deliberately withholds execution capabilities until its
@@ -140,6 +140,15 @@ verification status; it does not add scope.
   provider token counts, and discards cwd, tool inventory, response text, tool details, and raw
   errors. Unknown events, malformed usage, mismatched conversations, and post-terminal data fail
   closed. Authentication/quota/permission failures are reduced to typed categories without
-  retaining provider text. Production process execution remains withheld until prompts are sent
-  over stdin rather than exposed through argv.
+  retaining provider text. Production process execution remained withheld until prompt delivery
+  moved from argv to the documented stdin envelope.
+  The production runner now sends the user envelope only through piped stdin, uses structured
+  stdout with stderr discarded, and owns timeout, process-loss, cancellation, resume, and terminal
+  ordering. Real isolated canaries passed stdin read-only execution, local cancellation,
+  cross-process conversation resume, bounded timeout, and one exact-file workspace write. Codex
+  and Agy now share the same bounded, symlink-rejecting workspace snapshot in `bastet-core`; write
+  receipts precede terminal state and expose neither path nor content. The Agy protocol fixture
+  passes all ten mandatory conformance scenarios, including auth/quota classification and
+  redaction. Production capabilities now expose only the verified start, attach/resume,
+  status/wait, cancel, usage, read-only, bounded-write, and structured-event boundaries.
 - M2.5–M2.8: not started.

@@ -1,7 +1,9 @@
 //! Fail-closed discovery and catalog boundary for the Agy CLI reference adapter.
 
+mod process;
 mod stream;
 
+pub use process::{AgyProcess, AgyProcessError, AgyRunRequest};
 pub use stream::{AgyRunStream, AgyRunUpdate, AgyStreamError};
 
 use std::{
@@ -155,12 +157,18 @@ impl<R: CommandRunner> AgyAdapter<R> {
                 AdapterOperation::Discover,
                 AdapterOperation::Version,
                 AdapterOperation::ListModels,
+                AdapterOperation::Start,
+                AdapterOperation::Attach,
+                AdapterOperation::Status,
+                AdapterOperation::Wait,
+                AdapterOperation::Cancel,
+                AdapterOperation::ExportUsage,
             ],
             reasoning_controls: vec!["low".into(), "medium".into(), "high".into()],
-            supports_read_only: false,
-            supports_write: false,
-            supports_resume: false,
-            supports_structured_events: false,
+            supports_read_only: true,
+            supports_write: true,
+            supports_resume: true,
+            supports_structured_events: true,
         }
     }
 
@@ -294,15 +302,26 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_do_not_claim_execution_before_stream_contract_exists() {
+    fn capabilities_claim_only_verified_execution_boundaries() {
         let capabilities = AgyAdapter::new("agy").capabilities();
         assert!(capabilities
             .operations
             .contains(&AdapterOperation::ListModels));
-        assert!(!capabilities.operations.contains(&AdapterOperation::Start));
-        assert!(!capabilities.supports_read_only);
-        assert!(!capabilities.supports_write);
-        assert!(!capabilities.supports_resume);
-        assert!(!capabilities.supports_structured_events);
+        assert!(capabilities.operations.contains(&AdapterOperation::Start));
+        assert!(capabilities.operations.contains(&AdapterOperation::Attach));
+        assert!(capabilities.operations.contains(&AdapterOperation::Status));
+        assert!(capabilities.operations.contains(&AdapterOperation::Wait));
+        assert!(capabilities.operations.contains(&AdapterOperation::Cancel));
+        assert!(capabilities
+            .operations
+            .contains(&AdapterOperation::ExportUsage));
+        assert!(capabilities.supports_read_only);
+        assert!(capabilities.supports_write);
+        assert!(capabilities.supports_resume);
+        assert!(capabilities.supports_structured_events);
+        assert!(!capabilities.operations.contains(&AdapterOperation::Install));
+        assert!(!capabilities
+            .operations
+            .contains(&AdapterOperation::Authenticate));
     }
 }

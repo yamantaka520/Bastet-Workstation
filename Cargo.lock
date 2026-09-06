@@ -184,6 +184,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 name = "bastet-adapter-agy"
 version = "0.1.0"
 dependencies = [
+ "bastet-adapter-conformance",
  "bastet-core",
  "serde",
  "serde_json",
@@ -199,7 +200,6 @@ dependencies = [
  "bastet-core",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "thiserror 2.0.20",
 ]
@@ -232,6 +232,8 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror 2.0.20",
  "uuid",
 ]
