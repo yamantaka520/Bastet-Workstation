@@ -36,6 +36,7 @@ pub enum GraphNodeState {
     Succeeded,
     Failed,
     Blocked,
+    Uncertain,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +145,53 @@ impl GraphExecution {
             nodes,
             revision: 0,
         })
+    }
+
+    pub fn validate(&self) -> Result<(), GraphError> {
+        self.graph.validate()?;
+        if self.nodes.len() != self.graph.nodes.len()
+            || self
+                .nodes
+                .iter()
+                .map(|node| node.node_id)
+                .collect::<HashSet<_>>()
+                .len()
+                != self.nodes.len()
+            || self.nodes.iter().any(|execution| {
+                !self
+                    .graph
+                    .nodes
+                    .iter()
+                    .any(|node| node.id == execution.node_id)
+                    || match execution.state {
+                        GraphNodeState::Running
+                        | GraphNodeState::Succeeded
+                        | GraphNodeState::Failed => execution.owner.is_none(),
+                        GraphNodeState::Pending
+                        | GraphNodeState::Blocked
+                        | GraphNodeState::Uncertain => execution.owner.is_some(),
+                    }
+            })
+        {
+            return Err(GraphError::InvalidExecution);
+        }
+        Ok(())
+    }
+
+    pub fn reconcile_after_restart(&mut self) -> usize {
+        let mut changed = 0;
+        for node in &mut self.nodes {
+            if node.state == GraphNodeState::Running {
+                node.state = GraphNodeState::Uncertain;
+                node.owner = None;
+                node.revision += 1;
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.revision += 1;
+        }
+        changed
     }
 
     pub fn claim_ready(

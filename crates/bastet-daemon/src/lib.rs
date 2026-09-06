@@ -13,7 +13,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use bastet_core::{ApprovalError, ApprovalRequestId, CatalogError, IdentityCatalog, RunId};
+use bastet_core::{
+    ApprovalError, ApprovalRequestId, CatalogError, GraphError, GraphExecution, GraphNodeId,
+    GraphRunId, IdentityCatalog, RunId,
+};
 use bastet_protocol::{
     ApprovalList, ApprovalReceipt, ApprovalRecord, CancelRunReceipt, CatalogReceipt,
     CatalogSnapshot, CheckpointCommand, CheckpointReceipt, CreateApprovalCommand, DaemonLifecycle,
@@ -25,7 +28,7 @@ use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -60,6 +63,12 @@ pub enum StoreError {
     InvalidRunState(String),
     #[error("provider run controller rejected cancellation")]
     RunControlRejected,
+    #[error("graph execution is invalid: {0}")]
+    InvalidGraph(#[from] GraphError),
+    #[error("graph execution was not found")]
+    GraphNotFound,
+    #[error("graph execution already exists")]
+    GraphConflict,
 }
 
 #[derive(Clone)]
@@ -302,11 +311,15 @@ impl axum::response::IntoResponse for ApiError {
             StoreError::RevisionConflict { .. }
             | StoreError::InvalidLifecycle { .. }
             | StoreError::ApprovalConflict
+            | StoreError::GraphConflict
             | StoreError::InvalidRunState(_) => StatusCode::CONFLICT,
-            StoreError::ApprovalNotFound | StoreError::RunNotFound => StatusCode::NOT_FOUND,
+            StoreError::ApprovalNotFound | StoreError::RunNotFound | StoreError::GraphNotFound => {
+                StatusCode::NOT_FOUND
+            }
             StoreError::RunControlRejected => StatusCode::SERVICE_UNAVAILABLE,
             StoreError::InvalidCatalog(_)
             | StoreError::InvalidApproval(_)
+            | StoreError::InvalidGraph(_)
             | StoreError::Serialization(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -344,6 +357,7 @@ impl Store {
             )?;
             insert_event(&transaction, "daemon.recovery_started", "{}")?;
             reconcile_catalog_for_recovery(&transaction)?;
+            reconcile_graphs_for_recovery(&transaction)?;
             transaction.commit()?;
         }
         Ok(Self {
@@ -498,6 +512,119 @@ impl Store {
             catalog_revision: revision,
             event_sequence: event.sequence,
         })
+    }
+
+    pub fn create_graph_execution(&self, execution: &GraphExecution) -> Result<(), StoreError> {
+        execution.validate()?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO graph_executions(execution_id, revision, execution_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                execution.id.value().to_string(),
+                execution.revision,
+                serde_json::to_string(execution)?,
+                timestamp()
+            ],
+        )?;
+        if inserted == 0 {
+            return Err(StoreError::GraphConflict);
+        }
+        insert_event(
+            &transaction,
+            "graph.execution_created",
+            &serde_json::json!({"execution_id": execution.id, "nodes": execution.nodes.len()})
+                .to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn graph_execution(&self, id: GraphRunId) -> Result<GraphExecution, StoreError> {
+        let connection = self.connection()?;
+        let json: Option<String> = connection
+            .query_row(
+                "SELECT execution_json FROM graph_executions WHERE execution_id = ?1",
+                [id.value().to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let execution: GraphExecution =
+            serde_json::from_str(&json.ok_or(StoreError::GraphNotFound)?)?;
+        execution.validate()?;
+        Ok(execution)
+    }
+
+    pub fn claim_graph_nodes(
+        &self,
+        id: GraphRunId,
+        expected_revision: u64,
+        owner: &str,
+        limit: usize,
+    ) -> Result<Vec<GraphNodeId>, StoreError> {
+        self.update_graph(id, expected_revision, "graph.nodes_claimed", |execution| {
+            execution.claim_ready(owner, limit)
+        })
+    }
+
+    pub fn complete_graph_node(
+        &self,
+        id: GraphRunId,
+        expected_revision: u64,
+        node_id: GraphNodeId,
+        owner: &str,
+        succeeded: bool,
+    ) -> Result<(), StoreError> {
+        self.update_graph(id, expected_revision, "graph.node_completed", |execution| {
+            execution.complete(node_id, owner, succeeded)
+        })
+    }
+
+    fn update_graph<T>(
+        &self,
+        id: GraphRunId,
+        expected_revision: u64,
+        event_type: &str,
+        update: impl FnOnce(&mut GraphExecution) -> Result<T, GraphError>,
+    ) -> Result<T, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(u64, String)> = transaction
+            .query_row(
+                "SELECT revision, execution_json FROM graph_executions WHERE execution_id = ?1",
+                [id.value().to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (actual, json) = row.ok_or(StoreError::GraphNotFound)?;
+        if actual != expected_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: expected_revision,
+                actual,
+            });
+        }
+        let mut execution: GraphExecution = serde_json::from_str(&json)?;
+        execution.validate()?;
+        let result = update(&mut execution)?;
+        execution.validate()?;
+        transaction.execute(
+            "UPDATE graph_executions SET revision = ?1, execution_json = ?2, updated_at = ?3
+             WHERE execution_id = ?4",
+            params![
+                execution.revision,
+                serde_json::to_string(&execution)?,
+                timestamp(),
+                id.value().to_string()
+            ],
+        )?;
+        insert_event(
+            &transaction,
+            event_type,
+            &serde_json::json!({"execution_id": id, "revision": execution.revision}).to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(result)
     }
 
     pub fn create_approval(
@@ -894,6 +1021,61 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StoreError> {
         )?;
         transaction.commit()?;
     }
+    if current < 4 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE graph_executions (
+                execution_id TEXT PRIMARY KEY,
+                revision INTEGER NOT NULL,
+                execution_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL);",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?1)",
+            [timestamp()],
+        )?;
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
+fn reconcile_graphs_for_recovery(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), StoreError> {
+    let rows = {
+        let mut statement = transaction.prepare(
+            "SELECT execution_id, execution_json FROM graph_executions ORDER BY execution_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    for (id, json) in rows {
+        let mut execution: GraphExecution = serde_json::from_str(&json)?;
+        execution.validate()?;
+        let changed = execution.reconcile_after_restart();
+        if changed == 0 {
+            continue;
+        }
+        transaction.execute(
+            "UPDATE graph_executions SET revision = ?1, execution_json = ?2, updated_at = ?3
+             WHERE execution_id = ?4",
+            params![
+                execution.revision,
+                serde_json::to_string(&execution)?,
+                timestamp(),
+                id
+            ],
+        )?;
+        insert_event(
+            transaction,
+            "graph.running_nodes_marked_uncertain",
+            &serde_json::json!({"execution_id": execution.id, "nodes": changed}).to_string(),
+        )?;
+    }
     Ok(())
 }
 
@@ -1185,6 +1367,41 @@ mod tests {
                 },
             },
             &catalog_fixture().roles[0].policy,
+        )
+        .unwrap()
+    }
+
+    fn graph_fixture() -> GraphExecution {
+        let left = GraphNodeId::from_bytes([61; 16]);
+        let right = GraphNodeId::from_bytes([62; 16]);
+        GraphExecution::start(
+            GraphRunId::from_bytes([60; 16]),
+            bastet_core::WorkflowGraph {
+                decision_baseline_id: bastet_core::DecisionBaselineId::from_bytes([59; 16]),
+                nodes: vec![
+                    bastet_core::GraphNode {
+                        id: left,
+                        kind: bastet_core::GraphNodeKind::Research,
+                        role_id: RoleId::from_bytes([8; 16]),
+                        title: "Research A".into(),
+                        needs: vec![],
+                    },
+                    bastet_core::GraphNode {
+                        id: right,
+                        kind: bastet_core::GraphNodeKind::Research,
+                        role_id: RoleId::from_bytes([8; 16]),
+                        title: "Research B".into(),
+                        needs: vec![],
+                    },
+                    bastet_core::GraphNode {
+                        id: GraphNodeId::from_bytes([63; 16]),
+                        kind: bastet_core::GraphNodeKind::Join,
+                        role_id: RoleId::from_bytes([8; 16]),
+                        title: "Join".into(),
+                        needs: vec![left, right],
+                    },
+                ],
+            },
         )
         .unwrap()
     }
@@ -1591,6 +1808,40 @@ mod tests {
             store.events_after(0).unwrap().last().unwrap().event_type,
             "run.cancel_accepted"
         );
+    }
+
+    #[test]
+    fn graph_claim_is_revision_guarded_and_running_nodes_become_uncertain_on_restart() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("graph.db");
+        let store = Store::open(&path).unwrap();
+        let execution = graph_fixture();
+        let id = execution.id;
+        store.create_graph_execution(&execution).unwrap();
+        assert!(matches!(
+            store.create_graph_execution(&execution),
+            Err(StoreError::GraphConflict)
+        ));
+        let claimed = store.claim_graph_nodes(id, 0, "worker", 2).unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert!(matches!(
+            store.claim_graph_nodes(id, 0, "worker", 2),
+            Err(StoreError::RevisionConflict { .. })
+        ));
+        drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        let recovered = reopened.graph_execution(id).unwrap();
+        assert_eq!(recovered.revision, 2);
+        assert!(recovered
+            .nodes
+            .iter()
+            .take(2)
+            .all(|node| node.state == bastet_core::GraphNodeState::Uncertain));
+        assert!(reopened.events_after(0).unwrap().iter().any(|event| {
+            event.event_type == "graph.running_nodes_marked_uncertain"
+                && !event.payload_json.contains("worker")
+        }));
     }
 
     #[tokio::test]

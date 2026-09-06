@@ -29,4 +29,6 @@ verification evidence without adding scope.
   accessibility metadata and fail-closed relationship validation.
 - M3.2a started: bounded meeting and immutable, human-accepted DecisionBaseline contracts.
 - M3.3a started: validated two-branch research DAG and ownership-checked in-memory runtime with an
-  explicit join and failed-dependency blocking. Durable daemon persistence remains next.
+  explicit join and failed-dependency blocking.
+- M3.3b started: daemon schema v4 persists graph executions with compare-and-set revisions and
+  marks interrupted running nodes uncertain on restart without retaining worker identity in events.
