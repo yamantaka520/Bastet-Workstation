@@ -624,6 +624,8 @@ mod tests {
                 expected_m3_revision: 1,
                 project_name: "Client MVP".into(),
                 workspace_root: directory.path().to_string_lossy().into_owned(),
+                codex_model: "gpt-test".into(),
+                agy_model: "agy-test".into(),
             })
             .await
             .unwrap();

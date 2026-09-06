@@ -8,7 +8,7 @@ type ConnectionState = "connecting" | "ready" | "offline";
 type DaemonSnapshot = { protocol_version: number; daemon_id: string; revision: number; lifecycle: string };
 type ApprovalRecord = { request: { id: string; request_hash: string; expires_at_ms: number; action: { action_key: string; reason_key: string; consequence_key: string; risk: string } }; decision: { kind: "approve" | "deny" } | null };
 type ApprovalList = { protocol_version: number; records: ApprovalRecord[] };
-type AgentStatus = { adapter_kind: string; display_name: string; installed: boolean; version: string | null; authenticated: boolean | null; model_count: number | null; reasoning_controls: string[]; operations: string[]; error_key: string | null };
+type AgentStatus = { adapter_kind: string; display_name: string; installed: boolean; version: string | null; authenticated: boolean | null; model_count: number | null; models: string[]; reasoning_controls: string[]; operations: string[]; error_key: string | null };
 type AgentCenterSnapshot = { agents: AgentStatus[] };
 type WorkProjection = { revision: number; sessions: number; runs: { run_id: string; session_id: string; state: string; can_cancel: boolean }[] };
 type PetProfile = { metadata: { id: string }; name: string; version: number; states: { state_key: string; accessible_label_key: string }[] };
@@ -26,6 +26,8 @@ export function App() {
   const [m3, setM3] = useState<M3Projection>({ revision: 0, pet_profiles: [], pet_assignments: 0, rooms: 0, meetings: 0, documents: 0, costs: 0, graph_nodes: [], awaiting_meetings: [], document_versions: [], knowledge_deliveries: [] });
   const [projectName, setProjectName] = useState("");
   const [workspaceRoot, setWorkspaceRoot] = useState("");
+  const [codexModel, setCodexModel] = useState("");
+  const [agyModel, setAgyModel] = useState("");
   const [decision, setDecision] = useState("");
   const [documentTitle, setDocumentTitle] = useState("");
   const [documentMarkdown, setDocumentMarkdown] = useState("");
@@ -37,7 +39,10 @@ export function App() {
     try {
       const [next, list, agentList, workList, m3List] = await Promise.all([invoke<DaemonSnapshot>("daemon_snapshot"), invoke<ApprovalList>("approval_center_snapshot"), invoke<AgentCenterSnapshot>("agent_center_snapshot"), invoke<WorkProjection>("work_projection"), invoke<M3Projection>("m3_projection")]);
       if (next.protocol_version !== 1 || list.protocol_version !== 1) throw new Error("protocol mismatch");
-      setSnapshot(next); setApprovals(list.records); setAgents(agentList.agents); setWork(workList); setM3(m3List); setConnection("ready");
+      setSnapshot(next); setApprovals(list.records); setAgents(agentList.agents); setWork(workList); setM3(m3List);
+      setCodexModel((current) => current || agentList.agents.find((agent) => agent.adapter_kind === "codex_cli")?.models[0] || "");
+      setAgyModel((current) => current || agentList.agents.find((agent) => agent.adapter_kind === "agy_cli")?.models[0] || "");
+      setConnection("ready");
     } catch { setSnapshot(null); setConnection("offline"); }
   }, []);
   useEffect(() => { void reconnect(); const timer = window.setInterval(() => void reconnect(), 5_000); return () => window.clearInterval(timer); }, [reconnect]);
@@ -60,7 +65,7 @@ export function App() {
   };
   const prepareMvp = async () => {
     setActionError(false);
-    try { await invoke("prepare_mvp", { projectName, workspaceRoot }); await reconnect(); }
+    try { await invoke("prepare_mvp", { projectName, workspaceRoot, codexModel, agyModel }); await reconnect(); }
     catch { setActionError(true); }
   };
   const acceptDecision = async (meetingId: string) => {
@@ -99,7 +104,7 @@ export function App() {
       <article><h3>{translate(locale, "builtinPet")}: Bastet Cat</h3><p>{translate(locale, m3.pet_profiles.length ? "applied" : "notApplied")}</p>
         <ul className="pet-states">{["idle", "thinking", "working", "waiting", "blocked", "approval_required", "succeeded", "failed"].map((state) => <li key={state}><span aria-hidden="true">🐈</span><span>{state}</span></li>)}</ul>
         <button type="button" onClick={() => void changeBuiltinPet(m3.pet_profiles.length === 0)}>{translate(locale, m3.pet_profiles.length ? "rollbackPet" : "applyPet")}</button></article>
-      {m3.meetings === 0 && <form onSubmit={(event) => { event.preventDefault(); void prepareMvp(); }}><h3>{translate(locale, "prepareMvp")}</h3><label>{translate(locale, "projectName")}<input required value={projectName} onChange={(event) => setProjectName(event.target.value)} /></label><label>{translate(locale, "workspaceRoot")}<input required value={workspaceRoot} onChange={(event) => setWorkspaceRoot(event.target.value)} /></label><button type="submit">{translate(locale, "prepare")}</button></form>}
+      {m3.meetings === 0 && <form onSubmit={(event) => { event.preventDefault(); void prepareMvp(); }}><h3>{translate(locale, "prepareMvp")}</h3><label>{translate(locale, "projectName")}<input required value={projectName} onChange={(event) => setProjectName(event.target.value)} /></label><label>{translate(locale, "workspaceRoot")}<input required value={workspaceRoot} onChange={(event) => setWorkspaceRoot(event.target.value)} /></label><label>Codex {translate(locale, "models")}<select required value={codexModel} onChange={(event) => setCodexModel(event.target.value)}><option value="">—</option>{agents.find((agent) => agent.adapter_kind === "codex_cli")?.models.map((model) => <option key={model}>{model}</option>)}</select></label><label>Agy {translate(locale, "models")}<select required value={agyModel} onChange={(event) => setAgyModel(event.target.value)}><option value="">—</option>{agents.find((agent) => agent.adapter_kind === "agy_cli")?.models.map((model) => <option key={model}>{model}</option>)}</select></label><button type="submit">{translate(locale, "prepare")}</button></form>}
       {m3.awaiting_meetings.map((meeting) => <article key={meeting.meeting_id}><h3>{translate(locale, "decisionBaseline")}</h3><p>{meeting.summary}</p><label>{translate(locale, "decisionBaseline")}<textarea required value={decision} onChange={(event) => setDecision(event.target.value)} /></label><button type="button" disabled={!decision.trim()} onClick={() => void acceptDecision(meeting.meeting_id)}>{translate(locale, "acceptDecision")}</button></article>)}
       {completedExecution && m3.document_versions.length === 0 && <form onSubmit={(event) => { event.preventDefault(); void createDocument(); }}><label>{translate(locale, "documentTitle")}<input required value={documentTitle} onChange={(event) => setDocumentTitle(event.target.value)} /></label><label>{translate(locale, "documentMarkdown")}<textarea required value={documentMarkdown} onChange={(event) => setDocumentMarkdown(event.target.value)} /></label><button type="submit">{translate(locale, "createDocument")}</button></form>}
       {m3.document_versions.map((document) => <article key={document.version_id}><h3>{document.title}</h3><pre>{document.markdown}</pre><code>{document.content_hash}</code>{document.accepted ? <><p>{translate(locale, "approved")}</p><div className="actions"><button type="button" onClick={() => void prepareKnowledge(document, "agent_memory_os")}>{translate(locale, "prepareMemory")}</button><button type="button" onClick={() => void prepareKnowledge(document, "bastet_mind")}>{translate(locale, "prepareMind")}</button></div></> : <button type="button" onClick={() => void acceptDocument(document)}>{translate(locale, "acceptDocument")}</button>}</article>)}

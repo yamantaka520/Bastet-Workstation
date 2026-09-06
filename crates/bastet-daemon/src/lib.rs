@@ -671,8 +671,13 @@ impl Store {
     }
 
     pub fn prepare_mvp(&self, command: PrepareMvpCommand) -> Result<PrepareMvpReceipt, StoreError> {
-        let draft = MvpDraft::prepare(&command.project_name, Path::new(&command.workspace_root))
-            .map_err(|error| StoreError::InvalidMvp(error.to_string()))?;
+        let draft = MvpDraft::prepare(
+            &command.project_name,
+            Path::new(&command.workspace_root),
+            &command.codex_model,
+            &command.agy_model,
+        )
+        .map_err(|error| StoreError::InvalidMvp(error.to_string()))?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let catalog_revision: u64 = transaction.query_row(
@@ -3096,6 +3101,8 @@ mod tests {
                 expected_m3_revision: 0,
                 project_name: "MVP fixture".into(),
                 workspace_root: workspace.path().to_string_lossy().into_owned(),
+                codex_model: "gpt-test".into(),
+                agy_model: "agy-test".into(),
             })
             .unwrap();
         assert_eq!((prepared.catalog_revision, prepared.m3_revision), (1, 1));
@@ -3105,6 +3112,8 @@ mod tests {
                 expected_m3_revision: 1,
                 project_name: "replacement".into(),
                 workspace_root: workspace.path().to_string_lossy().into_owned(),
+                codex_model: "gpt-test".into(),
+                agy_model: "agy-test".into(),
             }),
             Err(StoreError::InvalidMvp(_))
         ));

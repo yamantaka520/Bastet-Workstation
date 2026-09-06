@@ -36,6 +36,7 @@ struct AgentStatus {
     version: Option<String>,
     authenticated: Option<bool>,
     model_count: Option<usize>,
+    models: Vec<String>,
     reasoning_controls: Vec<String>,
     operations: Vec<String>,
     error_key: Option<&'static str>,
@@ -127,6 +128,8 @@ async fn prepare_mvp(
     client: State<'_, DaemonClient>,
     project_name: String,
     workspace_root: String,
+    codex_model: String,
+    agy_model: String,
 ) -> Result<bastet_protocol::PrepareMvpReceipt, String> {
     let identity = client.catalog().await.map_err(|error| error.to_string())?;
     let m3 = client
@@ -139,6 +142,8 @@ async fn prepare_mvp(
             expected_m3_revision: m3.revision,
             project_name,
             workspace_root,
+            codex_model,
+            agy_model,
         })
         .await
         .map_err(|error| error.to_string())
@@ -501,6 +506,11 @@ fn inspect_codex() -> AgentStatus {
         .authentication_status()
         .ok()
         .map(|status| status.authenticated);
+    let models: Vec<String> = adapter
+        .connect_app_server(std::time::Duration::from_secs(10))
+        .and_then(|mut server| server.list_models(None, 100))
+        .map(|page| page.models.into_iter().map(|model| model.model).collect())
+        .unwrap_or_default();
     let capabilities = adapter.capabilities();
     AgentStatus {
         adapter_kind: "codex_cli",
@@ -508,7 +518,8 @@ fn inspect_codex() -> AgentStatus {
         installed: true,
         version,
         authenticated,
-        model_count: None,
+        model_count: Some(models.len()),
+        models,
         reasoning_controls: capabilities.reasoning_controls,
         operations: capabilities
             .operations
@@ -525,7 +536,10 @@ fn inspect_agy() -> AgentStatus {
     };
     let adapter = bastet_adapter_agy::AgyAdapter::new(path);
     let version = adapter.version().ok().map(|report| report.version);
-    let model_count = adapter.list_models().ok().map(|models| models.len());
+    let models = adapter
+        .list_models()
+        .map(|models| models.into_iter().map(|model| model.id).collect::<Vec<_>>())
+        .unwrap_or_default();
     let capabilities = adapter.capabilities();
     AgentStatus {
         adapter_kind: "agy_cli",
@@ -533,7 +547,8 @@ fn inspect_agy() -> AgentStatus {
         installed: true,
         version,
         authenticated: None,
-        model_count,
+        model_count: Some(models.len()),
+        models,
         reasoning_controls: capabilities.reasoning_controls,
         operations: capabilities
             .operations
@@ -552,6 +567,7 @@ fn missing_agent(adapter_kind: &'static str, display_name: &'static str) -> Agen
         version: None,
         authenticated: None,
         model_count: None,
+        models: Vec::new(),
         reasoning_controls: Vec::new(),
         operations: Vec::new(),
         error_key: Some("agent.binary_missing"),

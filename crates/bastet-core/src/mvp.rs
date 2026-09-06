@@ -25,10 +25,17 @@ pub enum MvpError {
 }
 
 impl MvpDraft {
-    pub fn prepare(project_name: &str, workspace_root: &Path) -> Result<Self, MvpError> {
+    pub fn prepare(
+        project_name: &str,
+        workspace_root: &Path,
+        codex_model: &str,
+        agy_model: &str,
+    ) -> Result<Self, MvpError> {
         if project_name.trim().is_empty()
             || !workspace_root.is_absolute()
             || !workspace_root.is_dir()
+            || codex_model.trim().is_empty()
+            || agy_model.trim().is_empty()
         {
             return Err(MvpError::InvalidProject);
         }
@@ -78,13 +85,13 @@ impl MvpDraft {
                 Model {
                     metadata: metadata(codex_model_id),
                     model_provider_id: openai_provider_id,
-                    provider_model_id: "configured-codex-model".into(),
+                    provider_model_id: codex_model.trim().into(),
                     reasoning_controls: vec!["low".into(), "medium".into(), "high".into()],
                 },
                 Model {
                     metadata: metadata(agy_model_id),
                     model_provider_id: agy_model_provider_id,
-                    provider_model_id: "configured-agy-model".into(),
+                    provider_model_id: agy_model.trim().into(),
                     reasoning_controls: vec!["low".into(), "medium".into(), "high".into()],
                 },
             ],
@@ -369,7 +376,7 @@ mod tests {
     #[test]
     fn mvp_draft_requires_human_decision_before_graph_exists() {
         let root = tempfile::tempdir().unwrap();
-        let mut draft = MvpDraft::prepare("MVP", root.path()).unwrap();
+        let mut draft = MvpDraft::prepare("MVP", root.path(), "gpt-test", "agy-test").unwrap();
         assert!(draft.m3.meetings.decision_baselines.is_empty());
         let execution = draft
             .accept_decision(

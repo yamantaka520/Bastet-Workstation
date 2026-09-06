@@ -110,6 +110,8 @@ pub struct PrepareMvpCommand {
     pub expected_m3_revision: u64,
     pub project_name: String,
     pub workspace_root: String,
+    pub codex_model: String,
+    pub agy_model: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

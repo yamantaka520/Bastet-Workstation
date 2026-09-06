@@ -9,7 +9,7 @@ const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 const defaultInvoke = (command: string) => Promise.resolve(command === "approval_center_snapshot"
     ? { protocol_version: 1, records: [] }
     : command === "agent_center_snapshot"
-      ? { agents: [{ adapter_kind: "codex_cli", display_name: "Codex CLI", installed: true, version: "1.0.0", authenticated: true, model_count: 2, reasoning_controls: ["low", "high"], operations: ["start", "cancel"], error_key: null }] }
+      ? { agents: [{ adapter_kind: "codex_cli", display_name: "Codex CLI", installed: true, version: "1.0.0", authenticated: true, model_count: 2, models: ["gpt-test"], reasoning_controls: ["low", "high"], operations: ["start", "cancel"], error_key: null }] }
       : command === "work_projection"
         ? { revision: 3, sessions: 1, runs: [] }
       : command === "m3_projection"
