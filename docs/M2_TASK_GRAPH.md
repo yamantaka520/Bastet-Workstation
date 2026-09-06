@@ -128,4 +128,10 @@ verification status; it does not add scope.
   verified execution boundaries (start, attach/resume, status/wait, cancel, usage export,
   read-only, bounded write, and structured events); installation and interactive authentication
   remain undeclared. A real model-list canary passed through this production connection boundary.
-- M2.4–M2.8: not started.
+- M2.4 Agy CLI reference adapter: in progress. Read-only local discovery established that Agy
+  1.1.25 exposes a single-line version and a tab-delimited model catalog. The initial adapter
+  boundary accepts only numeric triplet versions and allowlisted non-empty model records, fails
+  closed on malformed output, and deliberately withholds execution capabilities until its
+  stream/event contract is normalized and tested. An explicit real-CLI canary passed version and
+  non-empty catalog inspection against the installed Agy 1.1.25 binary.
+- M2.5–M2.8: not started.
