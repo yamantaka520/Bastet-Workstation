@@ -223,6 +223,20 @@ pub struct KnowledgeDeliveryReceipt {
     pub event_sequence: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordCostCommand {
+    pub expected_m3_revision: u64,
+    pub record: bastet_core::CostLedgerRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CostReceipt {
+    pub protocol_version: u32,
+    pub cost_record_id: bastet_core::CostRecordId,
+    pub m3_revision: u64,
+    pub event_sequence: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateApprovalCommand {
     pub request: ApprovalRequest,

@@ -24,12 +24,12 @@ use bastet_protocol::{
     ApprovalList, ApprovalReceipt, ApprovalRecord, CancelRunReceipt, CatalogReceipt,
     CatalogSnapshot, CheckpointCommand, CheckpointReceipt, ClaimGraphNodesCommand,
     ClaimGraphNodesReceipt, CompleteGraphNodeCommand, CompleteGraphNodeReceipt,
-    CompleteKnowledgeDeliveryCommand, CreateApprovalCommand, CreateDocumentCommand,
+    CompleteKnowledgeDeliveryCommand, CostReceipt, CreateApprovalCommand, CreateDocumentCommand,
     CreateGraphExecutionCommand, DaemonLifecycle, DaemonSnapshot, DecideApprovalCommand,
     DocumentReceipt, EventEnvelope, GraphExecutionList, GraphExecutionReceipt,
     KnowledgeDeliveryReceipt, M3CatalogSnapshot, PrepareKnowledgeDeliveryCommand,
-    PrepareMvpCommand, PrepareMvpReceipt, ReplaceCatalogCommand, ReplaceM3CatalogCommand,
-    PROTOCOL_VERSION,
+    PrepareMvpCommand, PrepareMvpReceipt, RecordCostCommand, ReplaceCatalogCommand,
+    ReplaceM3CatalogCommand, PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
@@ -80,6 +80,8 @@ pub enum StoreError {
     InvalidMvp(String),
     #[error("document workflow is invalid: {0}")]
     InvalidDocument(String),
+    #[error("cost evidence is invalid: {0}")]
+    InvalidCost(String),
     #[error("graph execution was not found")]
     GraphNotFound,
     #[error("graph execution already exists")]
@@ -216,6 +218,7 @@ fn build_router_with_controller(
             "/v1/mvp/knowledge/complete",
             post(complete_knowledge_delivery),
         )
+        .route("/v1/mvp/costs", post(record_cost))
         .route("/v1/approvals", get(approvals).post(create_approval))
         .route(
             "/v1/approvals/{request_id}",
@@ -393,6 +396,13 @@ async fn complete_knowledge_delivery(
     Ok(Json(state.store.complete_knowledge_delivery(command)?))
 }
 
+async fn record_cost(
+    State(state): State<AppState>,
+    Json(command): Json<RecordCostCommand>,
+) -> Result<Json<CostReceipt>, ApiError> {
+    Ok(Json(state.store.record_cost(command)?))
+}
+
 async fn create_approval(
     State(state): State<AppState>,
     Json(command): Json<CreateApprovalCommand>,
@@ -475,6 +485,7 @@ impl axum::response::IntoResponse for ApiError {
             | StoreError::InvalidM3(_)
             | StoreError::InvalidMvp(_)
             | StoreError::InvalidDocument(_)
+            | StoreError::InvalidCost(_)
             | StoreError::Serialization(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -1072,6 +1083,63 @@ impl Store {
             protocol_version: PROTOCOL_VERSION,
             delivery_id: command.delivery_id,
             state,
+            m3_revision: revision,
+            event_sequence: event.sequence,
+        })
+    }
+
+    pub fn record_cost(&self, command: RecordCostCommand) -> Result<CostReceipt, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let identity: IdentityCatalog =
+            serde_json::from_str(&transaction.query_row::<String, _, _>(
+                "SELECT catalog_json FROM identity_catalog WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?)?;
+        let (actual, json): (u64, String) = transaction.query_row(
+            "SELECT revision, catalog_json FROM m3_catalog WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if actual != command.expected_m3_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: command.expected_m3_revision,
+                actual,
+            });
+        }
+        let mut catalog: M3Catalog = serde_json::from_str(&json)?;
+        if catalog
+            .deliverables
+            .costs
+            .iter()
+            .any(|record| record.metadata.id == command.record.metadata.id)
+        {
+            return Err(StoreError::InvalidCost("duplicate cost record id".into()));
+        }
+        let cost_record_id = command.record.metadata.id;
+        catalog.deliverables.costs.push(command.record);
+        let executions = load_graph_executions(&transaction)?;
+        M3State {
+            catalog: catalog.clone(),
+            graph_executions: executions,
+        }
+        .validate(&identity)
+        .map_err(|error| StoreError::InvalidCost(error.to_string()))?;
+        let revision = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
+        transaction.execute(
+            "UPDATE m3_catalog SET revision=?1, catalog_json=?2, updated_at=?3 WHERE singleton=1",
+            params![revision, serde_json::to_string(&catalog)?, timestamp()],
+        )?;
+        let event = insert_event(
+            &transaction,
+            "cost.recorded",
+            &serde_json::json!({"cost_record_id": cost_record_id}).to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(CostReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            cost_record_id,
             m3_revision: revision,
             event_sequence: event.sequence,
         })
@@ -1976,10 +2044,11 @@ mod tests {
     use bastet_core::{
         Account, AccountId, AgentInstance, AgentInstanceId, AgentProvider, AgentProviderId,
         ApprovalAction, ApprovalDecision, ApprovalDecisionKind, ApprovalRequest, ApprovalRequestId,
-        ApprovalRisk, ApprovalScope, CredentialBackend, CredentialReference, CredentialReferenceId,
-        EntityLifecycle, EntityMetadata, Model, ModelId, ModelProvider, ModelProviderId,
-        PermissionLevel, PolicyCeiling, PolicyLayer, Project, ProjectId, Provenance, Role, RoleId,
-        Run, RunId, ScopedPolicy, Session, SessionId,
+        ApprovalRisk, ApprovalScope, CostLedgerRecord, CostRecordId, CredentialBackend,
+        CredentialReference, CredentialReferenceId, EntityLifecycle, EntityMetadata, EvidenceClass,
+        Model, ModelId, ModelProvider, ModelProviderId, PermissionLevel, PolicyCeiling,
+        PolicyLayer, Project, ProjectId, Provenance, Role, RoleId, Run, RunId, ScopedPolicy,
+        Session, SessionId,
     };
     use tempfile::tempdir;
     use tower::ServiceExt;
@@ -2696,6 +2765,31 @@ mod tests {
             .unwrap();
         assert_eq!(accepted.m3_revision, 2);
         let execution_id = accepted.graph_execution_id;
+        let mut identity = store.catalog().unwrap().catalog;
+        let agent_instance_id = identity.agent_instances[0].metadata.id;
+        let model_id = identity.models[0].metadata.id;
+        let session_id = SessionId::new();
+        let run_id = RunId::new();
+        identity.sessions.push(Session {
+            metadata: metadata(session_id),
+            agent_instance_id,
+            project_id: prepared.project_id,
+            provider_session_id: Some("mvp-session-fixture".into()),
+        });
+        identity.runs.push(Run {
+            metadata: metadata(run_id),
+            session_id,
+            model_id,
+            state: bastet_core::NormalizedRunState::Succeeded,
+            started_at: Some("2026-09-07T00:00:01Z".into()),
+            finished_at: Some("2026-09-07T00:00:02Z".into()),
+        });
+        store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: 1,
+                catalog: identity,
+            })
+            .unwrap();
         let branches = store
             .claim_graph_nodes(execution_id, 0, "research", 2)
             .unwrap();
@@ -2757,13 +2851,37 @@ mod tests {
                 preview: "Redacted accepted report summary".into(),
             })
             .unwrap();
-        store
+        let wiki = store
             .complete_knowledge_delivery(CompleteKnowledgeDeliveryCommand {
                 expected_m3_revision: wiki.m3_revision,
                 delivery_id: wiki.delivery_id,
                 destination_receipt: "bastetmind:fixture".into(),
             })
             .unwrap();
+        let cost = store
+            .record_cost(RecordCostCommand {
+                expected_m3_revision: wiki.m3_revision,
+                record: CostLedgerRecord {
+                    metadata: metadata(CostRecordId::new()),
+                    project_id: prepared.project_id,
+                    node_id: store.graph_execution(execution_id).unwrap().nodes[0].node_id,
+                    run_id,
+                    provider: "codex_cli".into(),
+                    account: "local-default".into(),
+                    model: "provider-reported-model".into(),
+                    currency: None,
+                    amount: None,
+                    input_tokens: Some(120),
+                    output_tokens: Some(30),
+                    evidence_class: EvidenceClass::ProviderReported,
+                    source: "codex app-server usage event".into(),
+                    formula_version: None,
+                    confidence: 1.0,
+                    reconciliation_state: "observed".into(),
+                },
+            })
+            .unwrap();
+        assert_eq!(cost.m3_revision, wiki.m3_revision + 1);
         drop(store);
 
         let reopened = Store::open(&path).unwrap();
@@ -2796,6 +2914,16 @@ mod tests {
             .knowledge_deliveries
             .iter()
             .all(|delivery| delivery.state == bastet_core::DeliveryState::Delivered));
+        assert_eq!(
+            reopened
+                .m3_catalog()
+                .unwrap()
+                .catalog
+                .deliverables
+                .costs
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

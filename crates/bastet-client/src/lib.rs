@@ -6,11 +6,11 @@ use bastet_protocol::{
     ApprovalList, ApprovalReceipt, ApprovalRecord, CancelRunCommand, CancelRunReceipt,
     CatalogReceipt, CatalogSnapshot, CheckpointCommand, CheckpointReceipt, ClaimGraphNodesCommand,
     ClaimGraphNodesReceipt, CompleteGraphNodeCommand, CompleteGraphNodeReceipt,
-    CompleteKnowledgeDeliveryCommand, CreateApprovalCommand, CreateDocumentCommand,
+    CompleteKnowledgeDeliveryCommand, CostReceipt, CreateApprovalCommand, CreateDocumentCommand,
     CreateGraphExecutionCommand, DaemonSnapshot, DecideApprovalCommand, DocumentReceipt,
     EventEnvelope, GraphExecutionList, GraphExecutionReceipt, KnowledgeDeliveryReceipt,
     M3CatalogSnapshot, PrepareKnowledgeDeliveryCommand, PrepareMvpCommand, PrepareMvpReceipt,
-    ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
+    RecordCostCommand, ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -298,6 +298,23 @@ impl DaemonClient {
             .await?
             .error_for_status()?
             .json::<KnowledgeDeliveryReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
+    pub async fn record_cost(
+        &self,
+        command: RecordCostCommand,
+    ) -> Result<CostReceipt, ClientError> {
+        let receipt = self
+            .http
+            .post(format!("{}/v1/mvp/costs", self.base_url))
+            .json(&command)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<CostReceipt>()
             .await?;
         require_protocol(receipt.protocol_version)?;
         Ok(receipt)
