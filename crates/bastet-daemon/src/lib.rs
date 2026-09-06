@@ -57,6 +57,8 @@ pub enum StoreError {
     RunNotFound,
     #[error("run cannot be cancelled from state {0}")]
     InvalidRunState(String),
+    #[error("provider run controller rejected cancellation")]
+    RunControlRejected,
 }
 
 #[derive(Clone)]
@@ -68,6 +70,22 @@ pub struct Store {
 struct AppState {
     store: Store,
     shutdown: Option<watch::Sender<bool>>,
+    run_controller: Arc<dyn RunController>,
+}
+
+pub trait RunController: Send + Sync + 'static {
+    fn cancel(&self, run_id: RunId) -> Result<(), RunControlError>;
+}
+
+#[derive(Debug, Error)]
+#[error("provider run controller rejected cancellation")]
+pub struct RunControlError;
+
+struct UnavailableRunController;
+impl RunController for UnavailableRunController {
+    fn cancel(&self, _run_id: RunId) -> Result<(), RunControlError> {
+        Err(RunControlError)
+    }
 }
 
 #[derive(Deserialize)]
@@ -85,6 +103,18 @@ pub fn router_with_shutdown(store: Store, shutdown_signal: watch::Sender<bool>) 
 }
 
 fn build_router(store: Store, shutdown_signal: Option<watch::Sender<bool>>) -> Router {
+    build_router_with_controller(store, shutdown_signal, Arc::new(UnavailableRunController))
+}
+
+pub fn router_with_run_controller(store: Store, run_controller: Arc<dyn RunController>) -> Router {
+    build_router_with_controller(store, None, run_controller)
+}
+
+fn build_router_with_controller(
+    store: Store,
+    shutdown_signal: Option<watch::Sender<bool>>,
+    run_controller: Arc<dyn RunController>,
+) -> Router {
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/events", get(events))
@@ -98,10 +128,31 @@ fn build_router(store: Store, shutdown_signal: Option<watch::Sender<bool>>) -> R
         .route("/v1/power/suspend", post(suspend))
         .route("/v1/power/resume", post(resume))
         .route("/v1/shutdown", post(shutdown))
+        .route("/v1/runs/{run_id}/cancel", post(cancel_run))
         .with_state(AppState {
             store,
             shutdown: shutdown_signal,
+            run_controller,
         })
+}
+
+async fn cancel_run(
+    State(state): State<AppState>,
+    AxumPath(run_id): AxumPath<Uuid>,
+    Json(command): Json<bastet_protocol::CancelRunCommand>,
+) -> Result<Json<CancelRunReceipt>, ApiError> {
+    let path_id = RunId::from_bytes(*run_id.as_bytes());
+    if path_id != command.run_id {
+        return Err(StoreError::RunNotFound.into());
+    }
+    state
+        .run_controller
+        .cancel(path_id)
+        .map_err(|_| StoreError::RunControlRejected)?;
+    Ok(Json(state.store.record_provider_cancel_accepted(
+        path_id,
+        command.expected_catalog_revision,
+    )?))
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<DaemonSnapshot>, ApiError> {
