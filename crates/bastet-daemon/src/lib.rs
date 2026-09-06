@@ -20,8 +20,8 @@ use bastet_core::{
 use bastet_protocol::{
     ApprovalList, ApprovalReceipt, ApprovalRecord, CancelRunReceipt, CatalogReceipt,
     CatalogSnapshot, CheckpointCommand, CheckpointReceipt, CreateApprovalCommand, DaemonLifecycle,
-    DaemonSnapshot, DecideApprovalCommand, EventEnvelope, M3CatalogSnapshot, ReplaceCatalogCommand,
-    ReplaceM3CatalogCommand, PROTOCOL_VERSION,
+    DaemonSnapshot, DecideApprovalCommand, EventEnvelope, GraphExecutionList, M3CatalogSnapshot,
+    ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
@@ -180,6 +180,7 @@ fn build_router_with_controller(
         .route("/v1/events", get(events))
         .route("/v1/catalog", get(catalog).put(replace_catalog))
         .route("/v1/m3", get(m3_catalog).put(replace_m3_catalog))
+        .route("/v1/graphs", get(graph_executions))
         .route("/v1/approvals", get(approvals).post(create_approval))
         .route(
             "/v1/approvals/{request_id}",
@@ -254,6 +255,15 @@ async fn replace_m3_catalog(
     Json(command): Json<ReplaceM3CatalogCommand>,
 ) -> Result<Json<CatalogReceipt>, ApiError> {
     Ok(Json(state.store.replace_m3_catalog(command)?))
+}
+
+async fn graph_executions(
+    State(state): State<AppState>,
+) -> Result<Json<GraphExecutionList>, ApiError> {
+    Ok(Json(GraphExecutionList {
+        protocol_version: PROTOCOL_VERSION,
+        executions: state.store.graph_executions()?,
+    }))
 }
 
 async fn create_approval(
@@ -645,6 +655,22 @@ impl Store {
             serde_json::from_str(&json.ok_or(StoreError::GraphNotFound)?)?;
         execution.validate()?;
         Ok(execution)
+    }
+
+    pub fn graph_executions(&self) -> Result<Vec<GraphExecution>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT execution_json FROM graph_executions ORDER BY updated_at, execution_id",
+        )?;
+        let executions = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|row| {
+                let execution: GraphExecution = serde_json::from_str(&row?)?;
+                execution.validate()?;
+                Ok(execution)
+            })
+            .collect();
+        executions
     }
 
     pub fn claim_graph_nodes(

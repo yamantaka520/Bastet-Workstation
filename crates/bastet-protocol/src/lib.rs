@@ -1,7 +1,8 @@
 //! Shared wire types. The daemon is authoritative; clients only project this state.
 
 use bastet_core::{
-    ApprovalDecision, ApprovalRequest, ApprovalRequestId, IdentityCatalog, M3Catalog, RunId,
+    ApprovalDecision, ApprovalRequest, ApprovalRequestId, GraphExecution, IdentityCatalog,
+    M3Catalog, RunId,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -82,6 +83,12 @@ pub struct M3CatalogSnapshot {
 pub struct ReplaceM3CatalogCommand {
     pub expected_revision: u64,
     pub catalog: M3Catalog,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphExecutionList {
+    pub protocol_version: u32,
+    pub executions: Vec<GraphExecution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

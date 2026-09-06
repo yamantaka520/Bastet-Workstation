@@ -42,3 +42,6 @@ verification evidence without adding scope.
   its dedicated authority table to avoid dual writes.
 - M3.4a provides a five-locale Office projection with an eight-state accessible first-party Pet
   preview plus revision-guarded apply and rollback; rollback fails closed while assigned.
+- M3.4b projects persisted graph-node lifecycle into role-work Pet states (`idle`, `working`,
+  `succeeded`, `failed`, `blocked`, or restart-safe `waiting`) through the daemon/client boundary;
+  visual icons remain supplemental to visible and screen-reader text.

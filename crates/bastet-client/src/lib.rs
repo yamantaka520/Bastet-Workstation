@@ -4,8 +4,8 @@ use bastet_core::{ApprovalDecision, ApprovalRequest, ApprovalRequestId, Identity
 use bastet_protocol::{
     ApprovalList, ApprovalReceipt, ApprovalRecord, CancelRunCommand, CancelRunReceipt,
     CatalogReceipt, CatalogSnapshot, CheckpointCommand, CheckpointReceipt, CreateApprovalCommand,
-    DaemonSnapshot, DecideApprovalCommand, EventEnvelope, M3CatalogSnapshot, ReplaceCatalogCommand,
-    ReplaceM3CatalogCommand, PROTOCOL_VERSION,
+    DaemonSnapshot, DecideApprovalCommand, EventEnvelope, GraphExecutionList, M3CatalogSnapshot,
+    ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -120,6 +120,19 @@ impl DaemonClient {
             .await?;
         require_protocol(snapshot.protocol_version)?;
         Ok(snapshot)
+    }
+
+    pub async fn graph_executions(&self) -> Result<GraphExecutionList, ClientError> {
+        let list = self
+            .http
+            .get(format!("{}/v1/graphs", self.base_url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<GraphExecutionList>()
+            .await?;
+        require_protocol(list.protocol_version)?;
+        Ok(list)
     }
 
     pub async fn replace_m3_catalog(

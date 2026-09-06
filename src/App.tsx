@@ -12,7 +12,7 @@ type AgentStatus = { adapter_kind: string; display_name: string; installed: bool
 type AgentCenterSnapshot = { agents: AgentStatus[] };
 type WorkProjection = { revision: number; sessions: number; runs: { run_id: string; session_id: string; state: string; can_cancel: boolean }[] };
 type PetProfile = { metadata: { id: string }; name: string; version: number; states: { state_key: string; accessible_label_key: string }[] };
-type M3Projection = { revision: number; pet_profiles: PetProfile[]; pet_assignments: number; rooms: number; meetings: number; documents: number; costs: number };
+type M3Projection = { revision: number; pet_profiles: PetProfile[]; pet_assignments: number; rooms: number; meetings: number; documents: number; costs: number; graph_nodes: { title: string; state: string; pet_state: string }[] };
 type View = "office" | "agents" | "approvals" | "diagnostics";
 
 export function App() {
@@ -23,7 +23,7 @@ export function App() {
   const [approvals, setApprovals] = useState<ApprovalRecord[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
   const [work, setWork] = useState<WorkProjection>({ revision: 0, sessions: 0, runs: [] });
-  const [m3, setM3] = useState<M3Projection>({ revision: 0, pet_profiles: [], pet_assignments: 0, rooms: 0, meetings: 0, documents: 0, costs: 0 });
+  const [m3, setM3] = useState<M3Projection>({ revision: 0, pet_profiles: [], pet_assignments: 0, rooms: 0, meetings: 0, documents: 0, costs: 0, graph_nodes: [] });
   const [actionError, setActionError] = useState(false);
   const [autostart, setAutostart] = useState(false);
 
@@ -66,7 +66,8 @@ export function App() {
       <dl><dt>{translate(locale, "revision")}</dt><dd>{m3.revision}</dd><dt>{translate(locale, "rooms")}</dt><dd>{m3.rooms}</dd><dt>{translate(locale, "meetings")}</dt><dd>{m3.meetings}</dd><dt>{translate(locale, "documents")}</dt><dd>{m3.documents}</dd><dt>{translate(locale, "costs")}</dt><dd>{m3.costs}</dd></dl>
       <article><h3>{translate(locale, "builtinPet")}: Bastet Cat</h3><p>{translate(locale, m3.pet_profiles.length ? "applied" : "notApplied")}</p>
         <ul className="pet-states">{["idle", "thinking", "working", "waiting", "blocked", "approval_required", "succeeded", "failed"].map((state) => <li key={state}><span aria-hidden="true">🐈</span><span>{state}</span></li>)}</ul>
-        <button type="button" onClick={() => void changeBuiltinPet(m3.pet_profiles.length === 0)}>{translate(locale, m3.pet_profiles.length ? "rollbackPet" : "applyPet")}</button></article></section>}
+        <button type="button" onClick={() => void changeBuiltinPet(m3.pet_profiles.length === 0)}>{translate(locale, m3.pet_profiles.length ? "rollbackPet" : "applyPet")}</button></article>
+      {m3.graph_nodes.length > 0 && <ul>{m3.graph_nodes.map((node) => <li key={`${node.title}-${node.state}`}><span aria-hidden="true">🐈</span> {node.title} — {node.state} <span className="sr-only">{node.pet_state}</span></li>)}</ul>}</section>}
 
     {view === "agents" && <section aria-labelledby="agents-heading"><h2 id="agents-heading">{translate(locale, "agents")}</h2><p>{translate(locale, "agentHelp")}</p>
       <div className="card-grid">{agents.map((agent) => <article key={agent.adapter_kind}><h3>{agent.display_name}</h3><span className="badge">{translate(locale, agent.installed ? "installed" : "notInstalled")}</span>

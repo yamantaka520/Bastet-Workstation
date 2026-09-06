@@ -70,6 +70,14 @@ struct M3Projection {
     meetings: usize,
     documents: usize,
     costs: usize,
+    graph_nodes: Vec<GraphNodeProjection>,
+}
+
+#[derive(Serialize)]
+struct GraphNodeProjection {
+    title: String,
+    state: String,
+    pet_state: &'static str,
 }
 
 #[tauri::command]
@@ -78,7 +86,11 @@ async fn m3_projection(client: State<'_, DaemonClient>) -> Result<M3Projection, 
         .m3_catalog()
         .await
         .map_err(|error| error.to_string())?;
-    Ok(project_m3(snapshot))
+    let graphs = client
+        .graph_executions()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(project_m3(snapshot, graphs.executions))
 }
 
 #[tauri::command]
@@ -108,7 +120,11 @@ async fn apply_builtin_pet(client: State<'_, DaemonClient>) -> Result<M3Projecti
         .m3_catalog()
         .await
         .map_err(|error| error.to_string())?;
-    Ok(project_m3(updated))
+    let graphs = client
+        .graph_executions()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(project_m3(updated, graphs.executions))
 }
 
 #[tauri::command]
@@ -146,10 +162,34 @@ async fn rollback_builtin_pet(client: State<'_, DaemonClient>) -> Result<M3Proje
         .m3_catalog()
         .await
         .map_err(|error| error.to_string())?;
-    Ok(project_m3(updated))
+    let graphs = client
+        .graph_executions()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(project_m3(updated, graphs.executions))
 }
 
-fn project_m3(snapshot: bastet_protocol::M3CatalogSnapshot) -> M3Projection {
+fn project_m3(
+    snapshot: bastet_protocol::M3CatalogSnapshot,
+    executions: Vec<bastet_core::GraphExecution>,
+) -> M3Projection {
+    let graph_nodes = executions
+        .into_iter()
+        .flat_map(|execution| {
+            execution.nodes.into_iter().filter_map(move |node| {
+                let definition = execution
+                    .graph
+                    .nodes
+                    .iter()
+                    .find(|definition| definition.id == node.node_id)?;
+                Some(GraphNodeProjection {
+                    title: definition.title.clone(),
+                    state: format!("{:?}", node.state).to_lowercase(),
+                    pet_state: pet_state(node.state),
+                })
+            })
+        })
+        .collect();
     M3Projection {
         revision: snapshot.revision,
         pet_profiles: snapshot.catalog.office.pet_profiles,
@@ -158,6 +198,18 @@ fn project_m3(snapshot: bastet_protocol::M3CatalogSnapshot) -> M3Projection {
         meetings: snapshot.catalog.meetings.meetings.len(),
         documents: snapshot.catalog.deliverables.documents.len(),
         costs: snapshot.catalog.deliverables.costs.len(),
+        graph_nodes,
+    }
+}
+
+fn pet_state(state: bastet_core::GraphNodeState) -> &'static str {
+    match state {
+        bastet_core::GraphNodeState::Pending => "idle",
+        bastet_core::GraphNodeState::Running => "working",
+        bastet_core::GraphNodeState::Succeeded => "succeeded",
+        bastet_core::GraphNodeState::Failed => "failed",
+        bastet_core::GraphNodeState::Blocked => "blocked",
+        bastet_core::GraphNodeState::Uncertain => "waiting",
     }
 }
 

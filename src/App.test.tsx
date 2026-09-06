@@ -13,7 +13,7 @@ const defaultInvoke = (command: string) => Promise.resolve(command === "approval
       : command === "work_projection"
         ? { revision: 3, sessions: 1, runs: [] }
       : command === "m3_projection"
-        ? { revision: 0, pet_profiles: [], pet_assignments: 0, rooms: 0, meetings: 0, documents: 0, costs: 0 }
+        ? { revision: 0, pet_profiles: [], pet_assignments: 0, rooms: 0, meetings: 0, documents: 0, costs: 0, graph_nodes: [] }
       : { protocol_version: 1, daemon_id: "test-daemon", revision: 7, lifecycle: "ready" });
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
