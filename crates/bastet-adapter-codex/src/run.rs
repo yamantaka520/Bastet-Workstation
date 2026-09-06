@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use bastet_core::{NormalizedRunState, RunId};
 use thiserror::Error;
 
+use crate::app_server::CodexFinalOutput;
 use crate::{
     AppServerError, AppServerTransport, ApprovalPolicy, CodexAppServer, CodexRunEvidence,
     CodexRunEvidenceUpdate, CodexRunStream, CodexRunUpdate, EvidenceError, LifecycleError,
@@ -47,6 +48,7 @@ pub struct CodexRunTracker {
     before: Option<WorkspaceSnapshot>,
     provider_write_receipt: bool,
     pending_terminal: Option<CodexRunUpdate>,
+    final_output: CodexFinalOutput,
 }
 
 impl CodexRunTracker {
@@ -64,7 +66,20 @@ impl CodexRunTracker {
             before: workspace_before,
             provider_write_receipt: false,
             pending_terminal: None,
+            final_output: CodexFinalOutput::new(provider_thread_id, provider_turn_id)?,
         })
+    }
+
+    /// Returns the bounded Markdown from completed final assistant messages.
+    /// It is never included in lifecycle, cost, or journal events.
+    pub fn final_output(&self) -> Option<&str> {
+        self.final_output.final_output()
+    }
+
+    /// True when a provider answer exceeded the capture bound and was
+    /// discarded rather than silently truncated.
+    pub fn final_output_overflowed(&self) -> bool {
+        self.final_output.overflowed()
     }
 
     pub fn request_cancellation<T: AppServerTransport>(
@@ -98,7 +113,12 @@ impl CodexRunTracker {
         if let Some(terminal) = self.pending_terminal.take() {
             return Ok(terminal);
         }
-        let update = server.next_run_update(&mut self.stream, &self.evidence, occurred_at)?;
+        let update = server.next_run_update_with_output(
+            &mut self.stream,
+            &self.evidence,
+            &mut self.final_output,
+            occurred_at,
+        )?;
         self.order_update(update)
     }
 
@@ -197,6 +217,7 @@ mod tests {
     #[derive(Default)]
     struct FixtureTransport {
         responses: VecDeque<Result<serde_json::Value, TransportError>>,
+        incoming_notifications: VecDeque<Result<AppServerNotification, TransportError>>,
         requests: Vec<(String, serde_json::Value)>,
     }
 
@@ -219,7 +240,9 @@ mod tests {
         }
 
         fn next_notification(&mut self) -> Result<AppServerNotification, TransportError> {
-            Err(TransportError::Unavailable)
+            self.incoming_notifications
+                .pop_front()
+                .unwrap_or(Err(TransportError::Unavailable))
         }
     }
 
@@ -312,6 +335,43 @@ mod tests {
         assert!(receipt.contains("locally_measured"));
         assert!(!receipt.contains("receipt.txt"));
         assert!(!receipt.contains("secret"));
+    }
+
+    #[test]
+    fn tracker_exposes_final_markdown_without_putting_it_in_the_terminal_event() {
+        let run_id = RunId::from_bytes([23; 16]);
+        let mut tracker = CodexRunTracker::new(run_id, "thr_1", "turn_1", None).unwrap();
+        let mut server = CodexAppServer::new(FixtureTransport {
+            responses: VecDeque::from([Ok(json!({}))]),
+            incoming_notifications: VecDeque::from([
+                Ok(AppServerNotification {
+                    method: "item/completed".into(),
+                    params: json!({
+                        "threadId": "thr_1", "turnId": "turn_1", "completedAtMs": 1,
+                        "item": {"id": "answer", "type": "agentMessage", "phase": "final_answer", "text": "# Final Markdown"}
+                    }),
+                }),
+                Ok(AppServerNotification {
+                    method: "turn/completed".into(),
+                    params: json!({"turn": {"id": "turn_1", "status": "completed"}}),
+                }),
+            ]),
+            ..FixtureTransport::default()
+        });
+        server.initialize().unwrap();
+
+        let CodexRunUpdate::Lifecycle(terminal) = tracker
+            .next_update(&mut server, "2026-09-07T00:00:00Z")
+            .unwrap()
+        else {
+            panic!("turn completion must remain a lifecycle update")
+        };
+        assert_eq!(tracker.final_output(), Some("# Final Markdown"));
+        assert!(!tracker.final_output_overflowed());
+        assert!(!terminal
+            .event
+            .redacted_payload_json
+            .contains("Final Markdown"));
     }
 
     #[test]

@@ -80,6 +80,15 @@ struct M3Projection {
     awaiting_meetings: Vec<MeetingProjection>,
     document_versions: Vec<DocumentProjection>,
     knowledge_deliveries: Vec<KnowledgeDeliveryProjection>,
+    joined_drafts: Vec<JoinedDraftProjection>,
+    missing_output_execution_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct JoinedDraftProjection {
+    execution_id: String,
+    title: String,
+    markdown: String,
 }
 
 #[derive(Serialize)]
@@ -119,6 +128,7 @@ struct ProviderOutcome {
     terminal_state: bastet_core::NormalizedRunState,
     provider_session_id: Option<String>,
     cost: bastet_core::CostEvidence,
+    output_markdown: Option<String>,
 }
 
 fn unknown_cost() -> bastet_core::CostEvidence {
@@ -129,6 +139,19 @@ fn unknown_cost() -> bastet_core::CostEvidence {
         input_tokens: None,
         output_tokens: None,
         confidence: 0.0,
+    }
+}
+
+fn output_terminal_state(
+    state: bastet_core::NormalizedRunState,
+    output: Option<&str>,
+) -> bastet_core::NormalizedRunState {
+    if state == bastet_core::NormalizedRunState::Succeeded
+        && output.is_none_or(|text| text.trim().is_empty())
+    {
+        bastet_core::NormalizedRunState::Failed
+    } else {
+        state
     }
 }
 
@@ -143,6 +166,38 @@ async fn m3_projection(client: State<'_, DaemonClient>) -> Result<M3Projection, 
         .await
         .map_err(|error| error.to_string())?;
     Ok(project_m3(snapshot, graphs.executions))
+}
+
+#[tauri::command]
+async fn retry_missing_graph_outputs(client: State<'_, DaemonClient>) -> Result<(), String> {
+    let executions = client
+        .graph_executions()
+        .await
+        .map_err(|error| error.to_string())?
+        .executions;
+    let execution = executions
+        .iter()
+        .find(|execution| {
+            execution
+                .nodes
+                .iter()
+                .all(|node| node.state == bastet_core::GraphNodeState::Succeeded)
+                && execution.outputs.len() < execution.nodes.len()
+                && !executions
+                    .iter()
+                    .any(|next| next.restarted_from_execution_id == Some(execution.id))
+        })
+        .ok_or("no completed graph needs output recovery")?;
+    client
+        .restart_missing_output_graph(
+            execution.id,
+            bastet_protocol::RestartMissingOutputGraphCommand {
+                expected_graph_revision: execution.revision,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -228,6 +283,7 @@ async fn run_ready_mvp_nodes(client: State<'_, DaemonClient>) -> Result<M3Projec
                 terminal_state: bastet_core::NormalizedRunState::Uncertain,
                 provider_session_id: None,
                 cost: unknown_cost(),
+                output_markdown: None,
             },
         });
     }
@@ -246,6 +302,7 @@ async fn run_ready_mvp_nodes(client: State<'_, DaemonClient>) -> Result<M3Projec
                     terminal_state: outcome.terminal_state,
                     provider_session_id: outcome.provider_session_id,
                     cost: outcome.cost,
+                    output_markdown: outcome.output_markdown,
                 },
             )
             .await
@@ -321,9 +378,13 @@ fn run_codex(
                 | bastet_core::NormalizedRunState::Blocked
                 | bastet_core::NormalizedRunState::Uncertain => {
                     return Ok(ProviderOutcome {
-                        terminal_state: event.event.state,
+                        terminal_state: output_terminal_state(
+                            event.event.state,
+                            started.tracker.final_output(),
+                        ),
                         provider_session_id,
                         cost,
+                        output_markdown: started.tracker.final_output().map(str::to_owned),
                     })
                 }
                 _ => {}
@@ -371,9 +432,10 @@ fn run_agy(
                 | bastet_core::NormalizedRunState::Blocked
                 | bastet_core::NormalizedRunState::Uncertain => {
                     return Ok(ProviderOutcome {
-                        terminal_state: event.state,
+                        terminal_state: output_terminal_state(event.state, process.final_output()),
                         provider_session_id: process.conversation_id().map(str::to_owned),
                         cost,
+                        output_markdown: process.final_output().map(str::to_owned),
                     })
                 }
                 _ => {}
@@ -450,6 +512,80 @@ async fn create_mvp_document(
         })
         .await
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn export_mvp_document(
+    client: State<'_, DaemonClient>,
+    artifact_id: bastet_core::ArtifactId,
+    version_id: bastet_core::ArtifactVersionId,
+) -> Result<String, String> {
+    let m3 = client
+        .m3_catalog()
+        .await
+        .map_err(|error| error.to_string())?;
+    let identity = client.catalog().await.map_err(|error| error.to_string())?;
+    let artifact = m3
+        .catalog
+        .deliverables
+        .documents
+        .iter()
+        .find(|item| item.metadata.id == artifact_id)
+        .ok_or("document not found")?;
+    let version = artifact
+        .versions
+        .iter()
+        .find(|item| item.id == version_id)
+        .ok_or("document version not found")?;
+    version
+        .validate_unchanged()
+        .map_err(|error| error.to_string())?;
+    if version.accepted_by.is_none() {
+        return Err("accept the document before exporting".into());
+    }
+    let project = identity
+        .catalog
+        .projects
+        .iter()
+        .find(|item| item.metadata.id == artifact.project_id)
+        .ok_or("project not found")?;
+    export_document_file(Path::new(&project.workspace_root), version)
+}
+
+fn export_document_file(
+    root: &Path,
+    version: &bastet_core::DocumentVersion,
+) -> Result<String, String> {
+    let root = root.canonicalize().map_err(|error| error.to_string())?;
+    if !root.is_dir() {
+        return Err("workspace is not a directory".into());
+    }
+    let path = root.join(format!("bastet-report-{}.md", version.id.value()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(version.markdown.as_bytes())
+                .map_err(|error| error.to_string())?;
+            file.sync_all().map_err(|error| error.to_string())?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || std::fs::read_to_string(&path).map_err(|error| error.to_string())?
+                    != version.markdown
+            {
+                return Err(
+                    "export path contains different content; nothing was overwritten".into(),
+                );
+            }
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+    Ok(path.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -787,6 +923,61 @@ fn project_m3(
     snapshot: bastet_protocol::M3CatalogSnapshot,
     executions: Vec<bastet_core::GraphExecution>,
 ) -> M3Projection {
+    let missing_output_execution_id = executions
+        .iter()
+        .find(|execution| {
+            execution
+                .nodes
+                .iter()
+                .all(|node| node.state == bastet_core::GraphNodeState::Succeeded)
+                && execution.outputs.len() < execution.nodes.len()
+                && !executions
+                    .iter()
+                    .any(|next| next.restarted_from_execution_id == Some(execution.id))
+        })
+        .map(|execution| execution.id.value().to_string());
+    let joined_drafts = executions
+        .iter()
+        .filter_map(|execution| {
+            if !execution
+                .nodes
+                .iter()
+                .all(|node| node.state == bastet_core::GraphNodeState::Succeeded)
+                || snapshot
+                    .catalog
+                    .deliverables
+                    .documents
+                    .iter()
+                    .any(|artifact| {
+                        artifact
+                            .versions
+                            .iter()
+                            .any(|version| version.source_execution_id == Some(execution.id))
+                    })
+            {
+                return None;
+            }
+            let join = execution
+                .graph
+                .nodes
+                .iter()
+                .find(|node| node.kind == bastet_core::GraphNodeKind::Join)?;
+            let output = execution
+                .outputs
+                .iter()
+                .find(|output| output.node_id == join.id)?;
+            Some(JoinedDraftProjection {
+                execution_id: execution.id.value().to_string(),
+                title: output
+                    .markdown
+                    .lines()
+                    .find_map(|line| line.strip_prefix("# "))
+                    .unwrap_or(&join.title)
+                    .to_owned(),
+                markdown: output.markdown.clone(),
+            })
+        })
+        .collect();
     let awaiting_meetings = snapshot
         .catalog
         .meetings
@@ -850,6 +1041,8 @@ fn project_m3(
         })
         .collect();
     M3Projection {
+        joined_drafts,
+        missing_output_execution_id,
         revision: snapshot.revision,
         pet_profiles: snapshot.catalog.office.pet_profiles,
         pet_assignments: snapshot.catalog.office.pet_assignments.len(),
@@ -1237,9 +1430,11 @@ pub fn run() {
             work_projection,
             m3_projection,
             run_ready_mvp_nodes,
+            retry_missing_graph_outputs,
             prepare_mvp,
             accept_mvp_decision,
             create_mvp_document,
+            export_mvp_document,
             accept_mvp_document,
             prepare_knowledge_delivery,
             deliver_knowledge,
@@ -1268,6 +1463,28 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_export_contains_markdown_and_never_overwrites_other_content() {
+        let root = tempfile::tempdir().unwrap();
+        let version = bastet_core::DocumentVersion::create(
+            bastet_core::ArtifactVersionId::new(),
+            1,
+            None,
+            "# Research\n\nActual joined research content.".into(),
+            vec![
+                bastet_core::GraphNodeId::new(),
+                bastet_core::GraphNodeId::new(),
+            ],
+        )
+        .unwrap();
+        let path = export_document_file(root.path(), &version).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), version.markdown);
+        assert_eq!(export_document_file(root.path(), &version).unwrap(), path);
+        std::fs::write(&path, "user edits").unwrap();
+        assert!(export_document_file(root.path(), &version).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "user edits");
+    }
 
     #[test]
     fn bootstrap_declares_daemon_authority() {
@@ -1419,6 +1636,7 @@ mod tests {
                     terminal_state: left.terminal_state,
                     provider_session_id: left.provider_session_id,
                     cost: left.cost,
+                    output_markdown: left.output_markdown,
                 },
             )
             .unwrap();
@@ -1435,6 +1653,7 @@ mod tests {
                     terminal_state: right.terminal_state,
                     provider_session_id: right.provider_session_id,
                     cost: right.cost,
+                    output_markdown: right.output_markdown,
                 },
             )
             .unwrap();
@@ -1468,6 +1687,11 @@ mod tests {
             joined.terminal_state,
             bastet_core::NormalizedRunState::Succeeded
         );
+        let joined_markdown = joined
+            .output_markdown
+            .clone()
+            .expect("join must return actual text");
+        assert!(!joined_markdown.trim().is_empty());
         let joined_done = store
             .finish_graph_node_run(
                 graph.id,
@@ -1481,6 +1705,7 @@ mod tests {
                     terminal_state: joined.terminal_state,
                     provider_session_id: joined.provider_session_id,
                     cost: joined.cost,
+                    output_markdown: joined.output_markdown,
                 },
             )
             .unwrap();
@@ -1489,7 +1714,7 @@ mod tests {
                 expected_m3_revision: joined_done.m3_revision,
                 graph_execution_id: graph.id,
                 title: "Real provider report".into(),
-                markdown: "# Real provider report\n\nThe two provider branches and explicit join completed.".into(),
+                markdown: joined_markdown.clone(),
             })
             .unwrap();
         let accepted_document = store
@@ -1524,14 +1749,37 @@ mod tests {
                 project_id: prepared.project_id,
                 artifact_version_id: document.version_id,
                 target: bastet_core::KnowledgeTarget::BastetMind,
-                preview: "Redacted real-provider result".into(),
+                preview: joined_markdown.clone(),
             })
             .unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::create_dir(vault.path().join("40-輸出成果")).unwrap();
+        for name in ["AGENTS.md", "index.md", "log.md"] {
+            std::fs::write(vault.path().join(name), "fixture\n").unwrap();
+        }
+        let mind_receipt = deliver_bastet_mind(
+            vault.path(),
+            mind.delivery_id,
+            &joined_markdown,
+            "2026-09-07",
+        )
+        .unwrap();
+        let published = vault.path().join("40-輸出成果").join(format!(
+            "Bastet Workstation Delivery {}.md",
+            mind.delivery_id.value()
+        ));
+        assert!(std::fs::read_to_string(published)
+            .unwrap()
+            .contains(&joined_markdown));
+        let accepted_version =
+            store.m3_catalog().unwrap().catalog.deliverables.documents[0].versions[0].clone();
+        let exported = export_document_file(root.path(), &accepted_version).unwrap();
+        assert_eq!(std::fs::read_to_string(exported).unwrap(), joined_markdown);
         store
             .complete_knowledge_delivery(bastet_protocol::CompleteKnowledgeDeliveryCommand {
                 expected_m3_revision: mind.m3_revision,
                 delivery_id: mind.delivery_id,
-                destination_receipt: "bastetmind:m3-real-gate-fixture".into(),
+                destination_receipt: mind_receipt,
             })
             .unwrap();
         drop(store);
@@ -1544,6 +1792,10 @@ mod tests {
             .all(|node| node.state == bastet_core::GraphNodeState::Succeeded));
         assert_eq!(reopened.catalog().unwrap().catalog.runs.len(), 3);
         let reopened_m3 = reopened.m3_catalog().unwrap().catalog;
+        assert_eq!(
+            reopened_m3.deliverables.documents[0].versions[0].markdown,
+            joined_markdown
+        );
         assert_eq!(reopened_m3.deliverables.costs.len(), 3);
         assert!(reopened_m3.deliverables.documents[0].versions[0]
             .accepted_by

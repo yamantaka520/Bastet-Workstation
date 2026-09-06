@@ -84,6 +84,12 @@ fn installed_codex_completes_a_read_only_turn_over_stdio() {
 
     assert!(saw_running);
     assert!(saw_cost);
+    assert!(!started.tracker.final_output_overflowed());
+    assert!(started
+        .tracker
+        .final_output()
+        .expect("successful turn must retain a completed final assistant message")
+        .contains("BASTET_READ_ONLY_OK"));
     assert_eq!(std::fs::read_dir(&probe_root).unwrap().count(), 0);
 }
 

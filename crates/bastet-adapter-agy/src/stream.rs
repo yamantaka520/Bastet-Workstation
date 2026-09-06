@@ -30,6 +30,8 @@ pub struct AgyRunStream {
     expected_conversation_id: Option<String>,
     initialized: bool,
     closed: bool,
+    final_output: String,
+    final_output_overflowed: bool,
 }
 
 impl AgyRunStream {
@@ -41,6 +43,8 @@ impl AgyRunStream {
             expected_conversation_id: None,
             initialized: false,
             closed: false,
+            final_output: String::new(),
+            final_output_overflowed: false,
         }
     }
 
@@ -59,11 +63,24 @@ impl AgyRunStream {
             expected_conversation_id: Some(conversation_id),
             initialized: false,
             closed: false,
+            final_output: String::new(),
+            final_output_overflowed: false,
         })
     }
 
     pub fn conversation_id(&self) -> Option<&str> {
         self.conversation_id.as_deref()
+    }
+
+    /// Returns bounded assistant Markdown collected from actual `agent_response`
+    /// stream events. It is intentionally not represented in normalized events.
+    pub fn final_output(&self) -> Option<&str> {
+        (!self.final_output_overflowed && !self.final_output.is_empty())
+            .then_some(self.final_output.as_str())
+    }
+
+    pub fn final_output_overflowed(&self) -> bool {
+        self.final_output_overflowed
     }
 
     pub fn recovery_started(&mut self, occurred_at: &str) -> Result<AgyRunUpdate, AgyStreamError> {
@@ -168,12 +185,22 @@ impl AgyRunStream {
         )
     }
 
-    fn consume_step(&self, value: &Value) -> Result<Option<AgyRunUpdate>, AgyStreamError> {
+    fn consume_step(&mut self, value: &Value) -> Result<Option<AgyRunUpdate>, AgyStreamError> {
         let update = value
             .get("step_update")
             .and_then(Value::as_object)
             .ok_or(AgyStreamError::ProtocolDrift)?;
         self.require_matching_conversation(update.get("conversation_id"))?;
+        if update.get("step_type").and_then(Value::as_str) == Some("agent_response") {
+            if let Some(text) = update.get("text_delta").and_then(Value::as_str) {
+                if !self.final_output_overflowed
+                    && !append_if_within_limit(&mut self.final_output, text, MAX_FINAL_OUTPUT_BYTES)
+                {
+                    self.final_output.clear();
+                    self.final_output_overflowed = true;
+                }
+            }
+        }
         let Some(usage) = update.get("usage") else {
             return Ok(None);
         };
@@ -334,6 +361,20 @@ impl AgyRunStream {
 }
 
 const ADAPTER_PROVIDER: &str = "agy_cli";
+const MAX_FINAL_OUTPUT_BYTES: usize = 256 * 1024;
+
+fn append_if_within_limit(target: &mut String, addition: &str, limit: usize) -> bool {
+    if target
+        .len()
+        .checked_add(addition.len())
+        .is_some_and(|length| length <= limit)
+    {
+        target.push_str(addition);
+        true
+    } else {
+        false
+    }
+}
 
 fn parse_usage(value: &Value) -> Result<CostEvidence, AgyStreamError> {
     let usage = value.as_object().ok_or(AgyStreamError::ProtocolDrift)?;
@@ -443,6 +484,55 @@ mod tests {
         assert_eq!(event.state, NormalizedRunState::Succeeded);
         assert_eq!(event.sequence, 2);
         assert!(failure.is_none());
+    }
+
+    #[test]
+    fn completed_agent_response_deltas_are_retained_bounded_and_other_text_is_ignored() {
+        let mut stream = stream();
+        stream
+            .consume_line(
+                &json!({"event":"init","conversation_id":ID,"init":{}}).to_string(),
+                "now",
+            )
+            .unwrap();
+        for step in [
+            json!({"event":"step_update","step_update":{"conversation_id":ID,"step_type":"agent_thought","text_delta":"reasoning must not persist"}}),
+            json!({"event":"step_update","step_update":{"conversation_id":ID,"step_type":"agent_response","text_delta":"# Result\n\n"}}),
+            json!({"event":"step_update","step_update":{"conversation_id":ID,"step_type":"agent_response","text_delta":"Retained Markdown"}}),
+        ] {
+            assert!(stream
+                .consume_line(&step.to_string(), "now")
+                .unwrap()
+                .is_none());
+        }
+        stream
+            .consume_line(
+                &json!({"event":"result","result":{"conversation_id":ID,"status":"SUCCESS","response":"result field is not an assistant event"}}).to_string(),
+                "later",
+            )
+            .unwrap();
+        assert_eq!(stream.final_output(), Some("# Result\n\nRetained Markdown"));
+        assert!(!stream.final_output().unwrap().contains("reasoning"));
+        assert!(!stream.final_output().unwrap().contains("result field"));
+    }
+
+    #[test]
+    fn over_limit_agent_response_output_is_discarded_instead_of_truncated() {
+        let mut stream = stream();
+        stream
+            .consume_line(
+                &json!({"event":"init","conversation_id":ID,"init":{}}).to_string(),
+                "now",
+            )
+            .unwrap();
+        stream
+            .consume_line(
+                &json!({"event":"step_update","step_update":{"conversation_id":ID,"step_type":"agent_response","text_delta":"é".repeat(MAX_FINAL_OUTPUT_BYTES)}}).to_string(),
+                "now",
+            )
+            .unwrap();
+        assert_eq!(stream.final_output(), None);
+        assert!(stream.final_output_overflowed());
     }
 
     #[test]

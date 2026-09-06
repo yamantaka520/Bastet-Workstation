@@ -26,6 +26,75 @@ pub enum CodexRunUpdate {
     Evidence(CodexRunEvidenceUpdate),
 }
 
+/// The bounded, run-scoped final assistant Markdown retained for a caller that
+/// explicitly asks for it. It is deliberately separate from normalized events
+/// and evidence, whose payloads must remain redacted.
+pub(crate) struct CodexFinalOutput {
+    provider_thread_id: String,
+    provider_turn_id: String,
+    text: String,
+    overflowed: bool,
+}
+
+impl CodexFinalOutput {
+    pub(crate) const MAX_BYTES: usize = 256 * 1024;
+
+    pub(crate) fn new(
+        provider_thread_id: impl Into<String>,
+        provider_turn_id: impl Into<String>,
+    ) -> Result<Self, AppServerError> {
+        let provider_thread_id = provider_thread_id.into();
+        let provider_turn_id = provider_turn_id.into();
+        require_text(&provider_thread_id)?;
+        require_text(&provider_turn_id)?;
+        Ok(Self {
+            provider_thread_id,
+            provider_turn_id,
+            text: String::new(),
+            overflowed: false,
+        })
+    }
+
+    pub(crate) fn final_output(&self) -> Option<&str> {
+        (!self.overflowed && !self.text.is_empty()).then_some(self.text.as_str())
+    }
+
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    fn ingest(&mut self, notification: &AppServerNotification) -> Result<(), AppServerError> {
+        // The generated app-server schema defines this as a completed
+        // `agentMessage` item with `phase: final_answer`; streaming deltas,
+        // commentary, tool items, and reasoning are intentionally excluded.
+        if notification.method != "item/completed" {
+            return Ok(());
+        }
+        let params = &notification.params;
+        if required_value_string(params, "threadId")? != self.provider_thread_id
+            || required_value_string(params, "turnId")? != self.provider_turn_id
+        {
+            return Ok(());
+        }
+        let item = params.get("item").ok_or(AppServerError::ProtocolDrift)?;
+        if required_value_string(item, "type")? != "agentMessage" {
+            return Ok(());
+        }
+        if item.get("phase").and_then(Value::as_str) != Some("final_answer") {
+            return Ok(());
+        }
+        let text = item
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or(AppServerError::ProtocolDrift)?;
+        if !self.overflowed && !append_if_within_limit(&mut self.text, text, Self::MAX_BYTES) {
+            self.text.clear();
+            self.overflowed = true;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum TransportError {
     #[error("Codex app-server transport is unavailable")]
@@ -332,6 +401,26 @@ impl<T: AppServerTransport> CodexAppServer<T> {
         evidence: &CodexRunEvidence,
         occurred_at: &str,
     ) -> Result<CodexRunUpdate, AppServerError> {
+        self.next_run_update_inner(stream, evidence, None, occurred_at)
+    }
+
+    pub(crate) fn next_run_update_with_output(
+        &mut self,
+        stream: &mut CodexRunStream,
+        evidence: &CodexRunEvidence,
+        final_output: &mut CodexFinalOutput,
+        occurred_at: &str,
+    ) -> Result<CodexRunUpdate, AppServerError> {
+        self.next_run_update_inner(stream, evidence, Some(final_output), occurred_at)
+    }
+
+    fn next_run_update_inner(
+        &mut self,
+        stream: &mut CodexRunStream,
+        evidence: &CodexRunEvidence,
+        mut final_output: Option<&mut CodexFinalOutput>,
+        occurred_at: &str,
+    ) -> Result<CodexRunUpdate, AppServerError> {
         loop {
             let notification = match self.next_notification() {
                 Ok(notification) => notification,
@@ -349,6 +438,9 @@ impl<T: AppServerTransport> CodexAppServer<T> {
                 }
                 Err(error) => return Err(error),
             };
+            if let Some(final_output) = final_output.as_deref_mut() {
+                final_output.ingest(&notification)?;
+            }
             if let Some(event) = stream
                 .ingest(&notification, occurred_at)
                 .map_err(|_| AppServerError::ProtocolDrift)?
@@ -374,6 +466,26 @@ impl<T: AppServerTransport> CodexAppServer<T> {
 
     pub fn into_transport(self) -> T {
         self.transport
+    }
+}
+
+fn required_value_string<'a>(value: &'a Value, key: &str) -> Result<&'a str, AppServerError> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or(AppServerError::ProtocolDrift)
+}
+
+fn append_if_within_limit(target: &mut String, addition: &str, limit: usize) -> bool {
+    if target
+        .len()
+        .checked_add(addition.len())
+        .is_some_and(|length| length <= limit)
+    {
+        target.push_str(addition);
+        true
+    } else {
+        false
     }
 }
 
@@ -834,6 +946,60 @@ mod tests {
         );
         server.initialize().unwrap();
         assert_eq!(server.next_notification().unwrap(), notification);
+    }
+
+    #[test]
+    fn final_output_keeps_only_matching_completed_final_agent_messages() {
+        let mut output = CodexFinalOutput::new("thr_target", "turn_target").unwrap();
+        for notification in [
+            AppServerNotification {
+                method: "item/completed".into(),
+                params: json!({
+                    "threadId": "thr_target", "turnId": "turn_target",
+                    "completedAtMs": 1,
+                    "item": {"id": "commentary", "type": "agentMessage", "phase": "commentary", "text": "do not retain"}
+                }),
+            },
+            AppServerNotification {
+                method: "item/completed".into(),
+                params: json!({
+                    "threadId": "thr_target", "turnId": "turn_other",
+                    "completedAtMs": 2,
+                    "item": {"id": "wrong-turn", "type": "agentMessage", "phase": "final_answer", "text": "wrong turn"}
+                }),
+            },
+            AppServerNotification {
+                method: "item/agentMessage/delta".into(),
+                params: json!({"threadId": "thr_target", "turnId": "turn_target", "itemId": "delta", "delta": "not completed"}),
+            },
+            AppServerNotification {
+                method: "item/completed".into(),
+                params: json!({
+                    "threadId": "thr_target", "turnId": "turn_target",
+                    "completedAtMs": 3,
+                    "item": {"id": "final", "type": "agentMessage", "phase": "final_answer", "text": "# Retained\n\nMarkdown"}
+                }),
+            },
+        ] {
+            output.ingest(&notification).unwrap();
+        }
+        assert_eq!(output.final_output(), Some("# Retained\n\nMarkdown"));
+    }
+
+    #[test]
+    fn over_limit_final_output_is_discarded_instead_of_truncated() {
+        let mut output = CodexFinalOutput::new("thr_1", "turn_1").unwrap();
+        output
+            .ingest(&AppServerNotification {
+                method: "item/completed".into(),
+                params: json!({
+                    "threadId": "thr_1", "turnId": "turn_1", "completedAtMs": 1,
+                    "item": {"id": "final", "type": "agentMessage", "phase": "final_answer", "text": "é".repeat(CodexFinalOutput::MAX_BYTES)}
+                }),
+            })
+            .unwrap();
+        assert_eq!(output.final_output(), None);
+        assert!(output.overflowed());
     }
 
     #[test]

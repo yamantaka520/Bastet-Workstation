@@ -71,6 +71,11 @@ fn installed_agy_completes_a_secure_stdin_read_only_turn() {
     assert!(saw_running);
     assert!(saw_cost);
     assert!(process.conversation_id().is_some());
+    assert!(!process.final_output_overflowed());
+    assert!(process
+        .final_output()
+        .expect("successful turn must retain agent_response text")
+        .contains("BASTET_AGY_STDIN_OK"));
     assert_eq!(std::fs::read_dir(&probe_root).unwrap().count(), 0);
 }
 

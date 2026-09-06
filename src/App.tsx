@@ -12,7 +12,7 @@ type AgentStatus = { adapter_kind: string; display_name: string; installed: bool
 type AgentCenterSnapshot = { agents: AgentStatus[] };
 type WorkProjection = { revision: number; sessions: number; runs: { run_id: string; session_id: string; state: string; can_cancel: boolean }[] };
 type PetProfile = { metadata: { id: string }; name: string; version: number; states: { state_key: string; accessible_label_key: string }[] };
-type M3Projection = { revision: number; pet_profiles: PetProfile[]; pet_assignments: number; rooms: number; meetings: number; documents: number; costs: number; graph_nodes: { execution_id: string; title: string; state: string; pet_state: string }[]; awaiting_meetings: { meeting_id: string; summary: string }[]; document_versions: { project_id: string; artifact_id: string; version_id: string; title: string; markdown: string; content_hash: string; accepted: boolean }[]; knowledge_deliveries: { delivery_id: string; target: string; preview: string; state: string }[] };
+type M3Projection = { revision: number; pet_profiles: PetProfile[]; pet_assignments: number; rooms: number; meetings: number; documents: number; costs: number; graph_nodes: { execution_id: string; title: string; state: string; pet_state: string }[]; awaiting_meetings: { meeting_id: string; summary: string }[]; joined_drafts: { execution_id: string; title: string; markdown: string }[]; missing_output_execution_id: string | null; document_versions: { project_id: string; artifact_id: string; version_id: string; title: string; markdown: string; content_hash: string; accepted: boolean; workspace_file?: string | null }[]; knowledge_deliveries: { delivery_id: string; target: string; preview: string; state: string }[] };
 type View = "office" | "agents" | "approvals" | "diagnostics";
 
 export function App() {
@@ -23,7 +23,7 @@ export function App() {
   const [approvals, setApprovals] = useState<ApprovalRecord[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
   const [work, setWork] = useState<WorkProjection>({ revision: 0, sessions: 0, runs: [] });
-  const [m3, setM3] = useState<M3Projection>({ revision: 0, pet_profiles: [], pet_assignments: 0, rooms: 0, meetings: 0, documents: 0, costs: 0, graph_nodes: [], awaiting_meetings: [], document_versions: [], knowledge_deliveries: [] });
+  const [m3, setM3] = useState<M3Projection>({ revision: 0, pet_profiles: [], pet_assignments: 0, rooms: 0, meetings: 0, documents: 0, costs: 0, graph_nodes: [], awaiting_meetings: [], joined_drafts: [], missing_output_execution_id: null, document_versions: [], knowledge_deliveries: [] });
   const [projectName, setProjectName] = useState("");
   const [workspaceRoot, setWorkspaceRoot] = useState("");
   const [codexModel, setCodexModel] = useState("");
@@ -31,6 +31,8 @@ export function App() {
   const [decision, setDecision] = useState("");
   const [documentTitle, setDocumentTitle] = useState("");
   const [documentMarkdown, setDocumentMarkdown] = useState("");
+  const [documentDraftId, setDocumentDraftId] = useState<string | null>(null);
+  const [workspaceFiles, setWorkspaceFiles] = useState<Record<string, string>>({});
   const [actionError, setActionError] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
   const [prepareError, setPrepareError] = useState(false);
@@ -86,11 +88,18 @@ export function App() {
     catch { setActionError(true); }
     finally { setActionBusy(false); }
   };
-  const completedExecution = m3.graph_nodes.length > 0 && m3.graph_nodes.every((node) => node.state === "succeeded") ? m3.graph_nodes[0].execution_id : null;
+  const selectedDraft = m3.joined_drafts.at(-1) ?? null;
+  useEffect(() => {
+    if (!selectedDraft || selectedDraft.execution_id === documentDraftId) return;
+    setDocumentDraftId(selectedDraft.execution_id);
+    setDocumentTitle(selectedDraft.title);
+    setDocumentMarkdown(selectedDraft.markdown);
+  }, [documentDraftId, selectedDraft]);
+  const graphCompletedWithoutOutput = m3.graph_nodes.length > 0 && m3.graph_nodes.every((node) => node.state === "succeeded") && !selectedDraft && m3.document_versions.length === 0;
   const createDocument = async () => {
-    if (!completedExecution) return;
+    if (!selectedDraft || documentDraftId !== selectedDraft.execution_id) return;
     setActionError(false);
-    try { await invoke("create_mvp_document", { graphExecutionId: completedExecution, title: documentTitle, markdown: documentMarkdown }); await reconnect(); }
+    try { await invoke("create_mvp_document", { graphExecutionId: documentDraftId, title: documentTitle, markdown: documentMarkdown }); await reconnect(); }
     catch { setActionError(true); }
   };
   const acceptDocument = async (document: M3Projection["document_versions"][number]) => {
@@ -108,6 +117,19 @@ export function App() {
     try { await invoke("deliver_knowledge", { deliveryId, deliveredOn: new Date().toISOString().slice(0, 10) }); await reconnect(); }
     catch { setActionError(true); }
     finally { setActionBusy(false); }
+  };
+  const retryMissingGraphOutputs = async () => {
+    setActionError(false); setActionBusy(true);
+    try { await invoke<void>("retry_missing_graph_outputs"); await reconnect(); }
+    catch { setActionError(true); }
+    finally { setActionBusy(false); }
+  };
+  const exportDocument = async (document: M3Projection["document_versions"][number]) => {
+    setActionError(false);
+    try {
+      const path = await invoke<string>("export_mvp_document", { artifactId: document.artifact_id, versionId: document.version_id });
+      setWorkspaceFiles((current) => ({ ...current, [document.version_id]: path }));
+    } catch { setActionError(true); }
   };
 
   return <main>
@@ -128,10 +150,12 @@ export function App() {
       {m3.meetings === 0 && <form onSubmit={(event) => { event.preventDefault(); void prepareMvp(); }}><h3>{translate(locale, "prepareMvp")}</h3><label>{translate(locale, "projectName")}<input required disabled={prepareBusy} value={projectName} onChange={(event) => setProjectName(event.target.value)} /></label><label>{translate(locale, "workspaceRoot")}<input required disabled={prepareBusy} value={workspaceRoot} onChange={(event) => setWorkspaceRoot(event.target.value)} /></label><label>Codex {translate(locale, "models")}<select required disabled={prepareBusy} value={codexModel} onChange={(event) => setCodexModel(event.target.value)}><option value="">—</option>{agents.find((agent) => agent.adapter_kind === "codex_cli")?.models.map((model) => <option key={model}>{model}</option>)}</select></label><label>Agy {translate(locale, "models")}<select required disabled={prepareBusy} value={agyModel} onChange={(event) => setAgyModel(event.target.value)}><option value="">—</option>{agents.find((agent) => agent.adapter_kind === "agy_cli")?.models.map((model) => <option key={model}>{model}</option>)}</select></label>{prepareBusy && <p role="status">{translate(locale, "working")}</p>}{prepareError && <p role="alert">{translate(locale, "actionFailed")}</p>}<button type="submit" disabled={prepareBusy}>{translate(locale, "prepare")}</button></form>}
       {m3.awaiting_meetings.map((meeting) => <article key={meeting.meeting_id}><h3>{translate(locale, "decisionBaseline")}</h3><p>{meeting.summary}</p><label>{translate(locale, "decisionBaseline")}<textarea required value={decision} onChange={(event) => setDecision(event.target.value)} /></label><button type="button" disabled={!decision.trim()} onClick={() => void acceptDecision(meeting.meeting_id)}>{translate(locale, "acceptDecision")}</button></article>)}
       {m3.graph_nodes.some((node) => node.state === "pending") && <button type="button" disabled={actionBusy} onClick={() => void runReady()}>{translate(locale, "runReady")}</button>}
-      {completedExecution && m3.document_versions.length === 0 && <form onSubmit={(event) => { event.preventDefault(); void createDocument(); }}><label>{translate(locale, "documentTitle")}<input required value={documentTitle} onChange={(event) => setDocumentTitle(event.target.value)} /></label><label>{translate(locale, "documentMarkdown")}<textarea required value={documentMarkdown} onChange={(event) => setDocumentMarkdown(event.target.value)} /></label><button type="submit">{translate(locale, "createDocument")}</button></form>}
-      {m3.document_versions.map((document) => <article key={document.version_id}><h3>{document.title}</h3><pre>{document.markdown}</pre><code>{document.content_hash}</code>{document.accepted ? <><p>{translate(locale, "approved")}</p><div className="actions"><button type="button" onClick={() => void prepareKnowledge(document, "agent_memory_os")}>{translate(locale, "prepareMemory")}</button><button type="button" onClick={() => void prepareKnowledge(document, "bastet_mind")}>{translate(locale, "prepareMind")}</button></div></> : <button type="button" onClick={() => void acceptDocument(document)}>{translate(locale, "acceptDocument")}</button>}</article>)}
+      {selectedDraft && documentDraftId === selectedDraft.execution_id && <form onSubmit={(event) => { event.preventDefault(); void createDocument(); }}><label>{translate(locale, "documentTitle")}<input required value={documentTitle} onChange={(event) => setDocumentTitle(event.target.value)} /></label><label>{translate(locale, "documentMarkdown")}<textarea required value={documentMarkdown} onChange={(event) => setDocumentMarkdown(event.target.value)} /></label><button type="submit">{translate(locale, "createDocument")}</button></form>}
+      {graphCompletedWithoutOutput && <p role="alert">{translate(locale, "graphOutputMissing")}</p>}
+      {m3.missing_output_execution_id && <section><p>{translate(locale, "retryMissingOutputHelp")}</p><button type="button" disabled={actionBusy} onClick={() => void retryMissingGraphOutputs()}>{translate(locale, "retryMissingOutputs")}</button></section>}
+      {m3.document_versions.map((document) => { const workspaceFile = workspaceFiles[document.version_id] ?? document.workspace_file; return <article key={document.version_id}><h3>{document.title}</h3><pre>{document.markdown}</pre><code>{document.content_hash}</code>{workspaceFile && <p>{translate(locale, "workspaceFile")}: <code>{workspaceFile}</code></p>}{document.accepted ? <><p>{translate(locale, "approved")}</p><div className="actions"><button type="button" onClick={() => void exportDocument(document)}>{translate(locale, "exportDocument")}</button><button type="button" onClick={() => void prepareKnowledge(document, "agent_memory_os")}>{translate(locale, "prepareMemory")}</button><button type="button" onClick={() => void prepareKnowledge(document, "bastet_mind")}>{translate(locale, "prepareMind")}</button></div></> : <button type="button" onClick={() => void acceptDocument(document)}>{translate(locale, "acceptDocument")}</button>}</article>; })}
       {m3.knowledge_deliveries.length > 0 && <section aria-labelledby="delivery-heading"><h3 id="delivery-heading">{translate(locale, "knowledgeDeliveries")}</h3><ul>{m3.knowledge_deliveries.map((delivery) => <li key={delivery.delivery_id}>{delivery.target} — {translate(locale, delivery.state === "delivered" ? "delivered" : "prepared")} {delivery.state === "prepared" && <button type="button" disabled={actionBusy} onClick={() => void deliverKnowledge(delivery.delivery_id)}>{translate(locale, "deliverNow")}</button>}</li>)}</ul></section>}
-      {m3.graph_nodes.length > 0 && <ul>{m3.graph_nodes.map((node) => <li key={`${node.title}-${node.state}`}><span aria-hidden="true">🐈</span> {node.title} — {node.state} <span className="sr-only">{node.pet_state}</span></li>)}</ul>}</section>}
+      {m3.graph_nodes.length > 0 && <ul>{m3.graph_nodes.map((node) => <li key={`${node.execution_id}-${node.title}`}><span aria-hidden="true">🐈</span> {node.title} — {node.state} <span className="sr-only">{node.pet_state}</span></li>)}</ul>}</section>}
 
     {view === "agents" && <section aria-labelledby="agents-heading"><h2 id="agents-heading">{translate(locale, "agents")}</h2><p>{translate(locale, "agentHelp")}</p>
       <div className="card-grid">{agents.map((agent) => <article key={agent.adapter_kind}><h3>{agent.display_name}</h3><span className="badge">{translate(locale, agent.installed ? "installed" : "notInstalled")}</span>

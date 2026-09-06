@@ -13,7 +13,7 @@ const defaultInvoke = (command: string) => Promise.resolve(command === "approval
       : command === "work_projection"
         ? { revision: 3, sessions: 1, runs: [] }
       : command === "m3_projection"
-        ? { revision: 0, pet_profiles: [], pet_assignments: 0, rooms: 0, meetings: 0, documents: 0, costs: 0, graph_nodes: [], awaiting_meetings: [], document_versions: [], knowledge_deliveries: [] }
+        ? { revision: 0, pet_profiles: [], pet_assignments: 0, rooms: 0, meetings: 0, documents: 0, costs: 0, graph_nodes: [], awaiting_meetings: [], joined_drafts: [], missing_output_execution_id: null, document_versions: [], knowledge_deliveries: [] }
       : { protocol_version: 1, daemon_id: "test-daemon", revision: 7, lifecycle: "ready" });
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
@@ -90,13 +90,33 @@ describe("M1 shell", () => {
 
   it("disables provider dispatch while long-running graph work is active", async () => {
     invokeMock.mockImplementation((command: string) => command === "m3_projection"
-      ? Promise.resolve({ revision: 2, pet_profiles: [], pet_assignments: 3, rooms: 1, meetings: 1, documents: 0, costs: 0, graph_nodes: [{ execution_id: "graph-1", title: "Research A", state: "pending", pet_state: "idle" }], awaiting_meetings: [], document_versions: [], knowledge_deliveries: [] })
+      ? Promise.resolve({ revision: 2, pet_profiles: [], pet_assignments: 3, rooms: 1, meetings: 1, documents: 0, costs: 0, graph_nodes: [{ execution_id: "graph-1", title: "Research A", state: "pending", pet_state: "idle" }], awaiting_meetings: [], joined_drafts: [], missing_output_execution_id: null, document_versions: [], knowledge_deliveries: [] })
       : command === "run_ready_mvp_nodes" ? new Promise(() => undefined) : defaultInvoke(command));
     render(<App />);
     const button = await screen.findByRole("button", { name: "執行已就緒的 Graph 工作" });
     fireEvent.click(button);
     expect(button).toBeDisabled();
     expect(screen.getByText("工作執行中…")).toBeInTheDocument();
+  });
+
+  it("prefills a document from the latest joined draft and keeps manual edits after reconnect", async () => {
+    const projection = { revision: 4, pet_profiles: [], pet_assignments: 3, rooms: 1, meetings: 1, documents: 0, costs: 0, graph_nodes: [{ execution_id: "graph-older", title: "Research A", state: "succeeded", pet_state: "succeeded" }, { execution_id: "graph-newer", title: "Join", state: "succeeded", pet_state: "succeeded" }], awaiting_meetings: [], joined_drafts: [{ execution_id: "graph-older", title: "Earlier draft", markdown: "# Earlier" }, { execution_id: "graph-newer", title: "Joined research", markdown: "# Joined\n\nActual graph output" }], missing_output_execution_id: null, document_versions: [], knowledge_deliveries: [] };
+    invokeMock.mockImplementation((command: string) => command === "m3_projection" ? Promise.resolve(projection) : defaultInvoke(command));
+    render(<App />);
+
+    const title = await screen.findByLabelText("文件標題");
+    const markdown = screen.getByLabelText("Markdown 文件");
+    expect(title).toHaveValue("Joined research");
+    expect(markdown).toHaveValue("# Joined\n\nActual graph output");
+
+    fireEvent.change(title, { target: { value: "Operator title" } });
+    fireEvent.change(markdown, { target: { value: "# Operator edit" } });
+    fireEvent.click(screen.getByRole("button", { name: "建立合併文件" }));
+
+    expect(invokeMock).toHaveBeenCalledWith("create_mvp_document", { graphExecutionId: "graph-newer", title: "Operator title", markdown: "# Operator edit" });
+    await waitFor(() => expect(invokeMock.mock.calls.filter(([command]) => command === "m3_projection").length).toBeGreaterThan(1));
+    expect(title).toHaveValue("Operator title");
+    expect(markdown).toHaveValue("# Operator edit");
   });
 
   it("shows pending feedback and submits a prepare request only once", async () => {

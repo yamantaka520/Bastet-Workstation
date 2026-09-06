@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::{
     ArtifactId, ArtifactVersionId, CostRecordId, EntityMetadata, EvidenceClass, GraphNodeId,
-    KnowledgeDeliveryId, ProjectId, RunId,
+    GraphRunId, KnowledgeDeliveryId, ProjectId, RunId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +25,12 @@ pub struct DocumentVersion {
     pub markdown: String,
     pub content_hash: String,
     pub source_node_ids: Vec<GraphNodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_execution_id: Option<GraphRunId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_join_node_id: Option<GraphNodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_join_output_hash: Option<String>,
     pub accepted_by: Option<String>,
     pub accepted_at: Option<String>,
 }
@@ -47,9 +53,31 @@ impl DocumentVersion {
             content_hash: hash(&markdown),
             markdown,
             source_node_ids,
+            source_execution_id: None,
+            source_join_node_id: None,
+            source_join_output_hash: None,
             accepted_by: None,
             accepted_at: None,
         })
+    }
+
+    pub fn bind_join_receipt(
+        &mut self,
+        execution_id: GraphRunId,
+        join_node_id: GraphNodeId,
+        join_output_hash: String,
+    ) -> Result<(), DeliverableError> {
+        if join_output_hash.trim().is_empty()
+            || self.source_execution_id.is_some()
+            || self.source_join_node_id.is_some()
+            || self.source_join_output_hash.is_some()
+        {
+            return Err(DeliverableError::InvalidJoinReceipt);
+        }
+        self.source_execution_id = Some(execution_id);
+        self.source_join_node_id = Some(join_node_id);
+        self.source_join_output_hash = Some(join_output_hash);
+        Ok(())
     }
 
     pub fn accept(&mut self, actor: &str, accepted_at: &str) -> Result<(), DeliverableError> {
@@ -63,10 +91,20 @@ impl DocumentVersion {
     }
 
     pub fn validate_unchanged(&self) -> Result<(), DeliverableError> {
+        let valid_source_receipt = match (
+            self.source_execution_id,
+            self.source_join_node_id,
+            self.source_join_output_hash.as_deref(),
+        ) {
+            (None, None, None) => true,
+            (Some(_), Some(_), Some(hash)) => !hash.trim().is_empty(),
+            _ => false,
+        };
         if self.version == 0
             || self.markdown.trim().is_empty()
             || self.content_hash != hash(&self.markdown)
             || self.accepted_by.is_some() != self.accepted_at.is_some()
+            || !valid_source_receipt
         {
             return Err(DeliverableError::InvalidDocumentVersion);
         }

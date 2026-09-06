@@ -105,6 +105,11 @@ pub struct GraphExecutionReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartMissingOutputGraphCommand {
+    pub expected_graph_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrepareMvpCommand {
     pub expected_catalog_revision: u64,
     pub expected_m3_revision: u64,
@@ -206,6 +211,7 @@ pub struct FinishGraphNodeRunCommand {
     pub owner: String,
     pub terminal_state: bastet_core::NormalizedRunState,
     pub provider_session_id: Option<String>,
+    pub output_markdown: Option<String>,
     pub cost: bastet_core::CostEvidence,
 }
 
@@ -216,6 +222,7 @@ pub struct FinishGraphNodeRunReceipt {
     pub node_id: bastet_core::GraphNodeId,
     pub run_id: bastet_core::RunId,
     pub cost_record_id: bastet_core::CostRecordId,
+    pub output_content_hash: Option<String>,
     pub catalog_revision: u64,
     pub graph_revision: u64,
     pub m3_revision: u64,

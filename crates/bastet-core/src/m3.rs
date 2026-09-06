@@ -95,6 +95,14 @@ impl M3State {
             .iter()
             .map(|run| run.metadata.id)
             .collect::<HashSet<_>>();
+        if self
+            .graph_executions
+            .iter()
+            .flat_map(|execution| &execution.outputs)
+            .any(|output| !run_ids.contains(&output.run_id))
+        {
+            return Err(M3Error::MissingDeliverableReference);
+        }
         let artifact_versions = self
             .catalog
             .deliverables
@@ -102,6 +110,53 @@ impl M3State {
             .iter()
             .flat_map(|document| document.versions.iter().map(|version| version.id))
             .collect::<HashSet<_>>();
+        let has_invalid_source_receipt = self
+            .catalog
+            .deliverables
+            .documents
+            .iter()
+            .flat_map(|document| &document.versions)
+            .any(|version| {
+                let (Some(execution_id), Some(join_node_id), Some(join_hash)) = (
+                    version.source_execution_id,
+                    version.source_join_node_id,
+                    version.source_join_output_hash.as_deref(),
+                ) else {
+                    return version.source_execution_id.is_some()
+                        || version.source_join_node_id.is_some()
+                        || version.source_join_output_hash.is_some();
+                };
+                let Some(execution) = self
+                    .graph_executions
+                    .iter()
+                    .find(|execution| execution.id == execution_id)
+                else {
+                    return true;
+                };
+                let Some(join_node) = execution.graph.nodes.iter().find(|node| {
+                    node.id == join_node_id && node.kind == crate::GraphNodeKind::Join
+                }) else {
+                    return true;
+                };
+                let source_ids = version
+                    .source_node_ids
+                    .iter()
+                    .copied()
+                    .collect::<HashSet<_>>();
+                source_ids != join_node.needs.iter().copied().collect::<HashSet<_>>()
+                    || join_node.needs.iter().any(|node_id| {
+                        execution.output(*node_id).is_none()
+                            || execution
+                                .graph
+                                .nodes
+                                .iter()
+                                .find(|node| node.id == *node_id)
+                                .is_none_or(|node| node.kind != crate::GraphNodeKind::Research)
+                    })
+                    || execution
+                        .output(join_node_id)
+                        .is_none_or(|output| output.content_hash != join_hash)
+            });
         if self.catalog.deliverables.documents.iter().any(|document| {
             !project_ids.contains(&document.project_id)
                 || document
@@ -109,19 +164,21 @@ impl M3State {
                     .iter()
                     .flat_map(|version| &version.source_node_ids)
                     .any(|node| !graph_nodes.contains(node))
-        }) || self.catalog.deliverables.costs.iter().any(|cost| {
-            !project_ids.contains(&cost.project_id)
-                || !run_ids.contains(&cost.run_id)
-                || !graph_nodes.contains(&cost.node_id)
-        }) || self
-            .catalog
-            .deliverables
-            .knowledge_deliveries
-            .iter()
-            .any(|delivery| {
-                !project_ids.contains(&delivery.project_id)
-                    || !artifact_versions.contains(&delivery.artifact_version_id)
+        }) || has_invalid_source_receipt
+            || self.catalog.deliverables.costs.iter().any(|cost| {
+                !project_ids.contains(&cost.project_id)
+                    || !run_ids.contains(&cost.run_id)
+                    || !graph_nodes.contains(&cost.node_id)
             })
+            || self
+                .catalog
+                .deliverables
+                .knowledge_deliveries
+                .iter()
+                .any(|delivery| {
+                    !project_ids.contains(&delivery.project_id)
+                        || !artifact_versions.contains(&delivery.artifact_version_id)
+                })
         {
             return Err(M3Error::MissingDeliverableReference);
         }

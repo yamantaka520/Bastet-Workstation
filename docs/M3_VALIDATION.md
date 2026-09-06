@@ -11,7 +11,7 @@ Record the final commit before signing the human gate.
 |---|---|---|
 | Core and persistence | Workspace Rust tests, including daemon restart reconciliation | Pending final commit |
 | Desktop workflow | Desktop unit/integration suite; real provider scenario is opt-in | Pending final commit |
-| Real provider scenario | Codex and Agy run two research branches concurrently, Codex joins, the document is accepted, two delivery receipts and three cost records persist after SQLite reopen | Pass locally, 1/1 in 60.03 seconds |
+| Real provider scenario | Actual Codex/Agy answer text persists, both outputs feed the join, actual joined Markdown becomes the accepted document, survives reopen, exports byte-for-byte to an isolated workspace, and appears in a real BastetMind connector write to a temporary vault. AgentMemory receipt remains a fixture in this scenario. | Pass locally, 1/1 in 74.92 seconds; not a human acceptance or live-vault publishing test |
 | Frontend | Node 22 Vitest, TypeScript, and Vite production build | Pending final commit |
 | Cross-platform | Ubuntu, macOS, and Windows GitHub Actions matrix | Pending final commit |
 | Recovery | Existing M1 forced-kill harness plus M3 graph/document/delivery reopen assertions | Pending final commit |
@@ -69,6 +69,23 @@ secret, private prompt, or sensitive workspace content.
 | Decision | Human name, date, and explicit M3 accept/reject |
 
 ## Human evidence in progress
+
+2026-09-07 blocking content-flow finding: user completed research/join but the document editor was
+empty. Entering a filename published that literal string to BastetMind; the project folder stayed
+empty. Earlier E2E used fixture document text and delivery receipts, so its passing state assertions
+did NOT prove research-output propagation. M3 automated completion claims above are superseded for
+this flow. Required correction: retain actual provider answers, feed both into join, persist joined
+content with provenance, prefill the document, and verify exact content in a real connector output
+and an explicitly exported workspace Markdown file. Existing outputless graphs need a new explicit
+run; preserve their accepted artifacts and delivered notes as history.
+
+Correction verification: bounded provider answer capture, hash/run-bound durable outputs,
+dependency-fed join prompts, provenance-bound document creation, editor prefill, and non-overwriting
+explicit workspace export are implemented. Local workspace tests, Clippy with warnings denied,
+12 frontend tests under Node 24, TypeScript, and macOS debug bundle build pass. The real-provider
+scenario above now asserts actual content instead of injecting a canned document. Upgrade recovery
+creates an idempotent child graph using the existing accepted decision and preserves historical
+artifacts. M3 remains open pending the full human gate and final cross-platform CI.
 
 2026-09-07 blocking finding: after applying the built-in Pet, preparing `Test-Prj` failed.
 Desktop and core constructed identical Pet assets with different metadata timestamps, so the daemon

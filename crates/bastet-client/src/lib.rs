@@ -12,7 +12,8 @@ use bastet_protocol::{
     FinishGraphNodeRunCommand, FinishGraphNodeRunReceipt, GraphExecutionList,
     GraphExecutionReceipt, KnowledgeDeliveryReceipt, M3CatalogSnapshot,
     PrepareKnowledgeDeliveryCommand, PrepareMvpCommand, PrepareMvpReceipt, RecordCostCommand,
-    ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
+    ReplaceCatalogCommand, ReplaceM3CatalogCommand, RestartMissingOutputGraphCommand,
+    PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -149,6 +150,28 @@ impl DaemonClient {
         let receipt = self
             .http
             .post(format!("{}/v1/graphs", self.base_url))
+            .json(&command)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<GraphExecutionReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
+    pub async fn restart_missing_output_graph(
+        &self,
+        execution_id: bastet_core::GraphRunId,
+        command: RestartMissingOutputGraphCommand,
+    ) -> Result<GraphExecutionReceipt, ClientError> {
+        let receipt = self
+            .http
+            .post(format!(
+                "{}/v1/graphs/{}/restart-missing-output",
+                self.base_url,
+                execution_id.value()
+            ))
             .json(&command)
             .send()
             .await?
@@ -661,31 +684,49 @@ mod tests {
             .unwrap();
         assert_eq!(begun.adapter_kind, "codex_cli");
         assert!(begun.prompt.contains("Assigned task"));
-        let branches = client
-            .claim_graph_nodes(
-                execution_id,
-                ClaimGraphNodesCommand {
-                    expected_revision: begun.graph_revision,
-                    owner: "research".into(),
-                    limit: 2,
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(branches.claimed.len(), 1);
-        let mut revision = branches.revision;
-        let finished = client
+        let empty_success = client
             .finish_graph_node_run(
                 execution_id,
                 FinishGraphNodeRunCommand {
                     expected_catalog_revision: begun.catalog_revision,
-                    expected_graph_revision: revision,
+                    expected_graph_revision: begun.graph_revision,
+                    expected_m3_revision: accepted.m3_revision,
+                    node_id: begun.node_id,
+                    run_id: begun.run_id,
+                    owner: "codex-worker".into(),
+                    terminal_state: bastet_core::NormalizedRunState::Succeeded,
+                    provider_session_id: None,
+                    output_markdown: None,
+                    cost: bastet_core::CostEvidence {
+                        evidence_class: bastet_core::EvidenceClass::ProviderReported,
+                        currency: None,
+                        amount: None,
+                        input_tokens: Some(8),
+                        output_tokens: Some(0),
+                        confidence: 1.0,
+                    },
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            empty_success,
+            ClientError::Request(ref error)
+                if error.status() == Some(reqwest::StatusCode::BAD_REQUEST)
+        ));
+        let first_finished = client
+            .finish_graph_node_run(
+                execution_id,
+                FinishGraphNodeRunCommand {
+                    expected_catalog_revision: begun.catalog_revision,
+                    expected_graph_revision: begun.graph_revision,
                     expected_m3_revision: accepted.m3_revision,
                     node_id: begun.node_id,
                     run_id: begun.run_id,
                     owner: "codex-worker".into(),
                     terminal_state: bastet_core::NormalizedRunState::Succeeded,
                     provider_session_id: Some("provider-thread-client-test".into()),
+                    output_markdown: Some("# Codex research\n\nEvidence A.".into()),
                     cost: bastet_core::CostEvidence {
                         evidence_class: bastet_core::EvidenceClass::ProviderReported,
                         currency: None,
@@ -698,55 +739,117 @@ mod tests {
             )
             .await
             .unwrap();
-        revision = finished.graph_revision;
-        for node_id in branches.claimed {
-            revision = client
-                .complete_graph_node(
-                    execution_id,
-                    CompleteGraphNodeCommand {
-                        expected_revision: revision,
-                        node_id,
-                        owner: "research".into(),
-                        succeeded: true,
-                    },
-                )
-                .await
-                .unwrap()
-                .revision;
-        }
-        let join = client
-            .claim_graph_nodes(
+        assert!(first_finished.output_content_hash.is_some());
+        let second = client
+            .begin_graph_node_run(
                 execution_id,
-                ClaimGraphNodesCommand {
-                    expected_revision: revision,
-                    owner: "integrator".into(),
-                    limit: 1,
+                BeginGraphNodeRunCommand {
+                    expected_catalog_revision: first_finished.catalog_revision,
+                    expected_graph_revision: first_finished.graph_revision,
+                    node_id: graph.nodes[1].node_id,
+                    owner: "agy-worker".into(),
                 },
             )
             .await
             .unwrap();
-        assert_eq!(join.claimed.len(), 1);
-        client
-            .complete_graph_node(
+        let second_finished = client
+            .finish_graph_node_run(
                 execution_id,
-                CompleteGraphNodeCommand {
-                    expected_revision: join.revision,
-                    node_id: join.claimed[0],
+                FinishGraphNodeRunCommand {
+                    expected_catalog_revision: second.catalog_revision,
+                    expected_graph_revision: second.graph_revision,
+                    expected_m3_revision: first_finished.m3_revision,
+                    node_id: second.node_id,
+                    run_id: second.run_id,
+                    owner: "agy-worker".into(),
+                    terminal_state: bastet_core::NormalizedRunState::Succeeded,
+                    provider_session_id: Some("provider-thread-client-test-2".into()),
+                    output_markdown: Some("# Agy research\n\nEvidence B.".into()),
+                    cost: bastet_core::CostEvidence {
+                        evidence_class: bastet_core::EvidenceClass::ProviderReported,
+                        currency: None,
+                        amount: None,
+                        input_tokens: Some(7),
+                        output_tokens: Some(3),
+                        confidence: 1.0,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let join = client
+            .begin_graph_node_run(
+                execution_id,
+                BeginGraphNodeRunCommand {
+                    expected_catalog_revision: second_finished.catalog_revision,
+                    expected_graph_revision: second_finished.graph_revision,
+                    node_id: graph.nodes[2].node_id,
                     owner: "integrator".into(),
-                    succeeded: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(join.prompt.contains("UNTRUSTED QUOTED DATA"));
+        assert!(join.prompt.contains("Evidence A"));
+        assert!(join.prompt.contains("Evidence B"));
+        let joined = client
+            .finish_graph_node_run(
+                execution_id,
+                FinishGraphNodeRunCommand {
+                    expected_catalog_revision: join.catalog_revision,
+                    expected_graph_revision: join.graph_revision,
+                    expected_m3_revision: second_finished.m3_revision,
+                    node_id: join.node_id,
+                    run_id: join.run_id,
+                    owner: "integrator".into(),
+                    terminal_state: bastet_core::NormalizedRunState::Succeeded,
+                    provider_session_id: Some("provider-thread-client-test-join".into()),
+                    output_markdown: Some("# Joined report\n\nEvidence A and B.".into()),
+                    cost: bastet_core::CostEvidence {
+                        evidence_class: bastet_core::EvidenceClass::ProviderReported,
+                        currency: None,
+                        amount: None,
+                        input_tokens: Some(15),
+                        output_tokens: Some(5),
+                        confidence: 1.0,
+                    },
                 },
             )
             .await
             .unwrap();
         let document = client
             .create_mvp_document(CreateDocumentCommand {
-                expected_m3_revision: finished.m3_revision,
+                expected_m3_revision: joined.m3_revision,
                 graph_execution_id: execution_id,
                 title: "Client report".into(),
                 markdown: "# Client report\n\nJoined evidence.".into(),
             })
             .await
             .unwrap();
+        let persisted_graph = client
+            .graph_executions()
+            .await
+            .unwrap()
+            .executions
+            .into_iter()
+            .find(|execution| execution.id == execution_id)
+            .unwrap();
+        assert_eq!(persisted_graph.outputs.len(), 3);
+        assert!(persisted_graph
+            .outputs
+            .iter()
+            .all(|output| output.content_hash.starts_with("sha256:")));
+        let version = &client
+            .m3_catalog()
+            .await
+            .unwrap()
+            .catalog
+            .deliverables
+            .documents[0]
+            .versions[0];
+        assert_eq!(version.source_execution_id, Some(execution_id));
+        assert_eq!(version.source_join_node_id, Some(join.node_id));
+        assert_eq!(version.source_join_output_hash, joined.output_content_hash);
         let accepted_document = client
             .accept_mvp_document(AcceptDocumentCommand {
                 expected_m3_revision: document.m3_revision,
@@ -877,6 +980,20 @@ mod tests {
         assert_eq!(
             store.snapshot().unwrap().lifecycle,
             bastet_protocol::DaemonLifecycle::Stopping
+        );
+        assert_eq!(
+            store.graph_execution(execution_id).unwrap().outputs.len(),
+            3
+        );
+        drop(store);
+        let reopened = Store::open(directory.path().join("bastet.db")).unwrap();
+        assert_eq!(
+            reopened
+                .graph_execution(execution_id)
+                .unwrap()
+                .outputs
+                .len(),
+            3
         );
     }
 }

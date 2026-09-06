@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{DecisionBaselineId, GraphNodeId, GraphRunId, RoleId};
+use crate::{DecisionBaselineId, GraphNodeId, GraphRunId, RoleId, RunId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,11 +48,53 @@ pub struct GraphNodeExecution {
     pub revision: u64,
 }
 
+pub const MAX_NODE_OUTPUT_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphNodeOutput {
+    pub node_id: GraphNodeId,
+    pub run_id: RunId,
+    pub content_hash: String,
+    pub markdown: String,
+}
+
+impl GraphNodeOutput {
+    pub fn create(
+        node_id: GraphNodeId,
+        run_id: RunId,
+        markdown: String,
+    ) -> Result<Self, GraphError> {
+        if markdown.trim().is_empty() || markdown.len() > MAX_NODE_OUTPUT_BYTES {
+            return Err(GraphError::InvalidOutput);
+        }
+        Ok(Self {
+            node_id,
+            run_id,
+            content_hash: output_hash(&markdown),
+            markdown,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), GraphError> {
+        if self.markdown.trim().is_empty()
+            || self.markdown.len() > MAX_NODE_OUTPUT_BYTES
+            || self.content_hash != output_hash(&self.markdown)
+        {
+            return Err(GraphError::InvalidOutput);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphExecution {
     pub id: GraphRunId,
     pub graph: WorkflowGraph,
     pub nodes: Vec<GraphNodeExecution>,
+    #[serde(default)]
+    pub outputs: Vec<GraphNodeOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restarted_from_execution_id: Option<GraphRunId>,
     pub revision: u64,
 }
 
@@ -71,6 +114,8 @@ pub enum GraphError {
     InvalidResearchJoin,
     #[error("graph execution owner or state is invalid")]
     InvalidExecution,
+    #[error("graph node output is missing, invalid, too large, or duplicated")]
+    InvalidOutput,
 }
 
 impl WorkflowGraph {
@@ -143,6 +188,8 @@ impl GraphExecution {
             id,
             graph,
             nodes,
+            outputs: Vec::new(),
+            restarted_from_execution_id: None,
             revision: 0,
         })
     }
@@ -175,6 +222,81 @@ impl GraphExecution {
         {
             return Err(GraphError::InvalidExecution);
         }
+        let output_nodes = self
+            .outputs
+            .iter()
+            .map(|output| output.node_id)
+            .collect::<HashSet<_>>();
+        let output_runs = self
+            .outputs
+            .iter()
+            .map(|output| output.run_id)
+            .collect::<HashSet<_>>();
+        if output_nodes.len() != self.outputs.len()
+            || output_runs.len() != self.outputs.len()
+            || self.outputs.iter().any(|output| {
+                output.validate().is_err()
+                    || !self
+                        .graph
+                        .nodes
+                        .iter()
+                        .any(|node| node.id == output.node_id)
+                    || self
+                        .nodes
+                        .iter()
+                        .find(|node| node.node_id == output.node_id)
+                        .is_none_or(|node| {
+                            !matches!(
+                                node.state,
+                                GraphNodeState::Succeeded | GraphNodeState::Failed
+                            )
+                        })
+            })
+        {
+            return Err(GraphError::InvalidOutput);
+        }
+        Ok(())
+    }
+
+    pub fn restart_as(&self, id: GraphRunId) -> Result<Self, GraphError> {
+        self.validate()?;
+        if self
+            .nodes
+            .iter()
+            .any(|node| node.state != GraphNodeState::Succeeded)
+            || self.outputs.len() == self.nodes.len()
+        {
+            return Err(GraphError::InvalidOutput);
+        }
+        let mut restarted = Self::start(id, self.graph.clone())?;
+        restarted.restarted_from_execution_id = Some(self.id);
+        Ok(restarted)
+    }
+
+    pub fn output(&self, node_id: GraphNodeId) -> Option<&GraphNodeOutput> {
+        self.outputs.iter().find(|output| output.node_id == node_id)
+    }
+
+    pub fn record_output(&mut self, output: GraphNodeOutput) -> Result<(), GraphError> {
+        output.validate()?;
+        if self
+            .outputs
+            .iter()
+            .any(|existing| existing.node_id == output.node_id || existing.run_id == output.run_id)
+            || self
+                .nodes
+                .iter()
+                .find(|node| node.node_id == output.node_id)
+                .is_none_or(|node| {
+                    !matches!(
+                        node.state,
+                        GraphNodeState::Succeeded | GraphNodeState::Failed
+                    )
+                })
+        {
+            return Err(GraphError::InvalidOutput);
+        }
+        self.outputs.push(output);
         Ok(())
     }
 
@@ -367,6 +489,10 @@ impl GraphExecution {
     }
 }
 
+fn output_hash(content: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(content.as_bytes()))
+}
+
 fn visit(
     id: GraphNodeId,
     graph: &WorkflowGraph,
@@ -493,5 +619,40 @@ mod tests {
         let mut implicit = graph();
         implicit.nodes[2].needs.pop();
         assert_eq!(implicit.validate(), Err(GraphError::InvalidResearchJoin));
+    }
+
+    #[test]
+    fn output_is_hash_bound_and_restart_preserves_original() {
+        let mut execution = GraphExecution::start(GraphRunId::new(), graph()).unwrap();
+        let original_id = execution.id;
+        let branches = execution.claim_ready("worker", 2).unwrap();
+        for (index, node_id) in branches.into_iter().enumerate() {
+            execution.complete(node_id, "worker", true).unwrap();
+            execution
+                .record_output(
+                    GraphNodeOutput::create(
+                        node_id,
+                        RunId::new(),
+                        format!("research output {index}"),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let join = execution.claim_ready("join", 1).unwrap()[0];
+        execution.complete(join, "join", true).unwrap();
+        assert_eq!(execution.validate(), Ok(()));
+
+        let restarted = execution.restart_as(GraphRunId::new()).unwrap();
+        assert_eq!(restarted.restarted_from_execution_id, Some(original_id));
+        assert!(restarted.outputs.is_empty());
+        assert!(restarted
+            .nodes
+            .iter()
+            .all(|node| node.state == GraphNodeState::Pending));
+
+        let mut tampered = execution;
+        tampered.outputs[0].markdown.push_str(" tampered");
+        assert_eq!(tampered.validate(), Err(GraphError::InvalidOutput));
     }
 }

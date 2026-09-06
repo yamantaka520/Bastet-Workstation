@@ -150,6 +150,18 @@ impl AgyProcess {
         self.stream.conversation_id()
     }
 
+    /// Returns the bounded final assistant Markdown retained outside the
+    /// lifecycle/cost/write-receipt update stream.
+    pub fn final_output(&self) -> Option<&str> {
+        self.stream.final_output()
+    }
+
+    /// True when a provider answer exceeded the capture bound and was
+    /// discarded rather than silently truncated.
+    pub fn final_output_overflowed(&self) -> bool {
+        self.stream.final_output_overflowed()
+    }
+
     pub fn next_update(&mut self, occurred_at: &str) -> Result<AgyRunUpdate, AgyProcessError> {
         if let Some(update) = self.pending.take() {
             return Ok(update);
