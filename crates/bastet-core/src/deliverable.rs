@@ -120,6 +120,39 @@ pub struct KnowledgeDelivery {
     pub destination_receipt: Option<String>,
 }
 
+impl KnowledgeDelivery {
+    pub fn prepare(
+        metadata: EntityMetadata<KnowledgeDeliveryId>,
+        project_id: ProjectId,
+        artifact_version_id: ArtifactVersionId,
+        target: KnowledgeTarget,
+        preview: String,
+    ) -> Result<Self, DeliverableError> {
+        if preview.trim().is_empty() {
+            return Err(DeliverableError::InvalidKnowledgeDelivery);
+        }
+        Ok(Self {
+            metadata,
+            project_id,
+            artifact_version_id,
+            target,
+            preview,
+            redacted: true,
+            state: DeliveryState::Prepared,
+            destination_receipt: None,
+        })
+    }
+
+    pub fn record_delivered(&mut self, receipt: String) -> Result<(), DeliverableError> {
+        if self.state != DeliveryState::Prepared || receipt.trim().is_empty() {
+            return Err(DeliverableError::InvalidKnowledgeDelivery);
+        }
+        self.state = DeliveryState::Delivered;
+        self.destination_receipt = Some(receipt);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeliverableCatalog {
     pub documents: Vec<DocumentArtifact>,
@@ -255,5 +288,35 @@ mod tests {
         });
         let evidence: crate::CostEvidence = serde_json::from_value(json).unwrap();
         assert_eq!(evidence.evidence_class, EvidenceClass::Unknown);
+    }
+
+    #[test]
+    fn knowledge_delivery_requires_preview_then_external_receipt() {
+        let metadata = EntityMetadata {
+            id: KnowledgeDeliveryId::from_bytes([74; 16]),
+            revision: 0,
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            provenance: crate::Provenance {
+                source_kind: "local_user".into(),
+                source_id: "delivery".into(),
+                recorded_by: "test".into(),
+            },
+            lifecycle: crate::EntityLifecycle::Active,
+        };
+        let mut delivery = KnowledgeDelivery::prepare(
+            metadata,
+            ProjectId::from_bytes([75; 16]),
+            ArtifactVersionId::from_bytes([76; 16]),
+            KnowledgeTarget::AgentMemoryOs,
+            "Redacted decision summary".into(),
+        )
+        .unwrap();
+        assert_eq!(delivery.state, DeliveryState::Prepared);
+        assert!(delivery.record_delivered("".into()).is_err());
+        delivery
+            .record_delivered("memory:receipt-1".into())
+            .unwrap();
+        assert_eq!(delivery.state, DeliveryState::Delivered);
     }
 }

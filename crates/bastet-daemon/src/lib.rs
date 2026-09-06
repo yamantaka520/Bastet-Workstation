@@ -17,17 +17,19 @@ use bastet_core::{
     accept_mvp_decision, ApprovalError, ApprovalRequestId, ArtifactId, ArtifactVersionId,
     CatalogError, DocumentArtifact, DocumentVersion, EntityLifecycle, EntityMetadata, GraphError,
     GraphExecution, GraphNodeId, GraphNodeKind, GraphNodeState, GraphRunId, IdentityCatalog,
-    M3Catalog, M3State, MvpDraft, Provenance, RunId,
+    KnowledgeDelivery, KnowledgeDeliveryId, M3Catalog, M3State, MvpDraft, Provenance, RunId,
 };
 use bastet_protocol::{
     AcceptDecisionBaselineCommand, AcceptDecisionBaselineReceipt, AcceptDocumentCommand,
     ApprovalList, ApprovalReceipt, ApprovalRecord, CancelRunReceipt, CatalogReceipt,
     CatalogSnapshot, CheckpointCommand, CheckpointReceipt, ClaimGraphNodesCommand,
     ClaimGraphNodesReceipt, CompleteGraphNodeCommand, CompleteGraphNodeReceipt,
-    CreateApprovalCommand, CreateDocumentCommand, CreateGraphExecutionCommand, DaemonLifecycle,
-    DaemonSnapshot, DecideApprovalCommand, DocumentReceipt, EventEnvelope, GraphExecutionList,
-    GraphExecutionReceipt, M3CatalogSnapshot, PrepareMvpCommand, PrepareMvpReceipt,
-    ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
+    CompleteKnowledgeDeliveryCommand, CreateApprovalCommand, CreateDocumentCommand,
+    CreateGraphExecutionCommand, DaemonLifecycle, DaemonSnapshot, DecideApprovalCommand,
+    DocumentReceipt, EventEnvelope, GraphExecutionList, GraphExecutionReceipt,
+    KnowledgeDeliveryReceipt, M3CatalogSnapshot, PrepareKnowledgeDeliveryCommand,
+    PrepareMvpCommand, PrepareMvpReceipt, ReplaceCatalogCommand, ReplaceM3CatalogCommand,
+    PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
@@ -206,6 +208,14 @@ fn build_router_with_controller(
         )
         .route("/v1/mvp/document", post(create_mvp_document))
         .route("/v1/mvp/document/accept", post(accept_mvp_document))
+        .route(
+            "/v1/mvp/knowledge/prepare",
+            post(prepare_knowledge_delivery),
+        )
+        .route(
+            "/v1/mvp/knowledge/complete",
+            post(complete_knowledge_delivery),
+        )
         .route("/v1/approvals", get(approvals).post(create_approval))
         .route(
             "/v1/approvals/{request_id}",
@@ -367,6 +377,20 @@ async fn accept_mvp_document(
     Json(command): Json<AcceptDocumentCommand>,
 ) -> Result<Json<DocumentReceipt>, ApiError> {
     Ok(Json(state.store.accept_mvp_document(command)?))
+}
+
+async fn prepare_knowledge_delivery(
+    State(state): State<AppState>,
+    Json(command): Json<PrepareKnowledgeDeliveryCommand>,
+) -> Result<Json<KnowledgeDeliveryReceipt>, ApiError> {
+    Ok(Json(state.store.prepare_knowledge_delivery(command)?))
+}
+
+async fn complete_knowledge_delivery(
+    State(state): State<AppState>,
+    Json(command): Json<CompleteKnowledgeDeliveryCommand>,
+) -> Result<Json<KnowledgeDeliveryReceipt>, ApiError> {
+    Ok(Json(state.store.complete_knowledge_delivery(command)?))
 }
 
 async fn create_approval(
@@ -897,6 +921,140 @@ impl Store {
             artifact_id: command.artifact_id,
             version_id: command.version_id,
             content_hash: command.content_hash,
+            m3_revision: revision,
+            event_sequence: event.sequence,
+        })
+    }
+
+    pub fn prepare_knowledge_delivery(
+        &self,
+        command: PrepareKnowledgeDeliveryCommand,
+    ) -> Result<KnowledgeDeliveryReceipt, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let identity: IdentityCatalog =
+            serde_json::from_str(&transaction.query_row::<String, _, _>(
+                "SELECT catalog_json FROM identity_catalog WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?)?;
+        let (actual, json): (u64, String) = transaction.query_row(
+            "SELECT revision, catalog_json FROM m3_catalog WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if actual != command.expected_m3_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: command.expected_m3_revision,
+                actual,
+            });
+        }
+        let mut catalog: M3Catalog = serde_json::from_str(&json)?;
+        let accepted = catalog.deliverables.documents.iter().any(|document| {
+            document.project_id == command.project_id
+                && document.versions.iter().any(|version| {
+                    version.id == command.artifact_version_id && version.accepted_by.is_some()
+                })
+        });
+        if !accepted {
+            return Err(StoreError::InvalidDocument(
+                "knowledge delivery requires an accepted artifact version".into(),
+            ));
+        }
+        let delivery_id = KnowledgeDeliveryId::new();
+        let delivery = KnowledgeDelivery::prepare(
+            entity_metadata(delivery_id, "knowledge_delivery"),
+            command.project_id,
+            command.artifact_version_id,
+            command.target,
+            command.preview,
+        )
+        .map_err(|error| StoreError::InvalidDocument(error.to_string()))?;
+        let state = delivery.state;
+        catalog.deliverables.knowledge_deliveries.push(delivery);
+        let executions = load_graph_executions(&transaction)?;
+        M3State {
+            catalog: catalog.clone(),
+            graph_executions: executions,
+        }
+        .validate(&identity)
+        .map_err(|error| StoreError::InvalidDocument(error.to_string()))?;
+        let revision = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
+        transaction.execute(
+            "UPDATE m3_catalog SET revision=?1, catalog_json=?2, updated_at=?3 WHERE singleton=1",
+            params![revision, serde_json::to_string(&catalog)?, timestamp()],
+        )?;
+        let event = insert_event(
+            &transaction,
+            "knowledge.delivery_prepared",
+            &serde_json::json!({"delivery_id": delivery_id, "target": command.target}).to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(KnowledgeDeliveryReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            delivery_id,
+            state,
+            m3_revision: revision,
+            event_sequence: event.sequence,
+        })
+    }
+
+    pub fn complete_knowledge_delivery(
+        &self,
+        command: CompleteKnowledgeDeliveryCommand,
+    ) -> Result<KnowledgeDeliveryReceipt, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let identity: IdentityCatalog =
+            serde_json::from_str(&transaction.query_row::<String, _, _>(
+                "SELECT catalog_json FROM identity_catalog WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?)?;
+        let (actual, json): (u64, String) = transaction.query_row(
+            "SELECT revision, catalog_json FROM m3_catalog WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if actual != command.expected_m3_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: command.expected_m3_revision,
+                actual,
+            });
+        }
+        let mut catalog: M3Catalog = serde_json::from_str(&json)?;
+        let delivery = catalog
+            .deliverables
+            .knowledge_deliveries
+            .iter_mut()
+            .find(|delivery| delivery.metadata.id == command.delivery_id)
+            .ok_or_else(|| StoreError::InvalidDocument("knowledge delivery not found".into()))?;
+        delivery
+            .record_delivered(command.destination_receipt)
+            .map_err(|error| StoreError::InvalidDocument(error.to_string()))?;
+        let state = delivery.state;
+        let executions = load_graph_executions(&transaction)?;
+        M3State {
+            catalog: catalog.clone(),
+            graph_executions: executions,
+        }
+        .validate(&identity)
+        .map_err(|error| StoreError::InvalidDocument(error.to_string()))?;
+        let revision = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
+        transaction.execute(
+            "UPDATE m3_catalog SET revision=?1, catalog_json=?2, updated_at=?3 WHERE singleton=1",
+            params![revision, serde_json::to_string(&catalog)?, timestamp()],
+        )?;
+        let event = insert_event(
+            &transaction,
+            "knowledge.delivery_completed",
+            &serde_json::json!({"delivery_id": command.delivery_id}).to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(KnowledgeDeliveryReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            delivery_id: command.delivery_id,
+            state,
             m3_revision: revision,
             event_sequence: event.sequence,
         })
@@ -2523,7 +2681,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(document.m3_revision, 3);
-        store
+        let accepted_document = store
             .accept_mvp_document(AcceptDocumentCommand {
                 expected_m3_revision: 3,
                 artifact_id: document.artifact_id,
@@ -2531,6 +2689,38 @@ mod tests {
                 content_hash: document.content_hash,
                 accepted_by: "local-user".into(),
                 accepted_at: "2026-09-07T00:01:00Z".into(),
+            })
+            .unwrap();
+        let memory = store
+            .prepare_knowledge_delivery(PrepareKnowledgeDeliveryCommand {
+                expected_m3_revision: accepted_document.m3_revision,
+                project_id: prepared.project_id,
+                artifact_version_id: document.version_id,
+                target: bastet_core::KnowledgeTarget::AgentMemoryOs,
+                preview: "Redacted accepted report summary".into(),
+            })
+            .unwrap();
+        let memory = store
+            .complete_knowledge_delivery(CompleteKnowledgeDeliveryCommand {
+                expected_m3_revision: memory.m3_revision,
+                delivery_id: memory.delivery_id,
+                destination_receipt: "memory:fixture".into(),
+            })
+            .unwrap();
+        let wiki = store
+            .prepare_knowledge_delivery(PrepareKnowledgeDeliveryCommand {
+                expected_m3_revision: memory.m3_revision,
+                project_id: prepared.project_id,
+                artifact_version_id: document.version_id,
+                target: bastet_core::KnowledgeTarget::BastetMind,
+                preview: "Redacted accepted report summary".into(),
+            })
+            .unwrap();
+        store
+            .complete_knowledge_delivery(CompleteKnowledgeDeliveryCommand {
+                expected_m3_revision: wiki.m3_revision,
+                delivery_id: wiki.delivery_id,
+                destination_receipt: "bastetmind:fixture".into(),
             })
             .unwrap();
         drop(store);
@@ -2557,6 +2747,14 @@ mod tests {
             .versions[0]
             .accepted_by
             .is_some());
+        assert!(reopened
+            .m3_catalog()
+            .unwrap()
+            .catalog
+            .deliverables
+            .knowledge_deliveries
+            .iter()
+            .all(|delivery| delivery.state == bastet_core::DeliveryState::Delivered));
     }
 
     #[tokio::test]

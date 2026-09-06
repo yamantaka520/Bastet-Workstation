@@ -66,3 +66,7 @@ verification evidence without adding scope.
 - The desktop now renders the exact Markdown and hash, authors a document only after the graph is
   fully successful, and exposes a separate exact-version acceptance action. The client loopback
   test covers both document transactions through HTTP before checkpoint/shutdown.
+- Knowledge publication is a durable two-phase protocol: only an accepted artifact version can
+  create a redacted `Prepared` delivery, and only a non-empty external destination receipt changes
+  it to `Delivered`. AgentMemoryOS and BastetMind targets remain separate records. Restart tests
+  prove both completed delivery receipts survive without journaling preview content or receipts.

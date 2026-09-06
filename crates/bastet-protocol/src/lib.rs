@@ -199,6 +199,31 @@ pub struct AcceptDocumentCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrepareKnowledgeDeliveryCommand {
+    pub expected_m3_revision: u64,
+    pub project_id: bastet_core::ProjectId,
+    pub artifact_version_id: bastet_core::ArtifactVersionId,
+    pub target: bastet_core::KnowledgeTarget,
+    pub preview: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteKnowledgeDeliveryCommand {
+    pub expected_m3_revision: u64,
+    pub delivery_id: bastet_core::KnowledgeDeliveryId,
+    pub destination_receipt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeDeliveryReceipt {
+    pub protocol_version: u32,
+    pub delivery_id: bastet_core::KnowledgeDeliveryId,
+    pub state: bastet_core::DeliveryState,
+    pub m3_revision: u64,
+    pub event_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateApprovalCommand {
     pub request: ApprovalRequest,
 }
