@@ -45,3 +45,7 @@ verification evidence without adding scope.
 - M3.4b projects persisted graph-node lifecycle into role-work Pet states (`idle`, `working`,
   `succeeded`, `failed`, `blocked`, or restart-safe `waiting`) through the daemon/client boundary;
   visual icons remain supplemental to visible and screen-reader text.
+- The pure MVP draft compiler now creates one Project, Codex/Agy AgentInstances, two independent
+  research Roles, one integrator Role, a room, three role-bound PetAssignments, and a bounded
+  meeting. It emits no graph until explicit human DecisionBaseline acceptance, then compiles
+  exactly two research branches and one join.

@@ -166,7 +166,10 @@ impl MeetingCatalog {
                 .iter()
                 .find(|meeting| meeting.metadata.id == baseline.meeting_id)
                 .ok_or(MeetingError::MissingMeeting)?;
-            if meeting.state != MeetingState::AwaitingDecision {
+            if !matches!(
+                meeting.state,
+                MeetingState::AwaitingDecision | MeetingState::Accepted
+            ) {
                 return Err(MeetingError::MeetingNotAwaitingDecision);
             }
             if !baseline_meetings.insert(baseline.meeting_id) {
