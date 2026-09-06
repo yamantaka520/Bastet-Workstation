@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { hasExplicitWorkflowTranslation, locales, translate, workflowKeys } from "./i18n";
@@ -24,7 +24,7 @@ vi.mock("@tauri-apps/plugin-autostart", () => ({
 }));
 
 describe("M1 shell", () => {
-  beforeEach(() => invokeMock.mockImplementation(defaultInvoke));
+  beforeEach(() => { invokeMock.mockReset(); invokeMock.mockImplementation(defaultInvoke); });
   it("has every required locale and no missing critical keys", () => {
     expect(locales).toEqual(["zh-Hant", "zh-Hans", "en", "ja", "ko"]);
     for (const locale of locales) expect(translate(locale, "ready")).not.toMatch(/^\[missing:/);
@@ -97,5 +97,57 @@ describe("M1 shell", () => {
     fireEvent.click(button);
     expect(button).toBeDisabled();
     expect(screen.getByText("工作執行中…")).toBeInTheDocument();
+  });
+
+  it("shows pending feedback and submits a prepare request only once", async () => {
+    invokeMock.mockImplementation((command: string) => command === "agent_center_snapshot"
+      ? Promise.resolve({ agents: [
+        { adapter_kind: "codex_cli", display_name: "Codex CLI", installed: true, version: "1.0.0", authenticated: true, model_count: 1, models: ["gpt-test"], reasoning_controls: [], operations: [], error_key: null },
+        { adapter_kind: "agy_cli", display_name: "Agy CLI", installed: true, version: "1.0.0", authenticated: true, model_count: 1, models: ["agy-test"], reasoning_controls: [], operations: [], error_key: null },
+      ] })
+      : command === "prepare_mvp" ? new Promise(() => undefined) : defaultInvoke(command));
+    render(<App />);
+
+    fireEvent.change(await screen.findByLabelText("專案名稱"), { target: { value: "Demo" } });
+    await screen.findByRole("option", { name: "agy-test" });
+    fireEvent.change(screen.getByLabelText("絕對工作目錄"), { target: { value: "/tmp/demo" } });
+    fireEvent.change(screen.getByLabelText("Codex 模型"), { target: { value: "gpt-test" } });
+    fireEvent.change(screen.getByLabelText("Agy 模型"), { target: { value: "agy-test" } });
+    const button = screen.getByRole("button", { name: "準備會議" });
+    const form = button.closest("form");
+    expect(form).not.toBeNull();
+    fireEvent.submit(form!);
+    fireEvent.submit(form!);
+
+    expect(button).toBeDisabled();
+    expect(screen.getByText("工作執行中…")).toBeInTheDocument();
+    expect(invokeMock.mock.calls.filter(([command]) => command === "prepare_mvp")).toHaveLength(1);
+    expect(invokeMock).toHaveBeenCalledWith("prepare_mvp", { projectName: "Demo", workspaceRoot: "/tmp/demo", codexModel: "gpt-test", agyModel: "agy-test" });
+  });
+
+  it("shows a prepare error beside the form and preserves its entries", async () => {
+    invokeMock.mockImplementation((command: string) => command === "agent_center_snapshot"
+      ? Promise.resolve({ agents: [
+        { adapter_kind: "codex_cli", display_name: "Codex CLI", installed: true, version: "1.0.0", authenticated: true, model_count: 1, models: ["gpt-test"], reasoning_controls: [], operations: [], error_key: null },
+        { adapter_kind: "agy_cli", display_name: "Agy CLI", installed: true, version: "1.0.0", authenticated: true, model_count: 1, models: ["agy-test"], reasoning_controls: [], operations: [], error_key: null },
+      ] })
+      : command === "prepare_mvp" ? Promise.reject(new Error("unavailable")) : defaultInvoke(command));
+    render(<App />);
+
+    const projectName = await screen.findByLabelText("專案名稱");
+    await screen.findByRole("option", { name: "agy-test" });
+    const workspaceRoot = screen.getByLabelText("絕對工作目錄");
+    fireEvent.change(projectName, { target: { value: "Demo" } });
+    fireEvent.change(workspaceRoot, { target: { value: "/tmp/demo" } });
+    fireEvent.change(screen.getByLabelText("Codex 模型"), { target: { value: "gpt-test" } });
+    fireEvent.change(screen.getByLabelText("Agy 模型"), { target: { value: "agy-test" } });
+    fireEvent.click(screen.getByRole("button", { name: "準備會議" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("操作失敗，已確認的狀態未變更。");
+    expect(projectName).toHaveValue("Demo");
+    expect(workspaceRoot).toHaveValue("/tmp/demo");
+    expect(screen.getByLabelText("Codex 模型")).toHaveValue("gpt-test");
+    expect(screen.getByLabelText("Agy 模型")).toHaveValue("agy-test");
+    await waitFor(() => expect(screen.getByRole("button", { name: "準備會議" })).toBeEnabled());
   });
 });

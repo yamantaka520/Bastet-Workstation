@@ -68,5 +68,20 @@ secret, private prompt, or sensitive workspace content.
 | Findings | Severity, reproduction steps, and linked fix/retest commit |
 | Decision | Human name, date, and explicit M3 accept/reject |
 
+## Human evidence in progress
+
+2026-09-07 blocking finding: after applying the built-in Pet, preparing `Test-Prj` failed.
+Desktop and core constructed identical Pet assets with different metadata timestamps, so the daemon
+rejected the desktop profile as existing data. The global error was outside the scrolled form.
+The correction shares the core factory, accepts the exact legacy desktop profile while preserving
+it, and adds submission feedback beside the form. Rebuilt-app operator retest using the user's
+existing Pet and `Test-Prj` input passed: revision 1 → 2, one room, one meeting, DecisionBaseline
+input displayed. This was an Agent-operated regression check, not human acceptance. Daemon 24/24,
+desktop 5/5, Clippy, TypeScript, and bundle build passed; M3 remains open.
+
+| Date | Commit/build | Reporter | Check | Result | Remaining scope |
+|---|---|---|---|---|---|
+| 2026-09-07 | `fe594972f35b0230268d17b2fa98e59de9824fab`; local macOS debug app SHA-256 `b17d1608a4ab7fbfa00c16e7cda03af4130aa6cf130406dd4d2bf7a9e388f659` | User | Locale switching | Pass — user reported no issue | Locale-by-locale full workflow, long strings/IME, accessibility, normal restart, and graphical forced-close |
+
 M3 is complete only after all automated rows are bound to the same final commit, GitHub Actions is
 green, every locale row is signed, and every blocking finding is fixed and retested.

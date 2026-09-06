@@ -5,8 +5,7 @@ mod macos_power;
 
 use bastet_client::DaemonClient;
 use bastet_core::{
-    ApprovalDecision, ApprovalRequestId, EntityLifecycle, EntityMetadata, MeetingId, PetProfile,
-    PetProfileId, PetStateAsset, Provenance, REQUIRED_PET_STATES,
+    builtin_pet_profile, ApprovalDecision, ApprovalRequestId, MeetingId, PetProfile,
 };
 use bastet_protocol::{
     ApprovalList, ApprovalReceipt, CheckpointReceipt, DaemonLifecycle, DaemonSnapshot,
@@ -873,33 +872,6 @@ fn pet_state(state: bastet_core::GraphNodeState) -> &'static str {
         bastet_core::GraphNodeState::Failed => "failed",
         bastet_core::GraphNodeState::Blocked => "blocked",
         bastet_core::GraphNodeState::Uncertain => "waiting",
-    }
-}
-
-fn builtin_pet_profile() -> PetProfile {
-    PetProfile {
-        metadata: EntityMetadata {
-            id: PetProfileId::from_bytes([0xBA; 16]),
-            revision: 0,
-            created_at: "builtin-v1".into(),
-            updated_at: "builtin-v1".into(),
-            provenance: Provenance {
-                source_kind: "first_party".into(),
-                source_id: "bastet-cat-v1".into(),
-                recorded_by: "bastet-workstation".into(),
-            },
-            lifecycle: EntityLifecycle::Active,
-        },
-        name: "Bastet Cat".into(),
-        version: 1,
-        states: REQUIRED_PET_STATES
-            .into_iter()
-            .map(|state| PetStateAsset {
-                state_key: state.into(),
-                asset_ref: format!("builtin://bastet-cat/{state}"),
-                accessible_label_key: format!("pet.state.{state}"),
-            })
-            .collect(),
     }
 }
 

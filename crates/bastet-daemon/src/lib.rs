@@ -671,7 +671,7 @@ impl Store {
     }
 
     pub fn prepare_mvp(&self, command: PrepareMvpCommand) -> Result<PrepareMvpReceipt, StoreError> {
-        let draft = MvpDraft::prepare(
+        let mut draft = MvpDraft::prepare(
             &command.project_name,
             Path::new(&command.workspace_root),
             &command.codex_model,
@@ -706,6 +706,9 @@ impl Store {
             return Err(StoreError::InvalidMvp(
                 "MVP initializer refuses to replace existing project data".into(),
             ));
+        }
+        if !existing_m3.office.pet_profiles.is_empty() {
+            draft.m3.office.pet_profiles = existing_m3.office.pet_profiles.clone();
         }
         if catalog_revision != command.expected_catalog_revision {
             return Err(StoreError::RevisionConflict {
@@ -2223,7 +2226,12 @@ fn m3_is_unconfigured(catalog: &M3Catalog) -> bool {
     if catalog == &M3Catalog::default() {
         return true;
     }
-    catalog.office.pet_profiles == vec![bastet_core::builtin_pet_profile()]
+    let canonical = bastet_core::builtin_pet_profile();
+    let mut legacy_desktop = canonical.clone();
+    legacy_desktop.metadata.created_at = "builtin-v1".into();
+    legacy_desktop.metadata.updated_at = "builtin-v1".into();
+    (catalog.office.pet_profiles == vec![canonical]
+        || catalog.office.pet_profiles == vec![legacy_desktop])
         && catalog.office.pet_assignments.is_empty()
         && catalog.office.rooms.is_empty()
         && catalog.meetings == bastet_core::MeetingCatalog::default()
@@ -3099,6 +3107,46 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event.event_type == "m3.catalog_replaced"));
+    }
+
+    #[test]
+    fn prepare_meeting_preserves_previously_applied_pet() {
+        for legacy in [false, true] {
+            let directory = tempdir().unwrap();
+            let workspace = tempdir().unwrap();
+            let store = Store::open(directory.path().join("pet.db")).unwrap();
+            let mut pet = bastet_core::builtin_pet_profile();
+            if legacy {
+                pet.metadata.created_at = "builtin-v1".into();
+                pet.metadata.updated_at = "builtin-v1".into();
+            }
+            let mut catalog = M3Catalog::default();
+            catalog.office.pet_profiles.push(pet.clone());
+            let mut changed = catalog.clone();
+            changed.office.pet_profiles[0].name = "Custom pet".into();
+            assert!(!m3_is_unconfigured(&changed));
+            store
+                .replace_m3_catalog(ReplaceM3CatalogCommand {
+                    expected_revision: 0,
+                    catalog,
+                })
+                .unwrap();
+            let receipt = store
+                .prepare_mvp(PrepareMvpCommand {
+                    expected_catalog_revision: 0,
+                    expected_m3_revision: 1,
+                    project_name: "Test-Prj".into(),
+                    workspace_root: workspace.path().to_string_lossy().into_owned(),
+                    codex_model: "gpt-test".into(),
+                    agy_model: "agy-test".into(),
+                })
+                .unwrap();
+            assert_eq!(receipt.m3_revision, 2);
+            assert_eq!(
+                store.m3_catalog().unwrap().catalog.office.pet_profiles,
+                vec![pet]
+            );
+        }
     }
 
     #[test]

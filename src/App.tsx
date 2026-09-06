@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { locales, type Locale, translate } from "./i18n";
 import "./styles.css";
 
@@ -33,6 +33,9 @@ export function App() {
   const [documentMarkdown, setDocumentMarkdown] = useState("");
   const [actionError, setActionError] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
+  const [prepareError, setPrepareError] = useState(false);
+  const [prepareBusy, setPrepareBusy] = useState(false);
+  const preparePending = useRef(false);
   const [autostart, setAutostart] = useState(false);
 
   const reconnect = useCallback(async () => {
@@ -65,9 +68,12 @@ export function App() {
     catch { setActionError(true); }
   };
   const prepareMvp = async () => {
-    setActionError(false);
+    if (preparePending.current) return;
+    preparePending.current = true;
+    setPrepareError(false); setPrepareBusy(true);
     try { await invoke("prepare_mvp", { projectName, workspaceRoot, codexModel, agyModel }); await reconnect(); }
-    catch { setActionError(true); }
+    catch { setPrepareError(true); }
+    finally { preparePending.current = false; setPrepareBusy(false); }
   };
   const acceptDecision = async (meetingId: string) => {
     setActionError(false);
@@ -119,7 +125,7 @@ export function App() {
       <article><h3>{translate(locale, "builtinPet")}: Bastet Cat</h3><p>{translate(locale, m3.pet_profiles.length ? "applied" : "notApplied")}</p>
         <ul className="pet-states">{["idle", "thinking", "working", "waiting", "blocked", "approval_required", "succeeded", "failed"].map((state) => <li key={state}><span aria-hidden="true">🐈</span><span>{state}</span></li>)}</ul>
         <button type="button" onClick={() => void changeBuiltinPet(m3.pet_profiles.length === 0)}>{translate(locale, m3.pet_profiles.length ? "rollbackPet" : "applyPet")}</button></article>
-      {m3.meetings === 0 && <form onSubmit={(event) => { event.preventDefault(); void prepareMvp(); }}><h3>{translate(locale, "prepareMvp")}</h3><label>{translate(locale, "projectName")}<input required value={projectName} onChange={(event) => setProjectName(event.target.value)} /></label><label>{translate(locale, "workspaceRoot")}<input required value={workspaceRoot} onChange={(event) => setWorkspaceRoot(event.target.value)} /></label><label>Codex {translate(locale, "models")}<select required value={codexModel} onChange={(event) => setCodexModel(event.target.value)}><option value="">—</option>{agents.find((agent) => agent.adapter_kind === "codex_cli")?.models.map((model) => <option key={model}>{model}</option>)}</select></label><label>Agy {translate(locale, "models")}<select required value={agyModel} onChange={(event) => setAgyModel(event.target.value)}><option value="">—</option>{agents.find((agent) => agent.adapter_kind === "agy_cli")?.models.map((model) => <option key={model}>{model}</option>)}</select></label><button type="submit">{translate(locale, "prepare")}</button></form>}
+      {m3.meetings === 0 && <form onSubmit={(event) => { event.preventDefault(); void prepareMvp(); }}><h3>{translate(locale, "prepareMvp")}</h3><label>{translate(locale, "projectName")}<input required disabled={prepareBusy} value={projectName} onChange={(event) => setProjectName(event.target.value)} /></label><label>{translate(locale, "workspaceRoot")}<input required disabled={prepareBusy} value={workspaceRoot} onChange={(event) => setWorkspaceRoot(event.target.value)} /></label><label>Codex {translate(locale, "models")}<select required disabled={prepareBusy} value={codexModel} onChange={(event) => setCodexModel(event.target.value)}><option value="">—</option>{agents.find((agent) => agent.adapter_kind === "codex_cli")?.models.map((model) => <option key={model}>{model}</option>)}</select></label><label>Agy {translate(locale, "models")}<select required disabled={prepareBusy} value={agyModel} onChange={(event) => setAgyModel(event.target.value)}><option value="">—</option>{agents.find((agent) => agent.adapter_kind === "agy_cli")?.models.map((model) => <option key={model}>{model}</option>)}</select></label>{prepareBusy && <p role="status">{translate(locale, "working")}</p>}{prepareError && <p role="alert">{translate(locale, "actionFailed")}</p>}<button type="submit" disabled={prepareBusy}>{translate(locale, "prepare")}</button></form>}
       {m3.awaiting_meetings.map((meeting) => <article key={meeting.meeting_id}><h3>{translate(locale, "decisionBaseline")}</h3><p>{meeting.summary}</p><label>{translate(locale, "decisionBaseline")}<textarea required value={decision} onChange={(event) => setDecision(event.target.value)} /></label><button type="button" disabled={!decision.trim()} onClick={() => void acceptDecision(meeting.meeting_id)}>{translate(locale, "acceptDecision")}</button></article>)}
       {m3.graph_nodes.some((node) => node.state === "pending") && <button type="button" disabled={actionBusy} onClick={() => void runReady()}>{translate(locale, "runReady")}</button>}
       {completedExecution && m3.document_versions.length === 0 && <form onSubmit={(event) => { event.preventDefault(); void createDocument(); }}><label>{translate(locale, "documentTitle")}<input required value={documentTitle} onChange={(event) => setDocumentTitle(event.target.value)} /></label><label>{translate(locale, "documentMarkdown")}<textarea required value={documentMarkdown} onChange={(event) => setDocumentMarkdown(event.target.value)} /></label><button type="submit">{translate(locale, "createDocument")}</button></form>}
