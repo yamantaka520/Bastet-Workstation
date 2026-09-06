@@ -3,7 +3,7 @@ use std::{path::PathBuf, time::Duration};
 use bastet_adapter_codex::{
     ApprovalPolicy, CodexAppServer, CodexRunEvidence, CodexRunEvidenceUpdate, CodexRunStream,
     CodexRunUpdate, StdioTransport, ThreadSandbox, ThreadStartRequest, TurnSandboxPolicy,
-    TurnStartRequest,
+    TurnStartRequest, WorkspaceSnapshot,
 };
 use bastet_core::{AdapterFailureKind, NormalizedRunState, RunId};
 
@@ -267,6 +267,7 @@ fn installed_codex_reports_a_bounded_workspace_write_over_stdio() {
     assert!(probe_root.is_absolute());
     assert!(probe_root.is_dir());
     assert_eq!(std::fs::read_dir(&probe_root).unwrap().count(), 0);
+    let before = WorkspaceSnapshot::capture(&probe_root).unwrap();
 
     let transport = StdioTransport::spawn(&executable, Duration::from_secs(60)).unwrap();
     let mut server = CodexAppServer::new(transport);
@@ -310,27 +311,35 @@ fn installed_codex_reports_a_bounded_workspace_write_over_stdio() {
     let mut saw_write_receipt = false;
 
     loop {
-        let notification = server.next_notification().unwrap();
-        if let Some(CodexRunEvidenceUpdate::WriteReceipt(receipt)) =
-            evidence.ingest(&notification).unwrap()
-        {
-            assert!(!receipt.contains("receipt.txt"));
-            assert!(!receipt.contains("BASTET_WRITE_OK"));
-            saw_write_receipt = true;
-        }
-        let Some(event) = stream
-            .ingest(&notification, "2026-09-03T00:00:00Z")
+        match server
+            .next_run_update(&mut stream, &evidence, "2026-09-03T00:00:00Z")
             .unwrap()
-        else {
-            continue;
-        };
-        match event.event.state {
-            NormalizedRunState::Running => {}
-            NormalizedRunState::Succeeded => break,
-            state => panic!("write probe ended in unexpected state: {state:?}"),
+        {
+            CodexRunUpdate::Evidence(CodexRunEvidenceUpdate::WriteReceipt(receipt)) => {
+                assert!(!receipt.contains("receipt.txt"));
+                assert!(!receipt.contains("BASTET_WRITE_OK"));
+                saw_write_receipt = true;
+            }
+            CodexRunUpdate::Evidence(CodexRunEvidenceUpdate::Cost(_)) => {}
+            CodexRunUpdate::Lifecycle(event) => match event.event.state {
+                NormalizedRunState::Running => {}
+                NormalizedRunState::Succeeded => break,
+                state => panic!("write probe ended in unexpected state: {state:?}"),
+            },
         }
     }
 
+    let after = WorkspaceSnapshot::capture(&probe_root).unwrap();
+    if !saw_write_receipt {
+        let receipt = before
+            .write_receipt(&after)
+            .unwrap()
+            .expect("the bounded write must have locally measured evidence");
+        assert!(receipt.contains("locally_measured"));
+        assert!(!receipt.contains("receipt.txt"));
+        assert!(!receipt.contains("BASTET_WRITE_OK"));
+        saw_write_receipt = true;
+    }
     assert!(saw_write_receipt);
     let entries = std::fs::read_dir(&probe_root)
         .unwrap()

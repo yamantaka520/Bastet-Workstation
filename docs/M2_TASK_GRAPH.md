@@ -101,5 +101,12 @@ verification status; it does not add scope.
   transport loss becomes an uncertain crash event; protocol drift and remote rejection still fail
   closed instead of being mislabeled as runtime state. A real read-only canary passes through this
   unified boundary. Real write evidence remains gated separately because the provider does not
-  guarantee a diff notification for every observed filesystem write.
+  guarantee a diff notification for every observed filesystem write. The official definitive
+  `item/completed` file-change lifecycle is therefore accepted as a second write-evidence source
+  only when the target run matches, status is `completed`, and the change list is non-empty and
+  structurally valid; all paths and diffs are discarded from the normalized receipt. Because
+  command execution can mutate the workspace without either provider event, a bounded local
+  before/after snapshot supplies `LocallyMeasured` fallback evidence. It hashes regular-file
+  contents, rejects symlinks, caps scans at 10,000 files and 256 MiB, and exposes only the changed
+  file count rather than paths or content.
 - M2.4–M2.8: not started.

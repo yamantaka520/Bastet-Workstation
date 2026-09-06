@@ -4,6 +4,7 @@ mod app_server;
 mod evidence;
 mod lifecycle;
 mod stdio;
+mod workspace;
 
 pub use app_server::{
     AppServerError, AppServerNotification, AppServerTransport, ApprovalPolicy, CodexAppServer,
@@ -14,6 +15,7 @@ pub use app_server::{
 pub use evidence::{CodexRunEvidence, CodexRunEvidenceUpdate, EvidenceError};
 pub use lifecycle::{CodexEventNormalizer, CodexRunStream, LifecycleError, NormalizedCodexEvent};
 pub use stdio::StdioTransport;
+pub use workspace::{WorkspaceEvidenceError, WorkspaceSnapshot};
 
 use std::{
     ffi::OsStr,

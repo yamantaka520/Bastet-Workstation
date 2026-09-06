@@ -43,9 +43,43 @@ impl CodexRunEvidence {
     ) -> Result<Option<CodexRunEvidenceUpdate>, EvidenceError> {
         match notification.method.as_str() {
             "turn/diff/updated" => self.diff_updated(&notification.params),
+            "item/completed" => self.file_change_completed(&notification.params),
             "thread/tokenUsage/updated" => self.token_usage_updated(&notification.params),
             _ => Ok(None),
         }
+    }
+
+    fn file_change_completed(
+        &self,
+        params: &Value,
+    ) -> Result<Option<CodexRunEvidenceUpdate>, EvidenceError> {
+        if !self.matches_run(params)? {
+            return Ok(None);
+        }
+        let item = params.get("item").ok_or(EvidenceError::ProtocolDrift)?;
+        if required_string(item, "type")? != "fileChange" {
+            return Ok(None);
+        }
+        match required_string(item, "status")? {
+            "failed" | "declined" => return Ok(None),
+            "completed" => {}
+            _ => return Err(EvidenceError::ProtocolDrift),
+        }
+        let changes = item
+            .get("changes")
+            .and_then(Value::as_array)
+            .filter(|changes| !changes.is_empty())
+            .ok_or(EvidenceError::ProtocolDrift)?;
+        if changes.iter().any(|change| !valid_file_change(change)) {
+            return Err(EvidenceError::ProtocolDrift);
+        }
+        Ok(Some(CodexRunEvidenceUpdate::WriteReceipt(
+            json!({
+                "evidence": "codex.item_file_change.completed",
+                "turn_id": self.provider_turn_id
+            })
+            .to_string(),
+        )))
     }
 
     fn diff_updated(
@@ -105,6 +139,18 @@ impl CodexRunEvidence {
     }
 }
 
+fn valid_file_change(change: &Value) -> bool {
+    let Some(change) = change.as_object() else {
+        return false;
+    };
+    ["path", "kind", "diff"].iter().all(|key| {
+        change
+            .get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    })
+}
+
 fn required_string<'a>(value: &'a Value, key: &str) -> Result<&'a str, EvidenceError> {
     value
         .get(key)
@@ -150,6 +196,71 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(&receipt).unwrap(),
             json!({"evidence": "codex.turn_diff.updated", "turn_id": "turn_1"})
+        );
+    }
+
+    #[test]
+    fn completed_file_change_becomes_a_redacted_write_receipt() {
+        let secret = "BASTET_ITEM_SECRET_DO_NOT_LOG";
+        let update = collector()
+            .ingest(&AppServerNotification {
+                method: "item/completed".into(),
+                params: json!({
+                    "threadId": "thr_1",
+                    "turnId": "turn_1",
+                    "item": {
+                        "type": "fileChange",
+                        "id": "item_1",
+                        "status": "completed",
+                        "changes": [{
+                            "path": "/secret/receipt.txt",
+                            "kind": "add",
+                            "diff": format!("+{secret}")
+                        }]
+                    }
+                }),
+            })
+            .unwrap()
+            .unwrap();
+        let CodexRunEvidenceUpdate::WriteReceipt(receipt) = update else {
+            panic!("completed file change must become write evidence");
+        };
+        assert!(receipt.contains("codex.item_file_change.completed"));
+        assert!(!receipt.contains("receipt.txt"));
+        assert!(!receipt.contains(secret));
+    }
+
+    #[test]
+    fn incomplete_or_malformed_file_changes_are_not_write_evidence() {
+        for status in ["failed", "declined"] {
+            assert_eq!(
+                collector()
+                    .ingest(&AppServerNotification {
+                        method: "item/completed".into(),
+                        params: json!({
+                            "threadId": "thr_1",
+                            "turnId": "turn_1",
+                            "item": {
+                                "type": "fileChange",
+                                "status": status,
+                                "changes": [{"path": "/tmp/a", "kind": "add", "diff": "+a"}]
+                            }
+                        }),
+                    })
+                    .unwrap(),
+                None
+            );
+        }
+        assert_eq!(
+            collector().ingest(&AppServerNotification {
+                method: "item/completed".into(),
+                params: json!({
+                    "threadId": "thr_1",
+                    "turnId": "turn_1",
+                    "item": {"type": "fileChange", "status": "completed", "changes": []}
+                }),
+            }),
+            Err(EvidenceError::ProtocolDrift)
         );
     }
 
