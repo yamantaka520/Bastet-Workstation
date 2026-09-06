@@ -43,7 +43,7 @@ verification status; it does not add scope.
   transitions, secret leakage, unauthorized or unevidenced writes, malformed normalized failures,
   and invalid cost evidence. Commits `8a179df`, `69b34e3`, and `a336135` passed GitHub Actions
   runs `33668014153`, `33668299526`, and `33669295915` respectively.
-- M2.3 Codex CLI reference adapter: in progress with a read-only discovery/version/doctor process
+- M2.3 Codex CLI reference adapter: complete locally with a read-only discovery/version/doctor process
   boundary, sanitized authentication-status parsing, and a capability declaration that does not
   claim unimplemented execution. A fixture-backed app-server JSON-RPC boundary now enforces the
   required initialize/initialized handshake and strictly normalizes `model/list` model, modality,
@@ -123,4 +123,9 @@ verification status; it does not add scope.
   fixtures prove both serialized policies and rejection before provider calls. Explicit real stdio
   canaries then passed read-only and bounded single-file workspace-write runs through this façade;
   the write canary retained the existing redacted locally-measured fallback receipt.
+  `CodexAdapter::connect_app_server` now owns transport spawn plus the mandatory
+  initialize/initialized handshake. Its production capability declaration exposes only the
+  verified execution boundaries (start, attach/resume, status/wait, cancel, usage export,
+  read-only, bounded write, and structured events); installation and interactive authentication
+  remain undeclared. A real model-list canary passed through this production connection boundary.
 - M2.4–M2.8: not started.

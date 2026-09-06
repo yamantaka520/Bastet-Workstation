@@ -24,6 +24,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 use bastet_core::{AdapterCapabilities, AdapterOperation, EvidenceClass};
@@ -121,6 +122,17 @@ pub struct CodexAdapter<R = SystemCommandRunner> {
 impl CodexAdapter<SystemCommandRunner> {
     pub fn new(executable: impl Into<PathBuf>) -> Self {
         Self::with_runner(executable, SystemCommandRunner)
+    }
+
+    pub fn connect_app_server(
+        &self,
+        timeout: Duration,
+    ) -> Result<CodexAppServer<StdioTransport>, AppServerError> {
+        let transport =
+            StdioTransport::spawn(&self.executable, timeout).map_err(AppServerError::Transport)?;
+        let mut server = CodexAppServer::new(transport);
+        server.initialize()?;
+        Ok(server)
     }
 }
 
@@ -230,12 +242,18 @@ impl<R: CommandRunner> CodexAdapter<R> {
                 AdapterOperation::Doctor,
                 AdapterOperation::InspectAuthentication,
                 AdapterOperation::ListModels,
+                AdapterOperation::Start,
+                AdapterOperation::Attach,
+                AdapterOperation::Status,
+                AdapterOperation::Wait,
+                AdapterOperation::Cancel,
+                AdapterOperation::ExportUsage,
             ],
             reasoning_controls: Vec::new(),
-            supports_read_only: false,
-            supports_write: false,
-            supports_resume: false,
-            supports_structured_events: false,
+            supports_read_only: true,
+            supports_write: true,
+            supports_resume: true,
+            supports_structured_events: true,
         }
     }
 }
@@ -419,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_do_not_claim_unimplemented_execution() {
+    fn capabilities_claim_only_implemented_execution_boundaries() {
         let adapter = CodexAdapter::new("codex");
         let capabilities = adapter.capabilities();
         assert!(capabilities
@@ -428,10 +446,21 @@ mod tests {
         assert!(capabilities
             .operations
             .contains(&AdapterOperation::ListModels));
-        assert!(!capabilities.operations.contains(&AdapterOperation::Start));
-        assert!(!capabilities.supports_read_only);
-        assert!(!capabilities.supports_write);
-        assert!(!capabilities.supports_resume);
-        assert!(!capabilities.supports_structured_events);
+        assert!(capabilities.operations.contains(&AdapterOperation::Start));
+        assert!(capabilities.operations.contains(&AdapterOperation::Attach));
+        assert!(capabilities.operations.contains(&AdapterOperation::Status));
+        assert!(capabilities.operations.contains(&AdapterOperation::Wait));
+        assert!(capabilities.operations.contains(&AdapterOperation::Cancel));
+        assert!(capabilities
+            .operations
+            .contains(&AdapterOperation::ExportUsage));
+        assert!(capabilities.supports_read_only);
+        assert!(capabilities.supports_write);
+        assert!(capabilities.supports_resume);
+        assert!(capabilities.supports_structured_events);
+        assert!(!capabilities.operations.contains(&AdapterOperation::Install));
+        assert!(!capabilities
+            .operations
+            .contains(&AdapterOperation::Authenticate));
     }
 }

@@ -279,10 +279,13 @@ fn fixture_evidence_never_claims_a_provider_currency_amount() {
 }
 
 #[test]
-fn production_adapter_still_does_not_claim_fixture_only_execution() {
+fn production_adapter_claims_the_now_verified_execution_boundary() {
     let adapter = bastet_adapter_codex::CodexAdapter::new("missing-fixture-binary");
     let capabilities = adapter.capabilities();
-    assert!(!capabilities.operations.contains(&AdapterOperation::Start));
-    assert!(!capabilities.operations.contains(&AdapterOperation::Cancel));
-    assert!(!capabilities.supports_structured_events);
+    assert!(capabilities.operations.contains(&AdapterOperation::Start));
+    assert!(capabilities.operations.contains(&AdapterOperation::Cancel));
+    assert!(capabilities.supports_read_only);
+    assert!(capabilities.supports_write);
+    assert!(capabilities.supports_resume);
+    assert!(capabilities.supports_structured_events);
 }
