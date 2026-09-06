@@ -18,7 +18,7 @@ vi.mock("@tauri-apps/plugin-autostart", () => ({
 describe("M1 shell", () => {
   it("has every required locale and no missing critical keys", () => {
     expect(locales).toEqual(["zh-Hant", "zh-Hans", "en", "ja", "ko"]);
-    for (const locale of locales) expect(translate(locale, "status")).not.toMatch(/^\[missing:/);
+    for (const locale of locales) expect(translate(locale, "ready")).not.toMatch(/^\[missing:/);
   });
   it("switches locale using an accessible native control", () => {
     render(<App />);
@@ -29,6 +29,7 @@ describe("M1 shell", () => {
   it("projects daemon state after reconnect", async () => {
     render(<App />);
     expect(await screen.findByText("本機服務已連線")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "診斷" }));
     expect(screen.getByText("7")).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveAttribute("data-state", "ready");
   });
