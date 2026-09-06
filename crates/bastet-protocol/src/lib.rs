@@ -105,6 +105,42 @@ pub struct GraphExecutionReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrepareMvpCommand {
+    pub expected_catalog_revision: u64,
+    pub expected_m3_revision: u64,
+    pub project_name: String,
+    pub workspace_root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrepareMvpReceipt {
+    pub protocol_version: u32,
+    pub project_id: bastet_core::ProjectId,
+    pub meeting_id: bastet_core::MeetingId,
+    pub catalog_revision: u64,
+    pub m3_revision: u64,
+    pub event_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptDecisionBaselineCommand {
+    pub expected_m3_revision: u64,
+    pub meeting_id: bastet_core::MeetingId,
+    pub content: String,
+    pub accepted_by: String,
+    pub accepted_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptDecisionBaselineReceipt {
+    pub protocol_version: u32,
+    pub baseline_id: bastet_core::DecisionBaselineId,
+    pub graph_execution_id: bastet_core::GraphRunId,
+    pub m3_revision: u64,
+    pub event_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateApprovalCommand {
     pub request: ApprovalRequest,
 }

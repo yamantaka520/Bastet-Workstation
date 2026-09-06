@@ -14,14 +14,15 @@ use axum::{
     Json, Router,
 };
 use bastet_core::{
-    ApprovalError, ApprovalRequestId, CatalogError, GraphError, GraphExecution, GraphNodeId,
-    GraphRunId, IdentityCatalog, M3Catalog, RunId,
+    accept_mvp_decision, ApprovalError, ApprovalRequestId, CatalogError, GraphError,
+    GraphExecution, GraphNodeId, GraphRunId, IdentityCatalog, M3Catalog, M3State, MvpDraft, RunId,
 };
 use bastet_protocol::{
-    ApprovalList, ApprovalReceipt, ApprovalRecord, CancelRunReceipt, CatalogReceipt,
-    CatalogSnapshot, CheckpointCommand, CheckpointReceipt, CreateApprovalCommand,
-    CreateGraphExecutionCommand, DaemonLifecycle, DaemonSnapshot, DecideApprovalCommand,
-    EventEnvelope, GraphExecutionList, GraphExecutionReceipt, M3CatalogSnapshot,
+    AcceptDecisionBaselineCommand, AcceptDecisionBaselineReceipt, ApprovalList, ApprovalReceipt,
+    ApprovalRecord, CancelRunReceipt, CatalogReceipt, CatalogSnapshot, CheckpointCommand,
+    CheckpointReceipt, CreateApprovalCommand, CreateGraphExecutionCommand, DaemonLifecycle,
+    DaemonSnapshot, DecideApprovalCommand, EventEnvelope, GraphExecutionList,
+    GraphExecutionReceipt, M3CatalogSnapshot, PrepareMvpCommand, PrepareMvpReceipt,
     ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -69,6 +70,8 @@ pub enum StoreError {
     InvalidGraph(#[from] GraphError),
     #[error("M3 catalog is invalid: {0}")]
     InvalidM3(String),
+    #[error("MVP workflow is invalid: {0}")]
+    InvalidMvp(String),
     #[error("graph execution was not found")]
     GraphNotFound,
     #[error("graph execution already exists")]
@@ -185,6 +188,11 @@ fn build_router_with_controller(
             "/v1/graphs",
             get(graph_executions).post(create_graph_execution),
         )
+        .route("/v1/mvp/prepare", post(prepare_mvp))
+        .route(
+            "/v1/mvp/accept-decision",
+            post(accept_mvp_decision_baseline),
+        )
         .route("/v1/approvals", get(approvals).post(create_approval))
         .route(
             "/v1/approvals/{request_id}",
@@ -279,6 +287,20 @@ async fn create_graph_execution(
     ))
 }
 
+async fn prepare_mvp(
+    State(state): State<AppState>,
+    Json(command): Json<PrepareMvpCommand>,
+) -> Result<Json<PrepareMvpReceipt>, ApiError> {
+    Ok(Json(state.store.prepare_mvp(command)?))
+}
+
+async fn accept_mvp_decision_baseline(
+    State(state): State<AppState>,
+    Json(command): Json<AcceptDecisionBaselineCommand>,
+) -> Result<Json<AcceptDecisionBaselineReceipt>, ApiError> {
+    Ok(Json(state.store.accept_mvp_decision(command)?))
+}
+
 async fn create_approval(
     State(state): State<AppState>,
     Json(command): Json<CreateApprovalCommand>,
@@ -359,6 +381,7 @@ impl axum::response::IntoResponse for ApiError {
             | StoreError::InvalidApproval(_)
             | StoreError::InvalidGraph(_)
             | StoreError::InvalidM3(_)
+            | StoreError::InvalidMvp(_)
             | StoreError::Serialization(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -513,6 +536,142 @@ impl Store {
             protocol_version: PROTOCOL_VERSION,
             revision,
             catalog,
+        })
+    }
+
+    pub fn prepare_mvp(&self, command: PrepareMvpCommand) -> Result<PrepareMvpReceipt, StoreError> {
+        let draft = MvpDraft::prepare(&command.project_name, Path::new(&command.workspace_root))
+            .map_err(|error| StoreError::InvalidMvp(error.to_string()))?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let catalog_revision: u64 = transaction.query_row(
+            "SELECT revision FROM identity_catalog WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let m3_revision: u64 = transaction.query_row(
+            "SELECT revision FROM m3_catalog WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if catalog_revision != command.expected_catalog_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: command.expected_catalog_revision,
+                actual: catalog_revision,
+            });
+        }
+        if m3_revision != command.expected_m3_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: command.expected_m3_revision,
+                actual: m3_revision,
+            });
+        }
+        let next_catalog = catalog_revision
+            .checked_add(1)
+            .ok_or(StoreError::RevisionOverflow)?;
+        let next_m3 = m3_revision
+            .checked_add(1)
+            .ok_or(StoreError::RevisionOverflow)?;
+        transaction.execute(
+            "UPDATE identity_catalog SET revision=?1, catalog_json=?2, updated_at=?3 WHERE singleton=1",
+            params![next_catalog, serde_json::to_string(&draft.identity)?, timestamp()],
+        )?;
+        transaction.execute(
+            "UPDATE m3_catalog SET revision=?1, catalog_json=?2, updated_at=?3 WHERE singleton=1",
+            params![next_m3, serde_json::to_string(&draft.m3)?, timestamp()],
+        )?;
+        let event = insert_event(
+            &transaction,
+            "mvp.prepared",
+            &serde_json::json!({"project_id": draft.project_id, "meeting_id": draft.meeting_id})
+                .to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(PrepareMvpReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            project_id: draft.project_id,
+            meeting_id: draft.meeting_id,
+            catalog_revision: next_catalog,
+            m3_revision: next_m3,
+            event_sequence: event.sequence,
+        })
+    }
+
+    pub fn accept_mvp_decision(
+        &self,
+        command: AcceptDecisionBaselineCommand,
+    ) -> Result<AcceptDecisionBaselineReceipt, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let identity_json: String = transaction.query_row(
+            "SELECT catalog_json FROM identity_catalog WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let (actual, m3_json): (u64, String) = transaction.query_row(
+            "SELECT revision, catalog_json FROM m3_catalog WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if actual != command.expected_m3_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: command.expected_m3_revision,
+                actual,
+            });
+        }
+        let identity: IdentityCatalog = serde_json::from_str(&identity_json)?;
+        let mut catalog: M3Catalog = serde_json::from_str(&m3_json)?;
+        let execution = accept_mvp_decision(
+            &mut catalog,
+            &identity,
+            command.meeting_id,
+            command.content,
+            &command.accepted_by,
+            &command.accepted_at,
+        )
+        .map_err(|error| StoreError::InvalidMvp(error.to_string()))?;
+        let baseline_id = catalog
+            .meetings
+            .decision_baselines
+            .last()
+            .ok_or_else(|| StoreError::InvalidMvp("missing accepted baseline".into()))?
+            .metadata
+            .id;
+        let mut executions = load_graph_executions(&transaction)?;
+        executions.push(execution.clone());
+        M3State {
+            catalog: catalog.clone(),
+            graph_executions: executions,
+        }
+        .validate(&identity)
+        .map_err(|error| StoreError::InvalidMvp(error.to_string()))?;
+        let revision = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
+        transaction.execute(
+            "UPDATE m3_catalog SET revision=?1, catalog_json=?2, updated_at=?3 WHERE singleton=1",
+            params![revision, serde_json::to_string(&catalog)?, timestamp()],
+        )?;
+        transaction.execute(
+            "INSERT INTO graph_executions(execution_id, revision, execution_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                execution.id.value().to_string(),
+                execution.revision,
+                serde_json::to_string(&execution)?,
+                timestamp()
+            ],
+        )?;
+        let event = insert_event(
+            &transaction,
+            "mvp.decision_accepted",
+            &serde_json::json!({"meeting_id": command.meeting_id, "baseline_id": baseline_id, "graph_execution_id": execution.id}).to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(AcceptDecisionBaselineReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            baseline_id,
+            graph_execution_id: execution.id,
+            m3_revision: revision,
+            event_sequence: event.sequence,
         })
     }
 
@@ -1211,6 +1370,22 @@ fn validate_m3_catalog(catalog: &M3Catalog, identity: &IdentityCatalog) -> Resul
         .validate()
         .map_err(|error| StoreError::InvalidM3(error.to_string()))?;
     Ok(())
+}
+
+fn load_graph_executions(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<Vec<GraphExecution>, StoreError> {
+    let mut statement = transaction
+        .prepare("SELECT execution_json FROM graph_executions ORDER BY updated_at, execution_id")?;
+    let executions = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .map(|row| {
+            let execution: GraphExecution = serde_json::from_str(&row?)?;
+            execution.validate()?;
+            Ok(execution)
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    Ok(executions)
 }
 
 fn reconcile_graphs_for_recovery(
@@ -2049,6 +2224,51 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event.event_type == "m3.catalog_replaced"));
+    }
+
+    #[test]
+    fn mvp_prepare_and_human_decision_are_atomic_and_restart_durable() {
+        let directory = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let path = directory.path().join("mvp.db");
+        let store = Store::open(&path).unwrap();
+        let prepared = store
+            .prepare_mvp(PrepareMvpCommand {
+                expected_catalog_revision: 0,
+                expected_m3_revision: 0,
+                project_name: "MVP fixture".into(),
+                workspace_root: workspace.path().to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        assert_eq!((prepared.catalog_revision, prepared.m3_revision), (1, 1));
+        assert!(store.graph_executions().unwrap().is_empty());
+        let accepted = store
+            .accept_mvp_decision(AcceptDecisionBaselineCommand {
+                expected_m3_revision: 1,
+                meeting_id: prepared.meeting_id,
+                content: "Research two perspectives, join them, and produce one sourced report."
+                    .into(),
+                accepted_by: "local-user".into(),
+                accepted_at: "2026-09-07T00:00:00Z".into(),
+            })
+            .unwrap();
+        assert_eq!(accepted.m3_revision, 2);
+        assert_eq!(store.graph_executions().unwrap().len(), 1);
+        drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(reopened.catalog().unwrap().catalog.projects.len(), 1);
+        assert_eq!(
+            reopened
+                .m3_catalog()
+                .unwrap()
+                .catalog
+                .office
+                .pet_assignments
+                .len(),
+            3
+        );
+        assert_eq!(reopened.graph_executions().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -194,59 +194,14 @@ impl MvpDraft {
         accepted_at: &str,
     ) -> Result<GraphExecution, MvpError> {
         self.validate()?;
-        let meeting = self
-            .m3
-            .meetings
-            .meetings
-            .iter_mut()
-            .find(|meeting| meeting.metadata.id == self.meeting_id)
-            .ok_or(MvpError::InvalidDraft)?;
-        if meeting.state != MeetingState::AwaitingDecision {
-            return Err(MvpError::NotAwaitingDecision);
-        }
-        let baseline = DecisionBaseline::create(
-            metadata(DecisionBaselineId::new()),
+        accept_mvp_decision(
+            &mut self.m3,
+            &self.identity,
             self.meeting_id,
             content,
-            actor.into(),
-            accepted_at.into(),
+            actor,
+            accepted_at,
         )
-        .map_err(|_| MvpError::InvalidDraft)?;
-        let baseline_id = baseline.metadata.id;
-        meeting.state = MeetingState::Accepted;
-        self.m3.meetings.decision_baselines.push(baseline);
-        let left = GraphNodeId::new();
-        let right = GraphNodeId::new();
-        GraphExecution::start(
-            GraphRunId::new(),
-            WorkflowGraph {
-                decision_baseline_id: baseline_id,
-                nodes: vec![
-                    GraphNode {
-                        id: left,
-                        kind: GraphNodeKind::Research,
-                        role_id: self.research_role_ids[0],
-                        title: "Independent research A".into(),
-                        needs: vec![],
-                    },
-                    GraphNode {
-                        id: right,
-                        kind: GraphNodeKind::Research,
-                        role_id: self.research_role_ids[1],
-                        title: "Independent research B".into(),
-                        needs: vec![],
-                    },
-                    GraphNode {
-                        id: GraphNodeId::new(),
-                        kind: GraphNodeKind::Join,
-                        role_id: self.integrator_role_id,
-                        title: "Join research into document".into(),
-                        needs: vec![left, right],
-                    },
-                ],
-            },
-        )
-        .map_err(|_| MvpError::InvalidDraft)
     }
 
     pub fn validate(&self) -> Result<(), MvpError> {
@@ -263,6 +218,82 @@ impl MvpDraft {
             .map_err(|_| MvpError::InvalidDraft)?;
         Ok(())
     }
+}
+
+pub fn accept_mvp_decision(
+    m3: &mut M3Catalog,
+    identity: &IdentityCatalog,
+    meeting_id: MeetingId,
+    content: String,
+    actor: &str,
+    accepted_at: &str,
+) -> Result<GraphExecution, MvpError> {
+    let meeting = m3
+        .meetings
+        .meetings
+        .iter_mut()
+        .find(|meeting| meeting.metadata.id == meeting_id)
+        .ok_or(MvpError::InvalidDraft)?;
+    if meeting.state != MeetingState::AwaitingDecision {
+        return Err(MvpError::NotAwaitingDecision);
+    }
+    let [left_role, right_role, integrator_role] = meeting.participant_role_ids.as_slice() else {
+        return Err(MvpError::InvalidDraft);
+    };
+    if [left_role, right_role, integrator_role]
+        .into_iter()
+        .any(|role_id| {
+            !identity
+                .roles
+                .iter()
+                .any(|role| role.metadata.id == *role_id)
+        })
+    {
+        return Err(MvpError::InvalidDraft);
+    }
+    let baseline = DecisionBaseline::create(
+        metadata(DecisionBaselineId::new()),
+        meeting_id,
+        content,
+        actor.into(),
+        accepted_at.into(),
+    )
+    .map_err(|_| MvpError::InvalidDraft)?;
+    let baseline_id = baseline.metadata.id;
+    meeting.state = MeetingState::Accepted;
+    m3.meetings.decision_baselines.push(baseline);
+    let left = GraphNodeId::new();
+    let right = GraphNodeId::new();
+    GraphExecution::start(
+        GraphRunId::new(),
+        WorkflowGraph {
+            decision_baseline_id: baseline_id,
+            nodes: vec![
+                GraphNode {
+                    id: left,
+                    kind: GraphNodeKind::Research,
+                    role_id: *left_role,
+                    title: "Independent research A".into(),
+                    needs: vec![],
+                },
+                GraphNode {
+                    id: right,
+                    kind: GraphNodeKind::Research,
+                    role_id: *right_role,
+                    title: "Independent research B".into(),
+                    needs: vec![],
+                },
+                GraphNode {
+                    id: GraphNodeId::new(),
+                    kind: GraphNodeKind::Join,
+                    role_id: *integrator_role,
+                    title: "Join research into document".into(),
+                    needs: vec![left, right],
+                },
+            ],
+        },
+    )
+    .map_err(|_| MvpError::InvalidDraft)
 }
 
 pub fn builtin_pet_profile() -> PetProfile {

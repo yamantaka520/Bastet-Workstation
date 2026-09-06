@@ -49,3 +49,6 @@ verification evidence without adding scope.
   research Roles, one integrator Role, a room, three role-bound PetAssignments, and a bounded
   meeting. It emits no graph until explicit human DecisionBaseline acceptance, then compiles
   exactly two research branches and one join.
+- The daemon now persists MVP preparation atomically across identity and M3 catalogs, then persists
+  the exact human-accepted DecisionBaseline and compiled graph in a second atomic transaction.
+  Restart tests prove Project, three PetAssignments, accepted meeting, and graph survive reopen.
