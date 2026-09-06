@@ -42,6 +42,9 @@ stable_id!(SessionId);
 stable_id!(RunId);
 stable_id!(CredentialReferenceId);
 stable_id!(ApprovalRequestId);
+stable_id!(PetProfileId);
+stable_id!(PetAssignmentId);
+stable_id!(RoomId);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
