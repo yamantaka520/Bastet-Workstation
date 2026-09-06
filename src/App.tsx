@@ -59,9 +59,9 @@ export function App() {
         <dl><dt>{translate(locale, "version")}</dt><dd>{agent.version ?? translate(locale, "unknown")}</dd><dt>{translate(locale, "authentication")}</dt><dd>{agent.authenticated == null ? translate(locale, "unknown") : translate(locale, agent.authenticated ? "authenticated" : "notAuthenticated")}</dd>
           <dt>{translate(locale, "models")}</dt><dd>{agent.model_count ?? translate(locale, "unknown")}</dd><dt>{translate(locale, "reasoning")}</dt><dd>{agent.reasoning_controls.join(" · ") || translate(locale, "unknown")}</dd>
           <dt>{translate(locale, "runControl")}</dt><dd>{agent.operations.join(" · ") || translate(locale, "unavailable")}</dd></dl></article>)}</div>
-      <h3>Sessions and runs</h3><p>Sessions: {work.sessions} · Revision: {work.revision}</p>
-      {actionError && <p role="alert">Cancellation was not accepted.</p>}
-      {work.runs.length === 0 ? <p>No runs.</p> : <ul>{work.runs.map((run) => <li key={run.run_id}><code>{run.run_id}</code> — {run.state} {run.can_cancel && <button type="button" onClick={() => void cancelRun(run.run_id)}>Cancel</button>}</li>)}</ul>}</section>}
+      <h3>{translate(locale, "sessionsAndRuns")}</h3><p>{translate(locale, "sessions")}: {work.sessions} · {translate(locale, "revision")}: {work.revision}</p>
+      {actionError && <p role="alert">{translate(locale, "cancelRejected")}</p>}
+      {work.runs.length === 0 ? <p>{translate(locale, "noRuns")}</p> : <ul>{work.runs.map((run) => <li key={run.run_id}><code>{run.run_id}</code> — {run.state} {run.can_cancel && <button type="button" onClick={() => void cancelRun(run.run_id)}>{translate(locale, "cancel")}</button>}</li>)}</ul>}</section>}
 
     {view === "approvals" && <section aria-labelledby="approvals-heading"><h2 id="approvals-heading">{translate(locale, "approvals")}</h2><p>{translate(locale, "approvalHelp")}</p>
       {approvals.length === 0 ? <p>{translate(locale, "noApprovals")}</p> : approvals.map((record) => <article key={record.request.id} className="approval-card"><h3>{record.request.action.action_key}</h3>

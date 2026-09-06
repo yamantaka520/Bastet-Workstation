@@ -1,18 +1,20 @@
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { locales, translate } from "./i18n";
 
-vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn((command: string) => Promise.resolve(command === "approval_center_snapshot"
+const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
+
+const defaultInvoke = (command: string) => Promise.resolve(command === "approval_center_snapshot"
     ? { protocol_version: 1, records: [] }
     : command === "agent_center_snapshot"
       ? { agents: [{ adapter_kind: "codex_cli", display_name: "Codex CLI", installed: true, version: "1.0.0", authenticated: true, model_count: 2, reasoning_controls: ["low", "high"], operations: ["start", "cancel"], error_key: null }] }
       : command === "work_projection"
         ? { revision: 3, sessions: 1, runs: [] }
-      : { protocol_version: 1, daemon_id: "test-daemon", revision: 7, lifecycle: "ready" })),
-}));
+      : { protocol_version: 1, daemon_id: "test-daemon", revision: 7, lifecycle: "ready" });
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 vi.mock("@tauri-apps/plugin-autostart", () => ({
   disable: vi.fn().mockResolvedValue(undefined),
   enable: vi.fn().mockResolvedValue(undefined),
@@ -20,6 +22,7 @@ vi.mock("@tauri-apps/plugin-autostart", () => ({
 }));
 
 describe("M1 shell", () => {
+  beforeEach(() => invokeMock.mockImplementation(defaultInvoke));
   it("has every required locale and no missing critical keys", () => {
     expect(locales).toEqual(["zh-Hant", "zh-Hans", "en", "ja", "ko"]);
     for (const locale of locales) expect(translate(locale, "ready")).not.toMatch(/^\[missing:/);
@@ -50,5 +53,16 @@ describe("M1 shell", () => {
     expect(await screen.findByRole("heading", { name: "Agents 與模型" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "核准中心" }));
     expect(screen.getByText("目前沒有待處理或近期核准。")).toBeInTheDocument();
+  });
+
+  it("cancels only a daemon-projected cancellable run with its catalog revision", async () => {
+    invokeMock.mockImplementation((command: string) => command === "work_projection"
+      ? Promise.resolve({ revision: 9, sessions: 1, runs: [{ run_id: "run-1", session_id: "session-1", state: "running", can_cancel: true }] })
+      : defaultInvoke(command));
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "取消" }));
+
+    expect(invokeMock).toHaveBeenCalledWith("cancel_run", { runId: "run-1", expectedCatalogRevision: 9 });
   });
 });
