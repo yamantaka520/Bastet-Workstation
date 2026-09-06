@@ -92,6 +92,19 @@ pub struct GraphExecutionList {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateGraphExecutionCommand {
+    pub execution: GraphExecution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphExecutionReceipt {
+    pub protocol_version: u32,
+    pub execution_id: bastet_core::GraphRunId,
+    pub revision: u64,
+    pub event_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateApprovalCommand {
     pub request: ApprovalRequest,
 }

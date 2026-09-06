@@ -19,8 +19,9 @@ use bastet_core::{
 };
 use bastet_protocol::{
     ApprovalList, ApprovalReceipt, ApprovalRecord, CancelRunReceipt, CatalogReceipt,
-    CatalogSnapshot, CheckpointCommand, CheckpointReceipt, CreateApprovalCommand, DaemonLifecycle,
-    DaemonSnapshot, DecideApprovalCommand, EventEnvelope, GraphExecutionList, M3CatalogSnapshot,
+    CatalogSnapshot, CheckpointCommand, CheckpointReceipt, CreateApprovalCommand,
+    CreateGraphExecutionCommand, DaemonLifecycle, DaemonSnapshot, DecideApprovalCommand,
+    EventEnvelope, GraphExecutionList, GraphExecutionReceipt, M3CatalogSnapshot,
     ReplaceCatalogCommand, ReplaceM3CatalogCommand, PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -180,7 +181,10 @@ fn build_router_with_controller(
         .route("/v1/events", get(events))
         .route("/v1/catalog", get(catalog).put(replace_catalog))
         .route("/v1/m3", get(m3_catalog).put(replace_m3_catalog))
-        .route("/v1/graphs", get(graph_executions))
+        .route(
+            "/v1/graphs",
+            get(graph_executions).post(create_graph_execution),
+        )
         .route("/v1/approvals", get(approvals).post(create_approval))
         .route(
             "/v1/approvals/{request_id}",
@@ -264,6 +268,15 @@ async fn graph_executions(
         protocol_version: PROTOCOL_VERSION,
         executions: state.store.graph_executions()?,
     }))
+}
+
+async fn create_graph_execution(
+    State(state): State<AppState>,
+    Json(command): Json<CreateGraphExecutionCommand>,
+) -> Result<Json<GraphExecutionReceipt>, ApiError> {
+    Ok(Json(
+        state.store.create_graph_execution(&command.execution)?,
+    ))
 }
 
 async fn create_approval(
@@ -615,7 +628,10 @@ impl Store {
         })
     }
 
-    pub fn create_graph_execution(&self, execution: &GraphExecution) -> Result<(), StoreError> {
+    pub fn create_graph_execution(
+        &self,
+        execution: &GraphExecution,
+    ) -> Result<GraphExecutionReceipt, StoreError> {
         execution.validate()?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -632,14 +648,19 @@ impl Store {
         if inserted == 0 {
             return Err(StoreError::GraphConflict);
         }
-        insert_event(
+        let event = insert_event(
             &transaction,
             "graph.execution_created",
             &serde_json::json!({"execution_id": execution.id, "nodes": execution.nodes.len()})
                 .to_string(),
         )?;
         transaction.commit()?;
-        Ok(())
+        Ok(GraphExecutionReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            execution_id: execution.id,
+            revision: execution.revision,
+            event_sequence: event.sequence,
+        })
     }
 
     pub fn graph_execution(&self, id: GraphRunId) -> Result<GraphExecution, StoreError> {
