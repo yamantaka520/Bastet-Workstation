@@ -4,7 +4,11 @@ mod supervisor;
 mod macos_power;
 
 use bastet_client::DaemonClient;
-use bastet_protocol::{CheckpointReceipt, DaemonLifecycle, DaemonSnapshot, PROTOCOL_VERSION};
+use bastet_core::{ApprovalDecision, ApprovalRequestId};
+use bastet_protocol::{
+    ApprovalList, ApprovalReceipt, CheckpointReceipt, DaemonLifecycle, DaemonSnapshot,
+    PROTOCOL_VERSION,
+};
 use serde::Serialize;
 use supervisor::DaemonSupervisor;
 use tauri::{
@@ -38,6 +42,31 @@ async fn daemon_snapshot(
         supervisor.ensure_running(&client).await?;
     }
     client.snapshot().await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn approval_center_snapshot(client: State<'_, DaemonClient>) -> Result<ApprovalList, String> {
+    client.approvals().await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn decide_approval(
+    client: State<'_, DaemonClient>,
+    request_id: ApprovalRequestId,
+    request_hash: String,
+    kind: bastet_core::ApprovalDecisionKind,
+    decided_at_ms: u64,
+) -> Result<ApprovalReceipt, String> {
+    client
+        .decide_approval(ApprovalDecision {
+            request_id,
+            request_hash,
+            kind,
+            decided_at_ms,
+            actor: "local-desktop-user".into(),
+        })
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn checkpoint_for_quit(client: &DaemonClient) -> Result<CheckpointReceipt, String> {
@@ -208,6 +237,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             bootstrap_state,
             daemon_snapshot,
+            approval_center_snapshot,
+            decide_approval,
             prepare_for_sleep,
             resume_after_wake
         ])

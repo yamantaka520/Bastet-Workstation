@@ -2,9 +2,9 @@ use std::{env, time::Duration};
 
 use bastet_core::{ApprovalDecision, ApprovalRequest, ApprovalRequestId, IdentityCatalog};
 use bastet_protocol::{
-    ApprovalReceipt, ApprovalRecord, CatalogReceipt, CatalogSnapshot, CheckpointCommand,
-    CheckpointReceipt, CreateApprovalCommand, DaemonSnapshot, DecideApprovalCommand, EventEnvelope,
-    ReplaceCatalogCommand, PROTOCOL_VERSION,
+    ApprovalList, ApprovalReceipt, ApprovalRecord, CatalogReceipt, CatalogSnapshot,
+    CheckpointCommand, CheckpointReceipt, CreateApprovalCommand, DaemonSnapshot,
+    DecideApprovalCommand, EventEnvelope, ReplaceCatalogCommand, PROTOCOL_VERSION,
 };
 use thiserror::Error;
 
@@ -143,6 +143,19 @@ impl DaemonClient {
             .await?;
         require_protocol(record.protocol_version)?;
         Ok(record)
+    }
+
+    pub async fn approvals(&self) -> Result<ApprovalList, ClientError> {
+        let records = self
+            .http
+            .get(format!("{}/v1/approvals", self.base_url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<ApprovalList>()
+            .await?;
+        require_protocol(records.protocol_version)?;
+        Ok(records)
     }
 
     pub async fn decide_approval(

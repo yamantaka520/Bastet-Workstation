@@ -14,8 +14,8 @@ use axum::{
 };
 use bastet_core::{ApprovalError, ApprovalRequestId, CatalogError, IdentityCatalog};
 use bastet_protocol::{
-    ApprovalReceipt, ApprovalRecord, CatalogReceipt, CatalogSnapshot, CheckpointCommand,
-    CheckpointReceipt, CreateApprovalCommand, DaemonLifecycle, DaemonSnapshot,
+    ApprovalList, ApprovalReceipt, ApprovalRecord, CatalogReceipt, CatalogSnapshot,
+    CheckpointCommand, CheckpointReceipt, CreateApprovalCommand, DaemonLifecycle, DaemonSnapshot,
     DecideApprovalCommand, EventEnvelope, ReplaceCatalogCommand, PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -85,7 +85,7 @@ fn build_router(store: Store, shutdown_signal: Option<watch::Sender<bool>>) -> R
         .route("/v1/health", get(health))
         .route("/v1/events", get(events))
         .route("/v1/catalog", get(catalog).put(replace_catalog))
-        .route("/v1/approvals", post(create_approval))
+        .route("/v1/approvals", get(approvals).post(create_approval))
         .route(
             "/v1/approvals/{request_id}",
             get(approval).post(decide_approval),
@@ -134,6 +134,10 @@ async fn create_approval(
     Json(command): Json<CreateApprovalCommand>,
 ) -> Result<Json<ApprovalReceipt>, ApiError> {
     Ok(Json(state.store.create_approval(command)?))
+}
+
+async fn approvals(State(state): State<AppState>) -> Result<Json<ApprovalList>, ApiError> {
+    Ok(Json(state.store.approvals()?))
 }
 
 async fn approval(
@@ -392,6 +396,32 @@ impl Store {
             protocol_version: PROTOCOL_VERSION,
             request,
             decision,
+        })
+    }
+
+    pub fn approvals(&self) -> Result<ApprovalList, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT request_json, decision_json FROM approval_requests ORDER BY rowid DESC",
+        )?;
+        let records = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .map(|row| {
+                let (request_json, decision_json) = row?;
+                Ok(ApprovalRecord {
+                    protocol_version: PROTOCOL_VERSION,
+                    request: serde_json::from_str(&request_json)?,
+                    decision: decision_json
+                        .map(|value| serde_json::from_str(&value))
+                        .transpose()?,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        Ok(ApprovalList {
+            protocol_version: PROTOCOL_VERSION,
+            records,
         })
     }
 

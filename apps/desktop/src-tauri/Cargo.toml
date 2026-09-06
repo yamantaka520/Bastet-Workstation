@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 bastet-client = { path = "../../../crates/bastet-client" }
+bastet-core = { path = "../../../crates/bastet-core" }
 bastet-protocol = { path = "../../../crates/bastet-protocol" }
 serde.workspace = true
 tauri = { version = "2", features = ["tray-icon"] }

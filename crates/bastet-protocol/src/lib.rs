@@ -87,6 +87,12 @@ pub struct ApprovalRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalList {
+    pub protocol_version: u32,
+    pub records: Vec<ApprovalRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalReceipt {
     pub protocol_version: u32,
     pub request_id: ApprovalRequestId,

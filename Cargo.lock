@@ -261,6 +261,7 @@ name = "bastet-desktop"
 version = "0.1.0"
 dependencies = [
  "bastet-client",
+ "bastet-core",
  "bastet-protocol",
  "block2",
  "objc2-app-kit",
