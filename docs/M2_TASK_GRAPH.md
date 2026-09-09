@@ -29,6 +29,20 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-09 sandbox probe positive control
+
+The macOS Seatbelt write probe now requires proof that the sandbox actually
+started its child. It checks denial inside a read-only workspace, successful
+creation at the same canonical path when workspace writes are enabled, and
+denial outside that workspace. An enforcer startup error can no longer pass
+as evidence of filesystem isolation. The focused native test and daemon
+warnings-denied Clippy pass locally. This strengthens test evidence only;
+production provider sandbox wiring and the full M2.6 gate remain open.
+
+CI run `34320304121` for `f837018` passed all ten jobs, including macOS,
+Windows, Linux, frontend, and baseline checks. This result predates the probe
+change above and must not be attributed to it.
+
 ### 2026-09-09 durable launch selection and process environment slice
 
 New graph attempts persist a typed launch selection before work starts (schema

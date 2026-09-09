@@ -146,22 +146,60 @@ mod tests {
     #[test]
     fn macos_seatbelt_enforces_read_only_workspace() {
         let directory = tempdir().unwrap();
-        let target = directory.path().join("must-not-exist");
-        let profile = SandboxProfile {
-            workspace_root: directory.path().to_path_buf(),
+        let outside = tempdir().unwrap();
+        // Seatbelt resolves filesystem aliases. Use the same canonical root in
+        // the allowed-write control and the denied-write probe.
+        let workspace_root = directory.path().canonicalize().unwrap();
+        let target = workspace_root.join("write-probe");
+        let mut profile = SandboxProfile {
+            workspace_root,
             allow_workspace_write: false,
             allow_network: false,
         };
-        let status = profile
+        let denied = write_probe(&profile, &target);
+        assert!(!denied.status.success());
+        assert!(!target.exists());
+
+        // Without this positive control, a missing/broken sandbox enforcer or
+        // unusable fixture path could falsely satisfy the denial assertion.
+        profile.allow_workspace_write = true;
+        let allowed = write_probe(&profile, &target);
+        assert!(
+            allowed.status.success(),
+            "sandbox write control did not succeed"
+        );
+        assert!(target.is_file());
+
+        let outside_target = outside
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("must-not-exist");
+        let outside_denied = write_probe(&profile, &outside_target);
+        assert!(!outside_denied.status.success());
+        assert!(!outside_target.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_probe(profile: &SandboxProfile, target: &Path) -> std::process::Output {
+        let output = profile
             .launch_command(
                 SandboxPlatform::MacosSeatbelt,
-                Path::new("/usr/bin/touch"),
-                &[target.display().to_string()],
+                Path::new("/bin/sh"),
+                &[
+                    "-c".into(),
+                    "printf 'bastet-probe-started\\n'; exec /usr/bin/touch \"$1\"".into(),
+                    "bastet-sandbox-probe".into(),
+                    target.display().to_string(),
+                ],
             )
             .unwrap()
-            .status()
+            .output()
             .unwrap();
-        assert!(!status.success());
-        assert!(!target.exists());
+        assert_eq!(
+            output.stdout, b"bastet-probe-started\n",
+            "sandbox must actually start the probe, not merely return an error"
+        );
+        output
     }
 }
