@@ -152,10 +152,24 @@ impl AppServerTransport for StdioTransport {
         if now >= inactivity_deadline {
             return Err(TransportError::TimedOut);
         }
-        let wait = max_wait.min(inactivity_deadline.saturating_duration_since(now));
+        let observation_deadline = now + max_wait;
         loop {
+            let now = Instant::now();
+            let wait = observation_deadline
+                .min(inactivity_deadline)
+                .saturating_duration_since(now);
             match self.responses.recv_timeout(wait) {
-                Ok(Ok(message)) if self.discard_abandoned_response(&message) => continue,
+                Ok(Ok(message)) if self.discard_abandoned_response(&message) => {
+                    // Quarantined RPC replies are not new run activity, and
+                    // must not restart this observation's bounded wait.
+                    let now = Instant::now();
+                    if now >= inactivity_deadline {
+                        return Err(TransportError::TimedOut);
+                    }
+                    if now >= observation_deadline {
+                        return Ok(None);
+                    }
+                }
                 Ok(Ok(message)) => {
                     self.notification_deadline = Some(Instant::now() + self.timeout);
                     return decode_notification(message).map(Some);
@@ -424,6 +438,26 @@ mod tests {
         assert_eq!(
             transport.request("next/request", json!({})).unwrap(),
             json!({"fresh": true})
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantined_reply_does_not_extend_zero_budget_poll_or_lose_next_event() {
+        let (mut transport, sender) = clock_transport(Duration::from_secs(10));
+        transport.remember_abandoned_request(7);
+        sender.send(Ok(json!({"id": 7, "result": {}}))).unwrap();
+        sender
+            .send(Ok(json!({"method": "turn/started", "params": {}})))
+            .unwrap();
+        assert_eq!(transport.poll_notification(Duration::ZERO).unwrap(), None);
+        assert_eq!(
+            transport
+                .poll_notification(Duration::ZERO)
+                .unwrap()
+                .unwrap()
+                .method,
+            "turn/started"
         );
     }
 
