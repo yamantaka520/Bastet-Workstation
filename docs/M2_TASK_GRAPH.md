@@ -29,6 +29,52 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-09 single-use credential authorization ledger
+
+Credential approvals can now carry an optional hash-bound provider/account,
+adapter, exact credential locator and `provider.authenticate` capability binding.
+They require an active Agent, Project, Account, provider, reference, Run, Session
+and explicit Role; one exact run/reference; a high-risk, nonpersistent Use policy;
+and both Project and Role policy ceilings. Daemon checks the actual active
+Agent/Project PetAssignment, and for graph-owned attempts the exact current node
+role and run slot. Non-graph runs with multiple candidate roles fail as ambiguous.
+Old approvals without a binding keep
+their original wire/hash shape and cannot produce credential grants.
+
+Schema 10 adds a metadata-only grant ledger. Approval and grant issuance commit
+atomically after daemon-time expiry and current-catalog checks. Client clock skew
+does not determine credential decision time. Daemon-internal Rust
+consumption checks the exact full approved action, current catalog, Starting run,
+Ready daemon, expiry and terminal grant state before a compare-and-set update
+and audit event. Consumption is one-shot even if a later native lookup fails;
+it is not exposed over HTTP. Authenticated local IPC exposes audit lookup and
+revocation only. Revocation rejects already expired grants; it cannot undo a consumed grant or revoke a provider
+token. Audit actor labels remain caller-supplied local labels, not proof of a
+human decision or provider identity. No secret is read or returned by this slice.
+
+Approval cards now show the full identity, scope, credential binding and requested
+policy, with explicit single-use/not-login wording in five locales. Missing
+optional bindings show None; unknown permission values show Unknown.
+Credential approval requires an explicit scope-review protocol acknowledgement;
+older clients that ignore the new binding cannot silently approve it. This is
+client feature negotiation, not proof that a human actually read the card.
+
+Tests cover exact scope and locator changes, disabled identities, unsupported
+capabilities, legacy hash compatibility, server-time expiry/backdating,
+concurrent consumption, denial/revocation, journal-failure rollback, backup/reopen,
+v9 migration without retrospective grants, and HTTP refusal of consumption.
+Local full-workspace tests and warnings-denied Clippy pass; provider canaries
+remain ignored. Frontend tests and production build pass.
+
+This is an authorization-ledger slice, **not a native credential broker or a
+completed M2 authentication gate**. Selected-account execution remains Unsupported.
+The current graph executor allocates RunId and starts immediately, so its next
+integration must durably stage an immutable launch plan/run, await approval, and
+only then consume the matching grant and access native storage. Staged-but-never-
+launched recovery must be distinguished from interrupted work. Native storage,
+exact provider-authentication binding, server-derived launch scope, and production
+OS sandbox enforcement remain required before enabling selected accounts.
+
 ### 2026-09-09 sandbox probe positive control
 
 The macOS Seatbelt write probe now requires proof that the sandbox actually
@@ -38,6 +84,9 @@ denial outside that workspace. An enforcer startup error can no longer pass
 as evidence of filesystem isolation. The focused native test and daemon
 warnings-denied Clippy pass locally. This strengthens test evidence only;
 production provider sandbox wiring and the full M2.6 gate remain open.
+
+CI run `34320929186` for `ec15f51` passed all ten jobs. This covers the probe
+positive control, not the later credential authorization slice above.
 
 CI run `34320304121` for `f837018` passed all ten jobs, including macOS,
 Windows, Linux, frontend, and baseline checks. This result predates the probe

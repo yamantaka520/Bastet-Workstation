@@ -360,6 +360,10 @@ pub struct CreateApprovalCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecideApprovalCommand {
     pub decision: ApprovalDecision,
+    /// Explicit protocol opt-in by a client that displays the bound credential
+    /// scope. Older clients default to false and cannot approve new authority.
+    #[serde(default)]
+    pub credential_scope_acknowledged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,6 +384,25 @@ pub struct ApprovalReceipt {
     pub protocol_version: u32,
     pub request_id: ApprovalRequestId,
     pub event_sequence: u64,
+}
+
+/// An auditable single-use authorization, never a credential or proof of login.
+/// The immutable request contains its complete provider/account/capability scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialGrantRecord {
+    pub protocol_version: u32,
+    pub request: ApprovalRequest,
+    pub decision: ApprovalDecision,
+    pub issued_at_ms: u64,
+    pub consumed_at_ms: Option<u64>,
+    pub revoked_at_ms: Option<u64>,
+    pub revoked_by: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevokeCredentialGrantCommand {
+    pub actor: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

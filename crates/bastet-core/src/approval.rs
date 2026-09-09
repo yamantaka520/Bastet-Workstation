@@ -3,7 +3,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    AgentInstanceId, ApprovalRequestId, CredentialReferenceId, PolicyError, PolicyLayer, ProjectId,
+    AccountId, AgentInstanceId, AgentProviderId, ApprovalRequestId, CredentialBackend,
+    CredentialReferenceId, EntityLifecycle, PermissionLevel, PolicyError, PolicyLayer, ProjectId,
     RoleId, RunId, ScopedPolicy,
 };
 
@@ -16,6 +17,22 @@ pub enum ApprovalRisk {
     Critical,
 }
 
+/// Immutable locator for a one-time credential-use approval.  It deliberately
+/// contains only credential-store metadata, never secret material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialGrantBinding {
+    pub agent_provider_id: AgentProviderId,
+    pub account_id: AccountId,
+    pub adapter_kind: String,
+    pub provider_identity: String,
+    pub credential_reference_id: CredentialReferenceId,
+    pub backend: CredentialBackend,
+    pub service: String,
+    pub account_label: String,
+    pub capability_key: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalScope {
     pub project_id: ProjectId,
@@ -25,6 +42,8 @@ pub struct ApprovalScope {
     pub network_destinations: Vec<String>,
     pub credential_reference_ids: Vec<CredentialReferenceId>,
     pub destination: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_binding: Option<CredentialGrantBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +113,30 @@ pub enum ApprovalError {
     RunAgentMismatch,
     #[error("approval run scope belongs to a different project")]
     RunProjectMismatch,
+    #[error("credential.use approvals require a credential grant binding")]
+    CredentialUseBindingRequired,
+    #[error("credential grant binding requires exactly one matching credential reference")]
+    CredentialBindingReferenceMismatch,
+    #[error("credential grant binding requires a run scope")]
+    CredentialBindingRunRequired,
+    #[error("credential grant binding requires a role scope")]
+    CredentialBindingRoleRequired,
+    #[error("credential grant binding capability key is empty")]
+    EmptyCredentialCapability,
+    #[error("credential grant binding capability is not supported")]
+    UnsupportedCredentialCapability,
+    #[error("credential grant binding requires credential permission Use")]
+    CredentialPermissionRequired,
+    #[error("credential grant binding must be high or critical risk")]
+    CredentialRiskRequired,
+    #[error("credential grant binding cannot be persistent")]
+    PersistentCredentialGrant,
+    #[error("credential grant binding does not match the active {0}")]
+    CredentialBindingMismatch(&'static str),
+    #[error("credential grant binding references a disabled {0}")]
+    CredentialBindingInactive(&'static str),
+    #[error("approval decision is outside the request validity interval")]
+    InvalidDecisionTime,
 }
 
 impl ApprovalRequest {
@@ -125,7 +168,10 @@ impl ApprovalRequest {
         if decision.request_id != self.id || decision.request_hash != self.request_hash {
             return Err(ApprovalError::HashMismatch);
         }
-        if decision.decided_at_ms > self.expires_at_ms {
+        if decision.decided_at_ms < self.created_at_ms {
+            return Err(ApprovalError::InvalidDecisionTime);
+        }
+        if decision.decided_at_ms >= self.expires_at_ms {
             return Err(ApprovalError::Expired);
         }
         Ok(())
@@ -157,6 +203,9 @@ impl ApprovalRequest {
             .iter()
             .find(|item| item.metadata.id == self.action.scope.project_id)
             .ok_or(ApprovalError::MissingReference("project_id"))?;
+        project
+            .policy
+            .restrict(self.action.requested_policy.clone())?;
         let parent_policy = if let Some(role_id) = self.action.role_id {
             &catalog
                 .roles
@@ -212,6 +261,9 @@ impl ApprovalRequest {
                 }
             }
         }
+        if let Some(binding) = &self.action.scope.credential_binding {
+            validate_credential_binding(self, catalog, agent, project, binding)?;
+        }
         validate_action(&self.action, parent_policy)
     }
 }
@@ -234,6 +286,152 @@ fn validate_action(action: &ApprovalAction, parent: &ScopedPolicy) -> Result<(),
         && action.requested_policy.ceiling.persistent_approval
     {
         return Err(ApprovalError::PersistentHighRisk);
+    }
+    if action.action_key == "credential.use" && action.scope.credential_binding.is_none() {
+        return Err(ApprovalError::CredentialUseBindingRequired);
+    }
+    if let Some(binding) = &action.scope.credential_binding {
+        if action.action_key != "credential.use" {
+            return Err(ApprovalError::CredentialUseBindingRequired);
+        }
+        if binding.capability_key.trim().is_empty() {
+            return Err(ApprovalError::EmptyCredentialCapability);
+        }
+        if binding.capability_key != "provider.authenticate" {
+            return Err(ApprovalError::UnsupportedCredentialCapability);
+        }
+        if action.scope.run_id.is_none() {
+            return Err(ApprovalError::CredentialBindingRunRequired);
+        }
+        if action.role_id.is_none() {
+            return Err(ApprovalError::CredentialBindingRoleRequired);
+        }
+        if action.scope.credential_reference_ids.as_slice() != [binding.credential_reference_id] {
+            return Err(ApprovalError::CredentialBindingReferenceMismatch);
+        }
+        if action.requested_policy.ceiling.credential != PermissionLevel::Use {
+            return Err(ApprovalError::CredentialPermissionRequired);
+        }
+        if !matches!(action.risk, ApprovalRisk::High | ApprovalRisk::Critical) {
+            return Err(ApprovalError::CredentialRiskRequired);
+        }
+        if action.requested_policy.ceiling.persistent_approval {
+            return Err(ApprovalError::PersistentCredentialGrant);
+        }
+    }
+    Ok(())
+}
+
+fn validate_credential_binding(
+    request: &ApprovalRequest,
+    catalog: &crate::IdentityCatalog,
+    agent: &crate::AgentInstance,
+    project: &crate::Project,
+    binding: &CredentialGrantBinding,
+) -> Result<(), ApprovalError> {
+    if agent.metadata.lifecycle != EntityLifecycle::Active {
+        return Err(ApprovalError::CredentialBindingInactive("agent_instance"));
+    }
+    if project.metadata.lifecycle != EntityLifecycle::Active {
+        return Err(ApprovalError::CredentialBindingInactive("project"));
+    }
+    if agent.agent_provider_id != binding.agent_provider_id {
+        return Err(ApprovalError::CredentialBindingMismatch(
+            "agent_provider_id",
+        ));
+    }
+    let provider = catalog
+        .agent_providers
+        .iter()
+        .find(|item| item.metadata.id == binding.agent_provider_id)
+        .ok_or(ApprovalError::MissingReference("agent_provider_id"))?;
+    if provider.metadata.lifecycle != EntityLifecycle::Active {
+        return Err(ApprovalError::CredentialBindingInactive("agent_provider"));
+    }
+    if provider.adapter_kind != binding.adapter_kind {
+        return Err(ApprovalError::CredentialBindingMismatch("adapter_kind"));
+    }
+    if agent.account_id != Some(binding.account_id) {
+        return Err(ApprovalError::CredentialBindingMismatch("account_id"));
+    }
+    let account = catalog
+        .accounts
+        .iter()
+        .find(|item| item.metadata.id == binding.account_id)
+        .ok_or(ApprovalError::MissingReference("account_id"))?;
+    if account.metadata.lifecycle != EntityLifecycle::Active {
+        return Err(ApprovalError::CredentialBindingInactive("account"));
+    }
+    if account.agent_provider_id != binding.agent_provider_id {
+        return Err(ApprovalError::CredentialBindingMismatch(
+            "account.agent_provider_id",
+        ));
+    }
+    if account.provider_identity != binding.provider_identity {
+        return Err(ApprovalError::CredentialBindingMismatch(
+            "provider_identity",
+        ));
+    }
+    if account.credential_reference_id != Some(binding.credential_reference_id) {
+        return Err(ApprovalError::CredentialBindingMismatch(
+            "credential_reference_id",
+        ));
+    }
+    let reference = catalog
+        .credential_references
+        .iter()
+        .find(|item| item.metadata.id == binding.credential_reference_id)
+        .ok_or(ApprovalError::MissingReference("credential_reference_id"))?;
+    if reference.metadata.lifecycle != EntityLifecycle::Active {
+        return Err(ApprovalError::CredentialBindingInactive(
+            "credential_reference",
+        ));
+    }
+    if reference.backend != binding.backend {
+        return Err(ApprovalError::CredentialBindingMismatch("backend"));
+    }
+    if reference.service != binding.service {
+        return Err(ApprovalError::CredentialBindingMismatch("service"));
+    }
+    if reference.account_label != binding.account_label {
+        return Err(ApprovalError::CredentialBindingMismatch("account_label"));
+    }
+    let run_id = request
+        .action
+        .scope
+        .run_id
+        .expect("validated credential run scope");
+    let run = catalog
+        .runs
+        .iter()
+        .find(|item| item.metadata.id == run_id)
+        .ok_or(ApprovalError::MissingReference("run_id"))?;
+    if run.metadata.lifecycle != EntityLifecycle::Active {
+        return Err(ApprovalError::CredentialBindingInactive("run"));
+    }
+    let session = catalog
+        .sessions
+        .iter()
+        .find(|item| item.metadata.id == run.session_id)
+        .ok_or(ApprovalError::MissingReference("session_id"))?;
+    if session.metadata.lifecycle != EntityLifecycle::Active {
+        return Err(ApprovalError::CredentialBindingInactive("session"));
+    }
+    if session.agent_instance_id != request.action.agent_instance_id {
+        return Err(ApprovalError::RunAgentMismatch);
+    }
+    if session.project_id != request.action.scope.project_id {
+        return Err(ApprovalError::RunProjectMismatch);
+    }
+    if let Some(role_id) = request.action.role_id {
+        let role = catalog
+            .roles
+            .iter()
+            .find(|item| item.metadata.id == role_id)
+            .ok_or(ApprovalError::MissingReference("role_id"))?;
+        if role.metadata.lifecycle != EntityLifecycle::Active {
+            return Err(ApprovalError::CredentialBindingInactive("role"));
+        }
     }
     Ok(())
 }
@@ -271,7 +469,7 @@ mod tests {
         Account, AccountId, AgentInstance, AgentProvider, AgentProviderId, CredentialBackend,
         CredentialReference, EntityLifecycle, EntityMetadata, IdentityCatalog, Model, ModelId,
         ModelProvider, ModelProviderId, NormalizedRunState, PermissionLevel, PolicyCeiling,
-        Project, Provenance, Run, Session, SessionId,
+        Project, Provenance, Role, Run, Session, SessionId,
     };
 
     fn policy(layer: PolicyLayer, level: PermissionLevel, persistent: bool) -> ScopedPolicy {
@@ -304,6 +502,7 @@ mod tests {
                 network_destinations: Vec::new(),
                 credential_reference_ids: Vec::new(),
                 destination: None,
+                credential_binding: None,
             },
             requested_policy: policy(PolicyLayer::SingleRun, PermissionLevel::Observe, false),
         }
@@ -424,6 +623,12 @@ mod tests {
                     policy: project_policy,
                 },
             ],
+            roles: vec![Role {
+                metadata: metadata(RoleId::from_bytes([19; 16])),
+                name: "credential role".into(),
+                responsibilities: Vec::new(),
+                policy: policy(PolicyLayer::RoleOrAgent, PermissionLevel::Use, true),
+            }],
             sessions: vec![
                 Session {
                     metadata: metadata(session_id),
@@ -470,7 +675,6 @@ mod tests {
                     finished_at: None,
                 },
             ],
-            ..IdentityCatalog::default()
         };
         catalog.validate().unwrap();
         catalog
@@ -480,6 +684,34 @@ mod tests {
         let mut action = action();
         action.role_id = None;
         action.scope.credential_reference_ids = vec![CredentialReferenceId::from_bytes([10; 16])];
+        ApprovalRequest::create(
+            ApprovalRequestId::from_bytes([5; 16]),
+            100,
+            200,
+            action,
+            &policy(PolicyLayer::Project, PermissionLevel::Use, true),
+        )
+        .unwrap()
+    }
+
+    fn credential_grant_request() -> ApprovalRequest {
+        let mut action = action();
+        action.role_id = Some(RoleId::from_bytes([19; 16]));
+        action.action_key = "credential.use".into();
+        action.risk = ApprovalRisk::High;
+        action.scope.credential_reference_ids = vec![CredentialReferenceId::from_bytes([10; 16])];
+        action.scope.credential_binding = Some(CredentialGrantBinding {
+            agent_provider_id: AgentProviderId::from_bytes([2; 16]),
+            account_id: AccountId::from_bytes([12; 16]),
+            adapter_kind: "test_adapter".into(),
+            provider_identity: "own-account".into(),
+            credential_reference_id: CredentialReferenceId::from_bytes([10; 16]),
+            backend: CredentialBackend::MacosKeychain,
+            service: "test.own".into(),
+            account_label: "own".into(),
+            capability_key: "provider.authenticate".into(),
+        });
+        action.requested_policy = policy(PolicyLayer::SingleRun, PermissionLevel::Use, false);
         ApprovalRequest::create(
             ApprovalRequestId::from_bytes([5; 16]),
             100,
@@ -541,6 +773,26 @@ mod tests {
     }
 
     #[test]
+    fn decision_must_not_predate_creation_or_equal_expiry() {
+        let request = request();
+        for (decided_at_ms, expected) in [
+            (99, ApprovalError::InvalidDecisionTime),
+            (200, ApprovalError::Expired),
+        ] {
+            assert_eq!(
+                request.verify_decision(&ApprovalDecision {
+                    request_id: request.id,
+                    request_hash: request.request_hash.clone(),
+                    kind: ApprovalDecisionKind::Approve,
+                    decided_at_ms,
+                    actor: "local-user".into(),
+                }),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
     fn policy_ceiling_expiry_and_persistent_high_risk_fail_closed() {
         let parent = policy(PolicyLayer::RoleOrAgent, PermissionLevel::Observe, false);
         let mut expanded = action();
@@ -585,6 +837,300 @@ mod tests {
     #[test]
     fn matching_own_credential_and_run_scope_succeeds() {
         bound_request().validate_against(&bound_catalog()).unwrap();
+    }
+
+    #[test]
+    fn credential_grant_binding_matches_the_active_catalog() {
+        credential_grant_request()
+            .validate_against(&bound_catalog())
+            .unwrap();
+    }
+
+    #[test]
+    fn credential_grant_rejects_locator_drift_and_disabled_entities() {
+        let request = credential_grant_request();
+        let mut catalog = bound_catalog();
+        catalog.credential_references[0].service = "drifted.service".into();
+        assert_eq!(
+            request.validate_against(&catalog),
+            Err(ApprovalError::CredentialBindingMismatch("service"))
+        );
+        let mut catalog = bound_catalog();
+        catalog.accounts[0].metadata.lifecycle = EntityLifecycle::Disabled;
+        assert_eq!(
+            request.validate_against(&catalog),
+            Err(ApprovalError::CredentialBindingInactive("account"))
+        );
+    }
+
+    #[test]
+    fn credential_grant_requires_active_run_session_and_role() {
+        let request = credential_grant_request();
+        let mut catalog = bound_catalog();
+        catalog.runs[0].metadata.lifecycle = EntityLifecycle::Archived;
+        assert_eq!(
+            request.validate_against(&catalog),
+            Err(ApprovalError::CredentialBindingInactive("run"))
+        );
+
+        let mut catalog = bound_catalog();
+        catalog.sessions[0].metadata.lifecycle = EntityLifecycle::Disabled;
+        assert_eq!(
+            request.validate_against(&catalog),
+            Err(ApprovalError::CredentialBindingInactive("session"))
+        );
+
+        let request = credential_grant_request();
+        let mut catalog = bound_catalog();
+        catalog.roles[0].metadata.lifecycle = EntityLifecycle::Archived;
+        assert_eq!(
+            request.validate_against(&catalog),
+            Err(ApprovalError::CredentialBindingInactive("role"))
+        );
+    }
+
+    #[test]
+    fn credential_grant_rejects_unsupported_capability() {
+        let mut action = action();
+        action.role_id = Some(RoleId::from_bytes([19; 16]));
+        action.action_key = "credential.use".into();
+        action.risk = ApprovalRisk::High;
+        action.scope.run_id = Some(RunId::from_bytes([4; 16]));
+        action.scope.credential_reference_ids = vec![CredentialReferenceId::from_bytes([10; 16])];
+        action.scope.credential_binding = Some(CredentialGrantBinding {
+            agent_provider_id: AgentProviderId::from_bytes([2; 16]),
+            account_id: AccountId::from_bytes([12; 16]),
+            adapter_kind: "test_adapter".into(),
+            provider_identity: "own-account".into(),
+            credential_reference_id: CredentialReferenceId::from_bytes([10; 16]),
+            backend: CredentialBackend::MacosKeychain,
+            service: "test.own".into(),
+            account_label: "own".into(),
+            capability_key: "provider.chat".into(),
+        });
+        action.requested_policy = policy(PolicyLayer::SingleRun, PermissionLevel::Use, false);
+        assert_eq!(
+            ApprovalRequest::create(
+                ApprovalRequestId::new(),
+                100,
+                200,
+                action,
+                &policy(PolicyLayer::Project, PermissionLevel::Use, true),
+            ),
+            Err(ApprovalError::UnsupportedCredentialCapability)
+        );
+    }
+
+    #[test]
+    fn credential_grant_cannot_omit_its_role_scope() {
+        let mut action = action();
+        action.role_id = None;
+        action.action_key = "credential.use".into();
+        action.risk = ApprovalRisk::High;
+        action.scope.credential_reference_ids = vec![CredentialReferenceId::from_bytes([10; 16])];
+        action.scope.credential_binding = Some(CredentialGrantBinding {
+            agent_provider_id: AgentProviderId::from_bytes([2; 16]),
+            account_id: AccountId::from_bytes([12; 16]),
+            adapter_kind: "test_adapter".into(),
+            provider_identity: "own-account".into(),
+            credential_reference_id: CredentialReferenceId::from_bytes([10; 16]),
+            backend: CredentialBackend::MacosKeychain,
+            service: "test.own".into(),
+            account_label: "own".into(),
+            capability_key: "provider.authenticate".into(),
+        });
+        action.requested_policy = policy(PolicyLayer::SingleRun, PermissionLevel::Use, false);
+        assert_eq!(
+            ApprovalRequest::create(
+                ApprovalRequestId::new(),
+                100,
+                200,
+                action,
+                &policy(PolicyLayer::Project, PermissionLevel::Use, true),
+            ),
+            Err(ApprovalError::CredentialBindingRoleRequired)
+        );
+    }
+
+    #[test]
+    fn credential_grant_rejects_wrong_actor_account_and_project() {
+        let mut request = credential_grant_request();
+        request.action.agent_instance_id = AgentInstanceId::from_bytes([6; 16]);
+        request.request_hash = canonical_hash(
+            request.id,
+            request.created_at_ms,
+            request.expires_at_ms,
+            &request.action,
+        );
+        assert_eq!(
+            request.validate_against(&bound_catalog()),
+            Err(ApprovalError::RunAgentMismatch)
+        );
+
+        let mut request = credential_grant_request();
+        request
+            .action
+            .scope
+            .credential_binding
+            .as_mut()
+            .unwrap()
+            .account_id = AccountId::from_bytes([17; 16]);
+        request.request_hash = canonical_hash(
+            request.id,
+            request.created_at_ms,
+            request.expires_at_ms,
+            &request.action,
+        );
+        assert_eq!(
+            request.validate_against(&bound_catalog()),
+            Err(ApprovalError::CredentialBindingMismatch("account_id"))
+        );
+
+        let mut request = credential_grant_request();
+        request.action.scope.project_id = ProjectId::from_bytes([13; 16]);
+        request.request_hash = canonical_hash(
+            request.id,
+            request.created_at_ms,
+            request.expires_at_ms,
+            &request.action,
+        );
+        assert_eq!(
+            request.validate_against(&bound_catalog()),
+            Err(ApprovalError::RunProjectMismatch)
+        );
+    }
+
+    #[test]
+    fn credential_use_cannot_be_created_without_a_binding() {
+        let mut action = action();
+        action.action_key = "credential.use".into();
+        assert_eq!(
+            ApprovalRequest::create(
+                ApprovalRequestId::new(),
+                100,
+                200,
+                action,
+                &policy(PolicyLayer::RoleOrAgent, PermissionLevel::Use, true),
+            ),
+            Err(ApprovalError::CredentialUseBindingRequired)
+        );
+    }
+
+    #[test]
+    fn absent_binding_preserves_legacy_serialization_and_hash() {
+        let request = request();
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert!(encoded["action"]["scope"]
+            .get("credential_binding")
+            .is_none());
+        let restored: ApprovalRequest = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.request_hash, request.request_hash);
+        restored.validate_unchanged().unwrap();
+    }
+
+    #[test]
+    fn absent_binding_hash_matches_the_frozen_pre_binding_shape() {
+        #[derive(Serialize)]
+        struct LegacyApprovalScope<'a> {
+            project_id: ProjectId,
+            run_id: Option<RunId>,
+            filesystem_roots: &'a Vec<String>,
+            data_scopes: &'a Vec<String>,
+            network_destinations: &'a Vec<String>,
+            credential_reference_ids: &'a Vec<CredentialReferenceId>,
+            destination: &'a Option<String>,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyApprovalAction<'a> {
+            agent_instance_id: AgentInstanceId,
+            role_id: Option<RoleId>,
+            action_key: &'a String,
+            reason_key: &'a String,
+            consequence_key: &'a String,
+            risk: ApprovalRisk,
+            scope: LegacyApprovalScope<'a>,
+            requested_policy: &'a ScopedPolicy,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyHashInput<'a> {
+            schema: &'static str,
+            id: ApprovalRequestId,
+            created_at_ms: u64,
+            expires_at_ms: u64,
+            action: LegacyApprovalAction<'a>,
+        }
+
+        let request = request();
+        let action = &request.action;
+        let legacy = LegacyHashInput {
+            schema: "bastet.approval-request.v1",
+            id: request.id,
+            created_at_ms: request.created_at_ms,
+            expires_at_ms: request.expires_at_ms,
+            action: LegacyApprovalAction {
+                agent_instance_id: action.agent_instance_id,
+                role_id: action.role_id,
+                action_key: &action.action_key,
+                reason_key: &action.reason_key,
+                consequence_key: &action.consequence_key,
+                risk: action.risk,
+                scope: LegacyApprovalScope {
+                    project_id: action.scope.project_id,
+                    run_id: action.scope.run_id,
+                    filesystem_roots: &action.scope.filesystem_roots,
+                    data_scopes: &action.scope.data_scopes,
+                    network_destinations: &action.scope.network_destinations,
+                    credential_reference_ids: &action.scope.credential_reference_ids,
+                    destination: &action.scope.destination,
+                },
+                requested_policy: &action.requested_policy,
+            },
+        };
+        let digest = Sha256::digest(serde_json::to_vec(&legacy).unwrap());
+        let legacy_hash: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(legacy_hash, request.request_hash);
+    }
+
+    #[test]
+    fn credential_binding_rejects_unknown_fields() {
+        let binding = credential_grant_request()
+            .action
+            .scope
+            .credential_binding
+            .unwrap();
+        let mut encoded = serde_json::to_value(binding).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .insert("secret".into(), serde_json::Value::String("never".into()));
+        assert!(serde_json::from_value::<CredentialGrantBinding>(encoded).is_err());
+    }
+
+    #[test]
+    fn project_policy_remains_a_ceiling_when_a_role_is_more_permissive() {
+        let mut catalog = bound_catalog();
+        catalog.projects[0].policy = policy(PolicyLayer::Project, PermissionLevel::Observe, true);
+        catalog.roles.push(Role {
+            metadata: metadata(RoleId::from_bytes([2; 16])),
+            name: "permissive role".into(),
+            responsibilities: Vec::new(),
+            policy: policy(PolicyLayer::RoleOrAgent, PermissionLevel::Use, true),
+        });
+        let mut request = request();
+        request.action.requested_policy =
+            policy(PolicyLayer::SingleRun, PermissionLevel::Use, false);
+        request.request_hash = canonical_hash(
+            request.id,
+            request.created_at_ms,
+            request.expires_at_ms,
+            &request.action,
+        );
+        assert!(matches!(
+            request.validate_against(&catalog),
+            Err(ApprovalError::Policy(PolicyError::ExceedsParent { .. }))
+        ));
     }
 
     #[test]

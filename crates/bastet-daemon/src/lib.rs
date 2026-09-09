@@ -1,5 +1,6 @@
 //! Durable state primitives for the Bastet Workstation local daemon.
 
+mod credential_grants;
 mod provider_executor;
 pub mod sandbox;
 
@@ -41,7 +42,7 @@ use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -68,6 +69,10 @@ pub enum StoreError {
     ApprovalNotFound,
     #[error("approval request already exists or has already been decided")]
     ApprovalConflict,
+    #[error("credential grant was not found")]
+    CredentialGrantNotFound,
+    #[error("credential grant is not usable for this request")]
+    CredentialGrantRejected,
     #[error("state revision overflow")]
     RevisionOverflow,
     #[error("run was not found")]
@@ -280,6 +285,10 @@ fn build_router_with_execution(
         )
         .route("/v1/mvp/costs", post(record_cost))
         .route("/v1/approvals", get(approvals).post(create_approval))
+        .route(
+            "/v1/credential-grants/{request_id}",
+            get(credential_grants::get_grant).post(credential_grants::revoke_grant),
+        )
         .route(
             "/v1/approvals/{request_id}",
             get(approval).post(decide_approval),
@@ -687,12 +696,14 @@ impl axum::response::IntoResponse for ApiError {
             StoreError::RevisionConflict { .. }
             | StoreError::InvalidLifecycle { .. }
             | StoreError::ApprovalConflict
+            | StoreError::CredentialGrantRejected
             | StoreError::GraphConflict
             | StoreError::InvalidRunState(_)
             | StoreError::ProviderRunsActive => StatusCode::CONFLICT,
-            StoreError::ApprovalNotFound | StoreError::RunNotFound | StoreError::GraphNotFound => {
-                StatusCode::NOT_FOUND
-            }
+            StoreError::ApprovalNotFound
+            | StoreError::RunNotFound
+            | StoreError::GraphNotFound
+            | StoreError::CredentialGrantNotFound => StatusCode::NOT_FOUND,
             StoreError::RunControlRejected => StatusCode::SERVICE_UNAVAILABLE,
             StoreError::InvalidCatalog(_)
             | StoreError::InvalidApproval(_)
@@ -2622,6 +2633,10 @@ impl Store {
         let catalog: IdentityCatalog = serde_json::from_str(&catalog_json)?;
         catalog.validate()?;
         command.request.validate_against(&catalog)?;
+        if command.request.action.scope.credential_binding.is_some() {
+            credential_grants::validate_time(&command.request, credential_grants::now_ms()?)?;
+            credential_grants::validate_current_catalog(&transaction, &command.request)?;
+        }
         let request_json = serde_json::to_string(&command.request)?;
         let inserted = transaction.execute(
             "INSERT OR IGNORE INTO approval_requests(request_id, request_hash, request_json, expires_at_ms, created_at)
@@ -2699,7 +2714,7 @@ impl Store {
 
     pub fn decide_approval(
         &self,
-        command: DecideApprovalCommand,
+        mut command: DecideApprovalCommand,
     ) -> Result<ApprovalReceipt, StoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2716,8 +2731,22 @@ impl Store {
         }
         let request: bastet_core::ApprovalRequest = serde_json::from_str(&request_json)?;
         request.validate_unchanged()?;
+        if request.action.scope.credential_binding.is_some() {
+            if command.decision.kind == bastet_core::ApprovalDecisionKind::Approve
+                && !command.credential_scope_acknowledged
+            {
+                return Err(StoreError::CredentialGrantRejected);
+            }
+            // A client timestamp cannot extend or resurrect a credential grant.
+            let now = credential_grants::now_ms()?;
+            credential_grants::validate_time(&request, now)?;
+            command.decision.decided_at_ms = now;
+            if command.decision.kind == bastet_core::ApprovalDecisionKind::Approve {
+                credential_grants::validate_current_catalog(&transaction, &request)?;
+            }
+        }
         request.verify_decision(&command.decision)?;
-        transaction.execute(
+        let updated = transaction.execute(
             "UPDATE approval_requests SET decision_json = ?1, decided_at = ?2 WHERE request_id = ?3 AND decision_json IS NULL",
             params![
                 serde_json::to_string(&command.decision)?,
@@ -2725,6 +2754,14 @@ impl Store {
                 command.decision.request_id.value().to_string()
             ],
         )?;
+        if updated != 1 {
+            return Err(StoreError::ApprovalConflict);
+        }
+        if request.action.scope.credential_binding.is_some()
+            && command.decision.kind == bastet_core::ApprovalDecisionKind::Approve
+        {
+            credential_grants::issue(&transaction, &request, &command.decision)?;
+        }
         let event = insert_event(
             &transaction,
             match command.decision.kind {
@@ -3148,6 +3185,26 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StoreError> {
             .execute_batch("ALTER TABLE graph_node_runs ADD COLUMN launch_identity_json TEXT;")?;
         transaction.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (9, ?1)",
+            [timestamp()],
+        )?;
+        transaction.commit()?;
+    }
+    if current < 10 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE credential_grants (
+                request_id TEXT PRIMARY KEY REFERENCES approval_requests(request_id),
+                issued_at_ms INTEGER NOT NULL CHECK(issued_at_ms >= 0),
+                consumed_at_ms INTEGER,
+                revoked_at_ms INTEGER,
+                revoked_by TEXT,
+                CHECK(consumed_at_ms IS NULL OR consumed_at_ms >= issued_at_ms),
+                CHECK(revoked_at_ms IS NULL OR revoked_at_ms >= issued_at_ms),
+                CHECK(consumed_at_ms IS NULL OR revoked_at_ms IS NULL),
+                CHECK((revoked_at_ms IS NULL) = (revoked_by IS NULL)));",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (10, ?1)",
             [timestamp()],
         )?;
         transaction.commit()?;
@@ -3762,7 +3819,8 @@ mod tests {
         }
     }
 
-    fn provider_execution_fixture() -> (tempfile::TempDir, tempfile::TempDir, Store, GraphRunId) {
+    pub(super) fn provider_execution_fixture(
+    ) -> (tempfile::TempDir, tempfile::TempDir, Store, GraphRunId) {
         let directory = tempdir().unwrap();
         let workspace = tempdir().unwrap();
         let store = Store::open(directory.path().join("provider-execution.db")).unwrap();
@@ -4325,7 +4383,11 @@ mod tests {
         ).unwrap(), 1);
     }
 
-    fn attach_selected_account(store: &Store, execution_id: GraphRunId, node_id: GraphNodeId) {
+    pub(super) fn attach_selected_account(
+        store: &Store,
+        execution_id: GraphRunId,
+        node_id: GraphNodeId,
+    ) {
         let mut catalog = store.catalog().unwrap();
         let binding = resolve_provider_run_binding(
             &catalog.catalog,
@@ -4366,7 +4428,10 @@ mod tests {
             .unwrap();
     }
 
-    fn begin_fixture_node(store: &Store, execution_id: GraphRunId) -> BeginGraphNodeRunReceipt {
+    pub(super) fn begin_fixture_node(
+        store: &Store,
+        execution_id: GraphRunId,
+    ) -> BeginGraphNodeRunReceipt {
         let graph = store.graph_execution(execution_id).unwrap();
         let node_id = graph.nodes[0].node_id;
         store
@@ -4683,7 +4748,8 @@ mod tests {
         connection
             .execute_batch(
                 "ALTER TABLE graph_node_runs DROP COLUMN launch_identity_json;
-             DELETE FROM schema_migrations WHERE version=9;",
+                 DROP TABLE credential_grants;
+                 DELETE FROM schema_migrations WHERE version >= 9;",
             )
             .unwrap();
         let original: (String, u64, String) = connection
@@ -4850,7 +4916,7 @@ mod tests {
         }
     }
 
-    fn catalog_fixture() -> IdentityCatalog {
+    pub(super) fn catalog_fixture() -> IdentityCatalog {
         let credential_id = CredentialReferenceId::from_bytes([1; 16]);
         let agent_provider_id = AgentProviderId::from_bytes([2; 16]);
         let model_provider_id = ModelProviderId::from_bytes([3; 16]);
@@ -4956,6 +5022,7 @@ mod tests {
                     data_scopes: vec![],
                     network_destinations: vec![],
                     credential_reference_ids: vec![],
+                    credential_binding: None,
                     destination: None,
                 },
                 requested_policy: ScopedPolicy {
@@ -5039,6 +5106,7 @@ mod tests {
         fixture
             .execute_batch(
                 "DELETE FROM schema_migrations WHERE version >= 7;
+                 DROP TABLE credential_grants;
                  DROP TABLE graph_node_outputs;
                  DROP INDEX graph_node_runs_current_attempt;
                  DROP TABLE graph_node_runs;
@@ -5076,6 +5144,7 @@ mod tests {
         fixture
             .execute_batch(
                 "DELETE FROM schema_migrations WHERE version >= 8;
+                 DROP TABLE credential_grants;
                  DROP TABLE graph_node_outputs;
                  DROP TABLE graph_node_runs;
                  CREATE TABLE graph_node_runs (
@@ -5472,11 +5541,13 @@ mod tests {
         };
         store
             .decide_approval(DecideApprovalCommand {
+                credential_scope_acknowledged: false,
                 decision: decision.clone(),
             })
             .unwrap();
         assert!(matches!(
             store.decide_approval(DecideApprovalCommand {
+                credential_scope_acknowledged: false,
                 decision: decision.clone()
             }),
             Err(StoreError::ApprovalConflict)
@@ -6113,6 +6184,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store.decide_approval(DecideApprovalCommand {
+                credential_scope_acknowledged: false,
                 decision: ApprovalDecision {
                     request_id: request.id,
                     request_hash: request.request_hash,

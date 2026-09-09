@@ -524,6 +524,16 @@ impl DaemonClient {
         &self,
         decision: ApprovalDecision,
     ) -> Result<ApprovalReceipt, ClientError> {
+        self.decide_approval_with_scope_review(decision, false)
+            .await
+    }
+
+    /// Use true only after presenting the immutable credential scope for review.
+    pub async fn decide_approval_with_scope_review(
+        &self,
+        decision: ApprovalDecision,
+        credential_scope_acknowledged: bool,
+    ) -> Result<ApprovalReceipt, ClientError> {
         let receipt = self
             .http
             .post(format!(
@@ -531,7 +541,10 @@ impl DaemonClient {
                 self.base_url,
                 decision.request_id.value()
             ))
-            .json(&DecideApprovalCommand { decision })
+            .json(&DecideApprovalCommand {
+                decision,
+                credential_scope_acknowledged,
+            })
             .send()
             .await?
             .error_for_status()?
@@ -539,6 +552,48 @@ impl DaemonClient {
             .await?;
         require_protocol(receipt.protocol_version)?;
         Ok(receipt)
+    }
+
+    pub async fn credential_grant(
+        &self,
+        request_id: ApprovalRequestId,
+    ) -> Result<bastet_protocol::CredentialGrantRecord, ClientError> {
+        let record = self
+            .http
+            .get(format!(
+                "{}/v1/credential-grants/{}",
+                self.base_url,
+                request_id.value()
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<bastet_protocol::CredentialGrantRecord>()
+            .await?;
+        require_protocol(record.protocol_version)?;
+        Ok(record)
+    }
+
+    pub async fn revoke_credential_grant(
+        &self,
+        request_id: ApprovalRequestId,
+        actor: String,
+    ) -> Result<bastet_protocol::CredentialGrantRecord, ClientError> {
+        let record = self
+            .http
+            .post(format!(
+                "{}/v1/credential-grants/{}",
+                self.base_url,
+                request_id.value()
+            ))
+            .json(&bastet_protocol::RevokeCredentialGrantCommand { actor })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<bastet_protocol::CredentialGrantRecord>()
+            .await?;
+        require_protocol(record.protocol_version)?;
+        Ok(record)
     }
 
     pub async fn cancel_run(

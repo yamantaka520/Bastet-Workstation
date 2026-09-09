@@ -7,7 +7,12 @@ import "./styles.css";
 
 type ConnectionState = "connecting" | "ready" | "offline";
 type DaemonSnapshot = { protocol_version: number; daemon_id: string; revision: number; lifecycle: string };
-type ApprovalRecord = { request: { id: string; request_hash: string; expires_at_ms: number; action: { action_key: string; reason_key: string; consequence_key: string; risk: string } }; decision: { kind: "approve" | "deny" } | null };
+type CredentialBinding = { agent_provider_id: string; account_id: string; adapter_kind: string; provider_identity: string; credential_reference_id: string; backend: string; service: string; account_label: string; capability_key: string };
+type ApprovalScope = { project_id: string; run_id?: string | null; filesystem_roots: string[]; data_scopes: string[]; network_destinations: string[]; credential_reference_ids: string[]; destination?: string | null; credential_binding?: CredentialBinding | null };
+type PolicyCeiling = { filesystem?: string | null; network?: string | null; process?: string | null; device?: string | null; credential?: string | null; persistent_approval?: boolean | null };
+type ScopedPolicy = { layer?: string | null; ceiling?: PolicyCeiling | null };
+type ApprovalAction = { agent_instance_id: string; role_id?: string | null; action_key: string; reason_key: string; consequence_key: string; risk: string; requested_policy?: ScopedPolicy | null; scope: ApprovalScope };
+type ApprovalRecord = { request: { id: string; request_hash: string; expires_at_ms: number; action: ApprovalAction }; decision: { kind: "approve" | "deny" } | null };
 type ApprovalList = { protocol_version: number; records: ApprovalRecord[] };
 type AgentStatus = { adapter_kind: string; display_name: string; installed: boolean; version: string | null; authenticated: boolean | null; model_count: number | null; models: string[]; reasoning_controls: string[]; operations: string[]; error_key: string | null };
 type AgentCenterSnapshot = { agents: AgentStatus[] };
@@ -15,6 +20,34 @@ type WorkProjection = { revision: number; sessions: number; runs: { run_id: stri
 type PetProfile = { metadata: { id: string }; name: string; version: number; states: { state_key: string; accessible_label_key: string }[] };
 type M3Projection = { revision: number; pet_profiles: PetProfile[]; pet_assignments: number; rooms: number; meetings: number; documents: number; costs: number; graph_nodes: { execution_id: string; node_id: string; title: string; state: string; pet_state: string; failure_kind?: string | null; failure_message_key?: string | null }[]; awaiting_meetings: { meeting_id: string; summary: string }[]; joined_drafts: { execution_id: string; title: string; markdown: string }[]; missing_output_execution_id: string | null; document_versions: { project_id: string; artifact_id: string; version_id: string; title: string; markdown: string; content_hash: string; accepted: boolean; workspace_file?: string | null }[]; knowledge_deliveries: { delivery_id: string; target: string; preview: string; state: string }[] };
 type View = "office" | "agents" | "approvals" | "diagnostics";
+
+function PolicyDetails({ policy, locale }: { policy: ScopedPolicy | null | undefined; locale: Locale }) {
+  const permission = (value: string | null | undefined) => translate(locale, value === "deny" ? "permissionDeny" : value === "observe" ? "permissionObserve" : value === "use" ? "permissionUse" : "unknown");
+  const layer = translate(locale, policy?.layer === "workstation" ? "policyLayerWorkstation" : policy?.layer === "project" ? "policyLayerProject" : policy?.layer === "role_or_agent" ? "policyLayerRoleOrAgent" : policy?.layer === "single_run" ? "policyLayerSingleRun" : "unknown");
+  const persistent = translate(locale, policy?.ceiling?.persistent_approval === true ? "yes" : policy?.ceiling?.persistent_approval === false ? "no" : "unknown");
+  return <dl><dt>{translate(locale, "policyLayer")}</dt><dd>{layer}</dd><dt>{translate(locale, "filesystem")}</dt><dd>{permission(policy?.ceiling?.filesystem)}</dd><dt>{translate(locale, "network")}</dt><dd>{permission(policy?.ceiling?.network)}</dd><dt>{translate(locale, "process")}</dt><dd>{permission(policy?.ceiling?.process)}</dd><dt>{translate(locale, "device")}</dt><dd>{permission(policy?.ceiling?.device)}</dd><dt>{translate(locale, "credential")}</dt><dd>{permission(policy?.ceiling?.credential)}</dd><dt>{translate(locale, "persistentApproval")}</dt><dd>{persistent}</dd></dl>;
+}
+
+function ApprovalDetails({ action, locale }: { action: ApprovalAction; locale: Locale }) {
+  const detail = (label: Parameters<typeof translate>[1], value: string | string[] | null | undefined) => {
+    if (value == null) return null;
+    return <><dt>{translate(locale, label)}</dt><dd>{Array.isArray(value) ? value.join(" · ") || translate(locale, "none") : value}</dd></>;
+  };
+  const binding = action.scope.credential_binding;
+  return <>
+    <h4>{translate(locale, "approvalIdentity")}</h4>
+    <dl>{detail("agentInstance", action.agent_instance_id)}{detail("role", action.role_id ?? translate(locale, "none"))}</dl>
+    <h4>{translate(locale, "requestedPolicy")}</h4>
+    <PolicyDetails policy={action.requested_policy} locale={locale} />
+    <h4>{translate(locale, "approvalScope")}</h4>
+    <dl>{detail("project", action.scope.project_id)}{detail("run", action.scope.run_id ?? translate(locale, "none"))}{detail("filesystemRoots", action.scope.filesystem_roots)}{detail("dataScopes", action.scope.data_scopes)}{detail("networkDestinations", action.scope.network_destinations)}{detail("credentialReferences", action.scope.credential_reference_ids)}{detail("destination", action.scope.destination ?? translate(locale, "none"))}</dl>
+    {binding && <section className="credential-binding" aria-label={translate(locale, "credentialBinding")}>
+      <h4>{translate(locale, "singleUseCredential")}</h4>
+      <p>{translate(locale, "credentialScopeNote")}</p>
+      <dl>{detail("agentProvider", binding.agent_provider_id)}{detail("providerIdentity", binding.provider_identity)}{detail("adapter", binding.adapter_kind)}{detail("account", binding.account_id)}{detail("accountLabel", binding.account_label)}{detail("credentialReference", binding.credential_reference_id)}{detail("capability", binding.capability_key)}{detail("backend", binding.backend)}{detail("service", binding.service)}</dl>
+    </section>}
+  </>;
+}
 
 export function App() {
   const [locale, setLocale] = useState<Locale>("zh-Hant");
@@ -85,7 +118,7 @@ export function App() {
 
   const changeAutostart = async (enabled: boolean) => { if (enabled) await enable(); else await disable(); setAutostart(await isEnabled()); };
   const decide = async (record: ApprovalRecord, kind: "approve" | "deny") => {
-    await invoke("decide_approval", { requestId: record.request.id, requestHash: record.request.request_hash, kind, decidedAtMs: Date.now() });
+    await invoke("decide_approval", { requestId: record.request.id, requestHash: record.request.request_hash, kind, decidedAtMs: Date.now(), credentialScopeAcknowledged: Boolean(record.request.action.scope.credential_binding) });
     await reconnect();
   };
   const cancelRun = async (runId: string) => {
@@ -210,6 +243,7 @@ export function App() {
       {approvals.length === 0 ? <p>{translate(locale, "noApprovals")}</p> : approvals.map((record) => <article key={record.request.id} className="approval-card"><h3>{record.request.action.action_key}</h3>
         <p>{record.request.action.reason_key}</p><p>{record.request.action.consequence_key}</p><dl><dt>{translate(locale, "risk")}</dt><dd>{record.request.action.risk}</dd>
           <dt>{translate(locale, "expires")}</dt><dd>{new Date(record.request.expires_at_ms).toLocaleString(locale)}</dd></dl>
+        <ApprovalDetails action={record.request.action} locale={locale} />
         {record.decision ? <strong>{translate(locale, record.decision.kind === "approve" ? "approved" : "denied")}</strong> : <div className="actions">
           <button type="button" onClick={() => void decide(record, "deny")}>{translate(locale, "deny")}</button><button type="button" className="primary" onClick={() => void decide(record, "approve")}>{translate(locale, "approve")}</button></div>}</article>)}</section>}
 

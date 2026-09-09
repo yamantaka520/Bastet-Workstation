@@ -1065,15 +1065,19 @@ async fn decide_approval(
     request_hash: String,
     kind: bastet_core::ApprovalDecisionKind,
     decided_at_ms: u64,
+    credential_scope_acknowledged: Option<bool>,
 ) -> Result<ApprovalReceipt, String> {
     client
-        .decide_approval(ApprovalDecision {
-            request_id,
-            request_hash,
-            kind,
-            decided_at_ms,
-            actor: "local-desktop-user".into(),
-        })
+        .decide_approval_with_scope_review(
+            ApprovalDecision {
+                request_id,
+                request_hash,
+                kind,
+                decided_at_ms,
+                actor: "local-desktop-user".into(),
+            },
+            credential_scope_acknowledged.unwrap_or(false),
+        )
         .await
         .map_err(|error| error.to_string())
 }

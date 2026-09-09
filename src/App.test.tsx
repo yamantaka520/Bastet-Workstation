@@ -28,7 +28,11 @@ describe("M1 shell", () => {
   beforeEach(() => { invokeMock.mockReset(); invokeMock.mockImplementation(defaultInvoke); listenMock.mockReset(); listenMock.mockResolvedValue(() => {}); });
   it("has every required locale and no missing critical keys", () => {
     expect(locales).toEqual(["zh-Hant", "zh-Hans", "en", "ja", "ko"]);
-    for (const locale of locales) expect(translate(locale, "ready")).not.toMatch(/^\[missing:/);
+    for (const locale of locales) {
+      for (const key of ["ready", "permissionDeny", "permissionObserve", "permissionUse", "yes", "no", "unknown"] as const) {
+        expect(translate(locale, key)).not.toMatch(/^\[missing:/);
+      }
+    }
   });
   it("has explicit workflow translations for all five locales", () => {
     for (const locale of locales) {
@@ -78,6 +82,50 @@ describe("M1 shell", () => {
     expect(await screen.findByRole("heading", { name: "Agents 與模型" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "核准中心" }));
     expect(screen.getByText("目前沒有待處理或近期核准。")).toBeInTheDocument();
+  });
+
+  it("shows the complete immutable identity, scope, and single-use credential binding before approval", async () => {
+    invokeMock.mockImplementation((command: string) => command === "approval_center_snapshot"
+      ? Promise.resolve({ protocol_version: 1, records: [{ request: {
+        id: "approval-1", request_hash: "immutable-hash", expires_at_ms: 1_800_000_000_000,
+        action: {
+          action_key: "credential.use", reason_key: "Need one provider operation", consequence_key: "A provider request will be made", risk: "high",
+          agent_instance_id: "agent-instance-7", role_id: null, requested_policy: { layer: "single_run", ceiling: { filesystem: "deny", network: "observe", process: "unexpected", device: "use", credential: "use", persistent_approval: false } },
+          scope: {
+            project_id: "project-9", run_id: null, filesystem_roots: ["/workspace/demo"], data_scopes: ["project.documents"], network_destinations: ["api.example.test"], credential_reference_ids: ["credential-ref-3"], destination: null,
+            credential_binding: { agent_provider_id: "provider-2", account_id: "account-4", adapter_kind: "codex_cli", provider_identity: "Example Provider", credential_reference_id: "credential-ref-3", backend: "macos_keychain", service: "example.service", account_label: "Work account", capability_key: "provider.chat" },
+          },
+        },
+      }, decision: null }] })
+      : defaultInvoke(command));
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "核准中心" }));
+    expect(await screen.findByText("單次使用憑證核准")).toBeInTheDocument();
+    for (const value of ["agent-instance-7", "project-9", "/workspace/demo", "project.documents", "api.example.test", "provider-2", "Example Provider", "codex_cli", "account-4", "Work account", "macos_keychain", "example.service", "provider.chat", "僅觀察", "否"]) {
+      expect(screen.getByText(value)).toBeInTheDocument();
+    }
+    expect(screen.getAllByText("拒絕")).toHaveLength(2);
+    expect(screen.getAllByText("使用")).toHaveLength(2);
+    expect(screen.getAllByText("無")).toHaveLength(3);
+    expect(screen.getByText("未知")).toBeInTheDocument();
+    expect(screen.queryByText("unexpected")).not.toBeInTheDocument();
+    expect(screen.getAllByText("credential-ref-3")).toHaveLength(2);
+    expect(screen.getByText(/不會驗證或登入供應商/)).toBeInTheDocument();
+    expect(screen.queryByText("Single-use credential approval")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "核准" }));
+    expect(invokeMock).toHaveBeenCalledWith("decide_approval", { requestId: "approval-1", requestHash: "immutable-hash", kind: "approve", decidedAtMs: expect.any(Number), credentialScopeAcknowledged: true });
+  });
+
+  it("does not acknowledge a credential scope for a legacy approval without a binding", async () => {
+    invokeMock.mockImplementation((command: string) => command === "approval_center_snapshot"
+      ? Promise.resolve({ protocol_version: 1, records: [{ request: { id: "approval-legacy", request_hash: "legacy-hash", expires_at_ms: 1_800_000_000_000, action: { action_key: "filesystem.read", reason_key: "Read", consequence_key: "Read", risk: "low", agent_instance_id: "agent-1", requested_policy: { layer: "single_run", ceiling: { filesystem: "observe", network: "deny", process: "deny", device: "deny", credential: "deny", persistent_approval: false } }, scope: { project_id: "project-1", filesystem_roots: [], data_scopes: [], network_destinations: [], credential_reference_ids: [] } }, }, decision: null }] })
+      : defaultInvoke(command));
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "核准中心" }));
+    fireEvent.click(await screen.findByRole("button", { name: "核准" }));
+    expect(invokeMock).toHaveBeenCalledWith("decide_approval", { requestId: "approval-legacy", requestHash: "legacy-hash", kind: "approve", decidedAtMs: expect.any(Number), credentialScopeAcknowledged: false });
   });
 
   it("cancels only a daemon-projected cancellable run with its catalog revision", async () => {
