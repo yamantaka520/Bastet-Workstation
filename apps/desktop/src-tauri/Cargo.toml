@@ -32,5 +32,6 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSWo
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSNotification", "NSOperation", "block2"] }
 
 [dev-dependencies]
+axum.workspace = true
 bastet-daemon = { path = "../../../crates/bastet-daemon" }
 tempfile.workspace = true

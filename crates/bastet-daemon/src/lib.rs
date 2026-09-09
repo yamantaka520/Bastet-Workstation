@@ -1,5 +1,6 @@
 //! Durable state primitives for the Bastet Workstation local daemon.
 
+mod provider_executor;
 pub mod sandbox;
 
 use std::collections::HashMap;
@@ -27,11 +28,12 @@ use bastet_protocol::{
     CheckpointReceipt, ClaimGraphNodesCommand, ClaimGraphNodesReceipt, CompleteGraphNodeCommand,
     CompleteGraphNodeReceipt, CompleteKnowledgeDeliveryCommand, CostReceipt, CreateApprovalCommand,
     CreateDocumentCommand, CreateGraphExecutionCommand, DaemonLifecycle, DaemonSnapshot,
-    DecideApprovalCommand, DocumentReceipt, EventEnvelope, FinishGraphNodeRunCommand,
-    FinishGraphNodeRunReceipt, GraphExecutionList, GraphExecutionReceipt, KnowledgeDeliveryReceipt,
-    M3CatalogSnapshot, PrepareKnowledgeDeliveryCommand, PrepareMvpCommand, PrepareMvpReceipt,
-    RecordCostCommand, ReplaceCatalogCommand, ReplaceM3CatalogCommand,
-    RestartMissingOutputGraphCommand, RetryFailedGraphNodeCommand, PROTOCOL_VERSION,
+    DecideApprovalCommand, DocumentReceipt, EventEnvelope, ExecuteReadyGraphCommand,
+    ExecuteReadyGraphReceipt, FinishGraphNodeRunCommand, FinishGraphNodeRunReceipt,
+    GraphExecutionList, GraphExecutionReceipt, KnowledgeDeliveryReceipt, M3CatalogSnapshot,
+    PrepareKnowledgeDeliveryCommand, PrepareMvpCommand, PrepareMvpReceipt, RecordCostCommand,
+    ReplaceCatalogCommand, ReplaceM3CatalogCommand, RestartMissingOutputGraphCommand,
+    RetryFailedGraphNodeCommand, PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
@@ -74,6 +76,8 @@ pub enum StoreError {
     InvalidRunState(String),
     #[error("provider run controller rejected cancellation")]
     RunControlRejected,
+    #[error("provider runs are still active")]
+    ProviderRunsActive,
     #[error("graph execution is invalid: {0}")]
     InvalidGraph(#[from] GraphError),
     #[error("M3 catalog is invalid: {0}")]
@@ -100,6 +104,18 @@ struct AppState {
     store: Store,
     shutdown: Option<watch::Sender<bool>>,
     run_controller: Arc<dyn RunController>,
+    provider_executor: Option<provider_executor::ProviderExecutor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderRunBinding {
+    agent_instance_id: bastet_core::AgentInstanceId,
+    project_id: bastet_core::ProjectId,
+    model_id: bastet_core::ModelId,
+    adapter_kind: String,
+    provider_model: String,
+    workspace_root: String,
+    prompt: String,
 }
 
 pub trait RunController: Send + Sync + 'static {
@@ -186,10 +202,34 @@ pub fn router_with_shutdown_and_run_controller(
     build_router_with_controller(store, Some(shutdown_signal), run_controller)
 }
 
+/// Production router: the daemon owns provider processes and their exact-run controllers.
+pub fn production_router_with_shutdown(
+    store: Store,
+    shutdown_signal: watch::Sender<bool>,
+) -> Router {
+    let registry = RunControllerRegistry::default();
+    let executor = provider_executor::ProviderExecutor::production(store.clone(), registry.clone());
+    build_router_with_execution(
+        store,
+        Some(shutdown_signal),
+        Arc::new(registry),
+        Some(executor),
+    )
+}
+
 fn build_router_with_controller(
     store: Store,
     shutdown_signal: Option<watch::Sender<bool>>,
     run_controller: Arc<dyn RunController>,
+) -> Router {
+    build_router_with_execution(store, shutdown_signal, run_controller, None)
+}
+
+fn build_router_with_execution(
+    store: Store,
+    shutdown_signal: Option<watch::Sender<bool>>,
+    run_controller: Arc<dyn RunController>,
+    provider_executor: Option<provider_executor::ProviderExecutor>,
 ) -> Router {
     Router::new()
         .route("/v1/health", get(health))
@@ -210,6 +250,10 @@ fn build_router_with_controller(
             post(retry_failed_graph_node),
         )
         .route("/v1/graphs/{execution_id}/runs", post(begin_graph_node_run))
+        .route(
+            "/v1/graphs/{execution_id}/execute-ready",
+            post(execute_ready_graph),
+        )
         .route(
             "/v1/graphs/{execution_id}/runs/finish",
             post(finish_graph_node_run),
@@ -248,6 +292,7 @@ fn build_router_with_controller(
             store,
             shutdown: shutdown_signal,
             run_controller,
+            provider_executor,
         })
 }
 
@@ -261,13 +306,115 @@ async fn cancel_run(
         return Err(StoreError::RunNotFound.into());
     }
     state
-        .run_controller
-        .cancel(path_id)
+        .store
+        .preflight_provider_cancel(path_id, command.expected_catalog_revision)?;
+    let controller = state.run_controller.clone();
+    tokio::task::spawn_blocking(move || controller.cancel(path_id))
+        .await
+        .map_err(|_| StoreError::RunControlRejected)?
         .map_err(|_| StoreError::RunControlRejected)?;
-    Ok(Json(state.store.record_provider_cancel_accepted(
-        path_id,
-        command.expected_catalog_revision,
-    )?))
+    Ok(Json(
+        state
+            .store
+            .record_provider_cancel_after_preflight(path_id)?,
+    ))
+}
+
+async fn execute_ready_graph(
+    State(state): State<AppState>,
+    AxumPath(execution_id): AxumPath<Uuid>,
+    Json(command): Json<ExecuteReadyGraphCommand>,
+) -> Result<Json<ExecuteReadyGraphReceipt>, ApiError> {
+    let lifecycle = state.store.snapshot()?.lifecycle;
+    if lifecycle != bastet_protocol::DaemonLifecycle::Ready {
+        return Err(StoreError::InvalidLifecycle {
+            expected: "ready",
+            actual: format!("{lifecycle:?}").to_lowercase(),
+        }
+        .into());
+    }
+    let execution_id = bastet_core::GraphRunId::from_bytes(*execution_id.as_bytes());
+    let executor = state
+        .provider_executor
+        .clone()
+        .ok_or(StoreError::RunControlRejected)?;
+    let catalog = state.store.catalog()?;
+    if catalog.revision != command.expected_catalog_revision {
+        return Err(StoreError::RevisionConflict {
+            expected: command.expected_catalog_revision,
+            actual: catalog.revision,
+        }
+        .into());
+    }
+    let execution = state.store.graph_execution(execution_id)?;
+    if execution.revision != command.expected_graph_revision {
+        return Err(StoreError::RevisionConflict {
+            expected: command.expected_graph_revision,
+            actual: execution.revision,
+        }
+        .into());
+    }
+    let mut readiness_probe = execution.clone();
+    let ready = readiness_probe
+        .claim_ready("daemon-provider-readiness", 2)
+        .map_err(StoreError::InvalidGraph)?;
+    if ready.is_empty() {
+        return Err(StoreError::InvalidGraph(bastet_core::GraphError::InvalidExecution).into());
+    }
+    let m3 = state.store.m3_catalog()?;
+    let bindings = ready
+        .iter()
+        .map(|node_id| {
+            resolve_provider_run_binding(&catalog.catalog, &m3.catalog, &execution, *node_id)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut receipts = Vec::new();
+    for (node_id, binding) in ready.into_iter().zip(bindings) {
+        let (catalog_revision, graph_revision) = if receipts.is_empty() {
+            (
+                command.expected_catalog_revision,
+                command.expected_graph_revision,
+            )
+        } else {
+            let previous: &BeginGraphNodeRunReceipt =
+                receipts.last().expect("non-empty receipts were checked");
+            (previous.catalog_revision, previous.graph_revision)
+        };
+        let receipt = match state.store.begin_provider_graph_node_run(
+            execution_id,
+            BeginGraphNodeRunCommand {
+                expected_catalog_revision: catalog_revision,
+                expected_graph_revision: graph_revision,
+                node_id,
+                owner: provider_executor::owner(node_id),
+            },
+            &binding,
+        ) {
+            Ok(receipt) => receipt,
+            Err(_error) if !receipts.is_empty() => break,
+            Err(error) => return Err(error.into()),
+        };
+        receipts.push(receipt);
+    }
+
+    let mut run_ids = Vec::with_capacity(receipts.len());
+    for receipt in receipts {
+        let run_id = receipt.run_id;
+        if executor.start(receipt.clone()).is_err() {
+            executor.persist_start_failure(&receipt);
+            continue;
+        }
+        run_ids.push(run_id);
+    }
+    if run_ids.is_empty() {
+        return Err(StoreError::RunControlRejected.into());
+    }
+    Ok(Json(ExecuteReadyGraphReceipt {
+        protocol_version: PROTOCOL_VERSION,
+        execution_id,
+        run_ids,
+    }))
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<DaemonSnapshot>, ApiError> {
@@ -497,6 +644,13 @@ async fn shutdown(
     State(state): State<AppState>,
     Json(command): Json<CheckpointCommand>,
 ) -> Result<Json<CheckpointReceipt>, ApiError> {
+    if state
+        .provider_executor
+        .as_ref()
+        .is_some_and(provider_executor::ProviderExecutor::has_active)
+    {
+        return Err(StoreError::ProviderRunsActive.into());
+    }
     let receipt = state.store.shutdown(command)?;
     if let Some(signal) = state.shutdown {
         let _ = signal.send(true);
@@ -533,7 +687,8 @@ impl axum::response::IntoResponse for ApiError {
             | StoreError::InvalidLifecycle { .. }
             | StoreError::ApprovalConflict
             | StoreError::GraphConflict
-            | StoreError::InvalidRunState(_) => StatusCode::CONFLICT,
+            | StoreError::InvalidRunState(_)
+            | StoreError::ProviderRunsActive => StatusCode::CONFLICT,
             StoreError::ApprovalNotFound | StoreError::RunNotFound | StoreError::GraphNotFound => {
                 StatusCode::NOT_FOUND
             }
@@ -1286,6 +1441,220 @@ impl Store {
     }
 
     /// Persists cancellation only after the daemon-owned provider controller accepted interrupt.
+    pub fn preflight_provider_cancel(
+        &self,
+        run_id: RunId,
+        expected_catalog_revision: u64,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection()?;
+        let (actual, catalog_json): (u64, String) = connection.query_row(
+            "SELECT revision, catalog_json FROM identity_catalog WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if actual != expected_catalog_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: expected_catalog_revision,
+                actual,
+            });
+        }
+        let catalog: IdentityCatalog = serde_json::from_str(&catalog_json)?;
+        let run = catalog
+            .runs
+            .iter()
+            .find(|run| run.metadata.id == run_id)
+            .ok_or(StoreError::RunNotFound)?;
+        if !matches!(
+            run.state,
+            bastet_core::NormalizedRunState::Running | bastet_core::NormalizedRunState::Recovering
+        ) {
+            return Err(StoreError::InvalidRunState(
+                format!("{:?}", run.state).to_lowercase(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Records the first provider-reported running state without regressing a
+    /// concurrently accepted cancellation or any terminal state.
+    pub fn record_provider_running(
+        &self,
+        run_id: RunId,
+        provider_session_id: Option<&str>,
+    ) -> Result<u64, StoreError> {
+        if provider_session_id.is_some_and(|id| id.trim().is_empty()) {
+            return Err(StoreError::InvalidRunState(
+                "empty provider session id".into(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (actual, catalog_json): (u64, String) = transaction.query_row(
+            "SELECT revision, catalog_json FROM identity_catalog WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let current_attempt: Option<String> = transaction
+            .query_row(
+                "SELECT latest.run_id FROM graph_node_runs latest
+                 WHERE latest.run_id=?1
+                   AND latest.attempt=(SELECT MAX(candidate.attempt) FROM graph_node_runs candidate
+                                       WHERE candidate.execution_id=latest.execution_id
+                                         AND candidate.node_id=latest.node_id)",
+                [run_id.value().to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_attempt.as_deref() != Some(run_id.value().to_string().as_str()) {
+            return Err(StoreError::InvalidRunState(
+                "run is not the current graph node attempt".into(),
+            ));
+        }
+        let mut catalog: IdentityCatalog = serde_json::from_str(&catalog_json)?;
+        let run_index = catalog
+            .runs
+            .iter()
+            .position(|run| run.metadata.id == run_id)
+            .ok_or(StoreError::RunNotFound)?;
+        if !matches!(
+            catalog.runs[run_index].state,
+            bastet_core::NormalizedRunState::Starting
+                | bastet_core::NormalizedRunState::Running
+                | bastet_core::NormalizedRunState::Cancelling
+        ) {
+            return Err(StoreError::InvalidRunState(
+                format!("{:?}", catalog.runs[run_index].state).to_lowercase(),
+            ));
+        }
+        let session_id = catalog.runs[run_index].session_id;
+        let session_index = catalog
+            .sessions
+            .iter()
+            .position(|session| session.metadata.id == session_id)
+            .ok_or(StoreError::RunNotFound)?;
+        let mut changed = false;
+        let now = timestamp();
+        if catalog.runs[run_index].state == bastet_core::NormalizedRunState::Starting {
+            catalog.runs[run_index].state = bastet_core::NormalizedRunState::Running;
+            catalog.runs[run_index].metadata.revision = catalog.runs[run_index]
+                .metadata
+                .revision
+                .checked_add(1)
+                .ok_or(StoreError::RevisionOverflow)?;
+            catalog.runs[run_index].metadata.updated_at = now.clone();
+            changed = true;
+        }
+        if let Some(provider_session_id) = provider_session_id {
+            if catalog.sessions[session_index]
+                .provider_session_id
+                .as_deref()
+                != Some(provider_session_id)
+            {
+                catalog.sessions[session_index].provider_session_id =
+                    Some(provider_session_id.to_owned());
+                catalog.sessions[session_index].metadata.revision = catalog.sessions[session_index]
+                    .metadata
+                    .revision
+                    .checked_add(1)
+                    .ok_or(StoreError::RevisionOverflow)?;
+                catalog.sessions[session_index].metadata.updated_at = now;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(actual);
+        }
+        catalog.validate()?;
+        let revision = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
+        transaction.execute(
+            "UPDATE identity_catalog SET revision=?1,catalog_json=?2,updated_at=?3 WHERE singleton=1",
+            params![revision, serde_json::to_string(&catalog)?, timestamp()],
+        )?;
+        insert_event(
+            &transaction,
+            "run.provider_running",
+            &serde_json::json!({"run_id": run_id}).to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(revision)
+    }
+
+    /// Finalizes an interrupt which was preflighted against the caller's
+    /// revision and then accepted by the exact provider controller. It reads
+    /// fresh state so unrelated worker completions cannot turn an accepted
+    /// interrupt into a false conflict, and it never regresses a terminal run.
+    pub fn record_provider_cancel_after_preflight(
+        &self,
+        run_id: RunId,
+    ) -> Result<CancelRunReceipt, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (actual, catalog_json): (u64, String) = transaction.query_row(
+            "SELECT revision, catalog_json FROM identity_catalog WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut catalog: IdentityCatalog = serde_json::from_str(&catalog_json)?;
+        let run = catalog
+            .runs
+            .iter_mut()
+            .find(|run| run.metadata.id == run_id)
+            .ok_or(StoreError::RunNotFound)?;
+        let terminal_won = matches!(
+            run.state,
+            bastet_core::NormalizedRunState::Cancelled
+                | bastet_core::NormalizedRunState::Failed
+                | bastet_core::NormalizedRunState::Succeeded
+                | bastet_core::NormalizedRunState::Blocked
+                | bastet_core::NormalizedRunState::Uncertain
+        );
+        let revision = if terminal_won {
+            actual
+        } else if matches!(
+            run.state,
+            bastet_core::NormalizedRunState::Starting
+                | bastet_core::NormalizedRunState::Running
+                | bastet_core::NormalizedRunState::Recovering
+                | bastet_core::NormalizedRunState::Cancelling
+        ) {
+            run.state = bastet_core::NormalizedRunState::Cancelling;
+            run.metadata.revision = run
+                .metadata
+                .revision
+                .checked_add(1)
+                .ok_or(StoreError::RevisionOverflow)?;
+            run.metadata.updated_at = timestamp();
+            catalog.validate()?;
+            let revision = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
+            transaction.execute(
+                "UPDATE identity_catalog SET revision=?1,catalog_json=?2,updated_at=?3 WHERE singleton=1",
+                params![revision, serde_json::to_string(&catalog)?, timestamp()],
+            )?;
+            revision
+        } else {
+            return Err(StoreError::InvalidRunState(
+                format!("{:?}", run.state).to_lowercase(),
+            ));
+        };
+        let event = insert_event(
+            &transaction,
+            if terminal_won {
+                "run.cancel_accepted_terminal_won"
+            } else {
+                "run.cancel_accepted"
+            },
+            &serde_json::json!({"run_id": run_id}).to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(CancelRunReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            run_id,
+            catalog_revision: revision,
+            event_sequence: event.sequence,
+        })
+    }
+
+    /// Persists cancellation only after the daemon-owned provider controller accepted interrupt.
     pub fn record_provider_cancel_accepted(
         &self,
         run_id: RunId,
@@ -1574,8 +1943,39 @@ impl Store {
         id: GraphRunId,
         command: BeginGraphNodeRunCommand,
     ) -> Result<BeginGraphNodeRunReceipt, StoreError> {
+        self.begin_graph_node_run_inner(id, command, None)
+    }
+
+    fn begin_provider_graph_node_run(
+        &self,
+        id: GraphRunId,
+        command: BeginGraphNodeRunCommand,
+        expected_binding: &ProviderRunBinding,
+    ) -> Result<BeginGraphNodeRunReceipt, StoreError> {
+        self.begin_graph_node_run_inner(id, command, Some(expected_binding))
+    }
+
+    fn begin_graph_node_run_inner(
+        &self,
+        id: GraphRunId,
+        command: BeginGraphNodeRunCommand,
+        expected_binding: Option<&ProviderRunBinding>,
+    ) -> Result<BeginGraphNodeRunReceipt, StoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if expected_binding.is_some() {
+            let lifecycle: String = transaction.query_row(
+                "SELECT lifecycle FROM daemon_state WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?;
+            if lifecycle != "ready" {
+                return Err(StoreError::InvalidLifecycle {
+                    expected: "ready",
+                    actual: lifecycle,
+                });
+            }
+        }
         let (catalog_revision, identity_json): (u64, String) = transaction.query_row(
             "SELECT revision, catalog_json FROM identity_catalog WHERE singleton=1",
             [],
@@ -1610,62 +2010,12 @@ impl Store {
         let mut execution: GraphExecution = serde_json::from_str(&graph_json)?;
         execution.validate()?;
         validate_graph_output_ledger(&transaction, &execution)?;
-        let definition = execution
-            .graph
-            .nodes
-            .iter()
-            .find(|node| node.id == command.node_id)
-            .ok_or(GraphError::InvalidExecution)?
-            .clone();
-        let baseline = m3
-            .meetings
-            .decision_baselines
-            .iter()
-            .find(|baseline| baseline.metadata.id == execution.graph.decision_baseline_id)
-            .ok_or_else(|| StoreError::InvalidMvp("graph DecisionBaseline not found".into()))?;
-        let meeting = m3
-            .meetings
-            .meetings
-            .iter()
-            .find(|meeting| meeting.metadata.id == baseline.meeting_id)
-            .ok_or_else(|| StoreError::InvalidMvp("DecisionBaseline meeting not found".into()))?;
-        let assignment = m3
-            .office
-            .pet_assignments
-            .iter()
-            .find(|assignment| {
-                assignment.project_id == meeting.project_id
-                    && assignment.role_id == definition.role_id
-            })
-            .ok_or_else(|| StoreError::InvalidMvp("role-bound Pet assignment not found".into()))?;
-        let agent = identity
-            .agent_instances
-            .iter()
-            .find(|agent| agent.metadata.id == assignment.agent_instance_id)
-            .ok_or_else(|| StoreError::InvalidMvp("assigned agent not found".into()))?;
-        let provider = identity
-            .agent_providers
-            .iter()
-            .find(|provider| provider.metadata.id == agent.agent_provider_id)
-            .ok_or_else(|| StoreError::InvalidMvp("agent provider not found".into()))?;
-        let model_id = agent
-            .default_model_id
-            .ok_or_else(|| StoreError::InvalidMvp("default model not configured".into()))?;
-        let model = identity
-            .models
-            .iter()
-            .find(|model| model.metadata.id == model_id)
-            .ok_or_else(|| StoreError::InvalidMvp("default model not found".into()))?;
-        let workspace_root = identity
-            .projects
-            .iter()
-            .find(|project| project.metadata.id == meeting.project_id)
-            .ok_or_else(|| StoreError::InvalidMvp("project not found".into()))?
-            .workspace_root
-            .clone();
-        let adapter_kind = provider.adapter_kind.clone();
-        let provider_model = model.provider_model_id.clone();
-        let prompt = graph_node_prompt(&execution, &definition, &baseline.content)?;
+        let binding = resolve_provider_run_binding(&identity, &m3, &execution, command.node_id)?;
+        if expected_binding.is_some_and(|expected| expected != &binding) {
+            return Err(StoreError::InvalidRunState(
+                "provider launch inputs changed".into(),
+            ));
+        }
         execution.claim_node(command.node_id, &command.owner)?;
         let session_id = bastet_core::SessionId::new();
         let run_id = RunId::new();
@@ -1678,14 +2028,14 @@ impl Store {
         )?;
         identity.sessions.push(bastet_core::Session {
             metadata: entity_metadata(session_id, "graph_node_run"),
-            agent_instance_id: agent.metadata.id,
-            project_id: meeting.project_id,
+            agent_instance_id: binding.agent_instance_id,
+            project_id: binding.project_id,
             provider_session_id: None,
         });
         identity.runs.push(bastet_core::Run {
             metadata: entity_metadata(run_id, "graph_node_run"),
             session_id,
-            model_id,
+            model_id: binding.model_id,
             state: bastet_core::NormalizedRunState::Starting,
             started_at: Some(timestamp()),
             finished_at: None,
@@ -1722,10 +2072,10 @@ impl Store {
             node_id: command.node_id,
             session_id,
             run_id,
-            adapter_kind,
-            model: provider_model,
-            workspace_root,
-            prompt,
+            adapter_kind: binding.adapter_kind,
+            model: binding.provider_model,
+            workspace_root: binding.workspace_root,
+            prompt: binding.prompt,
             catalog_revision: next_catalog_revision,
             graph_revision: execution.revision,
             event_sequence: event.sequence,
@@ -1813,7 +2163,9 @@ impl Store {
             .ok_or(StoreError::RunNotFound)?;
         if !matches!(
             identity.runs[run_index].state,
-            bastet_core::NormalizedRunState::Starting | bastet_core::NormalizedRunState::Running
+            bastet_core::NormalizedRunState::Starting
+                | bastet_core::NormalizedRunState::Running
+                | bastet_core::NormalizedRunState::Cancelling
         ) {
             return Err(StoreError::InvalidRunState(
                 format!("{:?}", identity.runs[run_index].state).to_lowercase(),
@@ -2296,6 +2648,25 @@ impl Store {
                 });
             }
         }
+        if final_lifecycle == DaemonLifecycle::Stopping {
+            let catalog_json: String = transaction.query_row(
+                "SELECT catalog_json FROM identity_catalog WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?;
+            let catalog: IdentityCatalog = serde_json::from_str(&catalog_json)?;
+            if catalog.runs.iter().any(|run| {
+                matches!(
+                    run.state,
+                    bastet_core::NormalizedRunState::Running
+                        | bastet_core::NormalizedRunState::Cancelling
+                        | bastet_core::NormalizedRunState::Recovering
+                ) || (run.state == bastet_core::NormalizedRunState::Starting
+                    && run.started_at.is_some())
+            }) {
+                return Err(StoreError::ProviderRunsActive);
+            }
+        }
         let revision = actual + 1;
         transaction.execute(
             "UPDATE daemon_state SET revision = ?1, lifecycle = 'checkpointing' WHERE singleton = 1",
@@ -2672,6 +3043,73 @@ fn m3_is_unconfigured(catalog: &M3Catalog) -> bool {
         && catalog.deliverables == bastet_core::DeliverableCatalog::default()
 }
 
+fn resolve_provider_run_binding(
+    identity: &IdentityCatalog,
+    m3: &M3Catalog,
+    execution: &GraphExecution,
+    node_id: GraphNodeId,
+) -> Result<ProviderRunBinding, StoreError> {
+    let definition = execution
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.id == node_id)
+        .ok_or(GraphError::InvalidExecution)?;
+    let baseline = m3
+        .meetings
+        .decision_baselines
+        .iter()
+        .find(|baseline| baseline.metadata.id == execution.graph.decision_baseline_id)
+        .ok_or_else(|| StoreError::InvalidMvp("graph DecisionBaseline not found".into()))?;
+    let meeting = m3
+        .meetings
+        .meetings
+        .iter()
+        .find(|meeting| meeting.metadata.id == baseline.meeting_id)
+        .ok_or_else(|| StoreError::InvalidMvp("DecisionBaseline meeting not found".into()))?;
+    let assignment = m3
+        .office
+        .pet_assignments
+        .iter()
+        .find(|assignment| {
+            assignment.project_id == meeting.project_id && assignment.role_id == definition.role_id
+        })
+        .ok_or_else(|| StoreError::InvalidMvp("role-bound Pet assignment not found".into()))?;
+    let agent = identity
+        .agent_instances
+        .iter()
+        .find(|agent| agent.metadata.id == assignment.agent_instance_id)
+        .ok_or_else(|| StoreError::InvalidMvp("assigned agent not found".into()))?;
+    let provider = identity
+        .agent_providers
+        .iter()
+        .find(|provider| provider.metadata.id == agent.agent_provider_id)
+        .ok_or_else(|| StoreError::InvalidMvp("agent provider not found".into()))?;
+    let model_id = agent
+        .default_model_id
+        .ok_or_else(|| StoreError::InvalidMvp("default model not configured".into()))?;
+    let model = identity
+        .models
+        .iter()
+        .find(|model| model.metadata.id == model_id)
+        .ok_or_else(|| StoreError::InvalidMvp("default model not found".into()))?;
+    let project = identity
+        .projects
+        .iter()
+        .find(|project| project.metadata.id == meeting.project_id)
+        .ok_or_else(|| StoreError::InvalidMvp("project not found".into()))?;
+
+    Ok(ProviderRunBinding {
+        agent_instance_id: agent.metadata.id,
+        project_id: meeting.project_id,
+        model_id,
+        adapter_kind: provider.adapter_kind.clone(),
+        provider_model: model.provider_model_id.clone(),
+        workspace_root: project.workspace_root.clone(),
+        prompt: graph_node_prompt(execution, definition, &baseline.content)?,
+    })
+}
+
 fn graph_node_prompt(
     execution: &GraphExecution,
     definition: &bastet_core::GraphNode,
@@ -2811,6 +3249,9 @@ fn reconcile_catalog_for_recovery(
     for run in &mut catalog.runs {
         if matches!(
             run.state,
+            bastet_core::NormalizedRunState::Starting if run.started_at.is_some()
+        ) || matches!(
+            run.state,
             bastet_core::NormalizedRunState::Running
                 | bastet_core::NormalizedRunState::Cancelling
                 | bastet_core::NormalizedRunState::Recovering
@@ -2931,19 +3372,195 @@ mod tests {
     use bastet_core::{
         Account, AccountId, AgentInstance, AgentInstanceId, AgentProvider, AgentProviderId,
         ApprovalAction, ApprovalDecision, ApprovalDecisionKind, ApprovalRequest, ApprovalRequestId,
-        ApprovalRisk, ApprovalScope, CredentialBackend, CredentialReference, CredentialReferenceId,
-        EntityLifecycle, EntityMetadata, Model, ModelId, ModelProvider, ModelProviderId,
-        PermissionLevel, PolicyCeiling, PolicyLayer, Project, ProjectId, Provenance, Role, RoleId,
-        Run, RunId, ScopedPolicy, Session, SessionId,
+        ApprovalRisk, ApprovalScope, CostEvidence, CredentialBackend, CredentialReference,
+        CredentialReferenceId, EntityLifecycle, EntityMetadata, Model, ModelId, ModelProvider,
+        ModelProviderId, PermissionLevel, PolicyCeiling, PolicyLayer, Project, ProjectId,
+        Provenance, Role, RoleId, Run, RunId, ScopedPolicy, Session, SessionId,
     };
     use tempfile::tempdir;
     use tower::ServiceExt;
+
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     struct AcceptingRunController;
 
     impl RunController for AcceptingRunController {
         fn cancel(&self, _run_id: RunId) -> Result<(), RunControlError> {
             Ok(())
+        }
+    }
+
+    struct FixtureProviderRunner {
+        cancel_codex: Option<bool>,
+        delay: Duration,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        started: Mutex<Vec<(RunId, String)>>,
+    }
+
+    impl FixtureProviderRunner {
+        fn new(cancel_codex: Option<bool>, delay: Duration) -> Self {
+            Self {
+                cancel_codex,
+                delay,
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                started: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn started(&self) -> Vec<(RunId, String)> {
+            self.started.lock().unwrap().clone()
+        }
+    }
+
+    impl provider_executor::ProviderRunner for FixtureProviderRunner {
+        fn run(
+            &self,
+            receipt: &BeginGraphNodeRunReceipt,
+            control: std::sync::mpsc::Receiver<provider_executor::CancelRequest>,
+        ) -> provider_executor::ProviderOutcome {
+            let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_active.fetch_max(active, Ordering::AcqRel);
+            self.started
+                .lock()
+                .unwrap()
+                .push((receipt.run_id, receipt.adapter_kind.clone()));
+
+            let (terminal_state, failure, output_markdown) = if receipt.adapter_kind == "codex_cli"
+            {
+                if let Some(accepted) = self.cancel_codex {
+                    let request = control.recv_timeout(Duration::from_secs(2)).unwrap();
+                    assert_eq!(request.run_id(), receipt.run_id);
+                    request.acknowledge(accepted);
+                    if accepted {
+                        (
+                            bastet_core::NormalizedRunState::Cancelled,
+                            Some(AdapterFailure {
+                                kind: AdapterFailureKind::Cancelled,
+                                message_key: "adapter.failure.cancelled".into(),
+                                retryable: false,
+                                provider_code: None,
+                                redacted_detail: None,
+                            }),
+                            Some("partial provider output".into()),
+                        )
+                    } else {
+                        (
+                            bastet_core::NormalizedRunState::Failed,
+                            Some(AdapterFailure {
+                                kind: AdapterFailureKind::Unknown,
+                                message_key: "adapter.failure.unknown".into(),
+                                retryable: false,
+                                provider_code: None,
+                                redacted_detail: None,
+                            }),
+                            None,
+                        )
+                    }
+                } else {
+                    std::thread::sleep(self.delay);
+                    (
+                        bastet_core::NormalizedRunState::Succeeded,
+                        None,
+                        Some(format!("# {} fixture output", receipt.adapter_kind)),
+                    )
+                }
+            } else {
+                std::thread::sleep(self.delay);
+                (
+                    bastet_core::NormalizedRunState::Succeeded,
+                    None,
+                    Some(format!("# {} fixture output", receipt.adapter_kind)),
+                )
+            };
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            provider_executor::ProviderOutcome {
+                terminal_state,
+                provider_session_id: Some(format!("session-{}", receipt.adapter_kind)),
+                cost: CostEvidence {
+                    evidence_class: bastet_core::EvidenceClass::Unknown,
+                    currency: None,
+                    amount: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    confidence: 0.0,
+                },
+                output_markdown,
+                failure,
+            }
+        }
+    }
+
+    struct PanicProviderRunner;
+
+    impl provider_executor::ProviderRunner for PanicProviderRunner {
+        fn run(
+            &self,
+            _receipt: &BeginGraphNodeRunReceipt,
+            _control: std::sync::mpsc::Receiver<provider_executor::CancelRequest>,
+        ) -> provider_executor::ProviderOutcome {
+            panic!("fixture provider crash")
+        }
+    }
+
+    fn provider_execution_fixture() -> (tempfile::TempDir, tempfile::TempDir, Store, GraphRunId) {
+        let directory = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = Store::open(directory.path().join("provider-execution.db")).unwrap();
+        store.mark_ready().unwrap();
+        let prepared = store
+            .prepare_mvp(PrepareMvpCommand {
+                expected_catalog_revision: 0,
+                expected_m3_revision: 0,
+                project_name: "Provider execution fixture".into(),
+                workspace_root: workspace.path().to_string_lossy().into_owned(),
+                codex_model: "gpt-test".into(),
+                agy_model: "agy-test".into(),
+            })
+            .unwrap();
+        let accepted = store
+            .accept_mvp_decision(AcceptDecisionBaselineCommand {
+                expected_m3_revision: prepared.m3_revision,
+                meeting_id: prepared.meeting_id,
+                content: "Research independently and join the final evidence.".into(),
+                accepted_by: "test-user".into(),
+                accepted_at: "2026-09-09T00:00:00Z".into(),
+            })
+            .unwrap();
+        (directory, workspace, store, accepted.graph_execution_id)
+    }
+
+    fn provider_router(
+        store: Store,
+        runner: Arc<FixtureProviderRunner>,
+    ) -> (
+        Router,
+        RunControllerRegistry,
+        provider_executor::ProviderExecutor,
+    ) {
+        let registry = RunControllerRegistry::default();
+        let executor = provider_executor::ProviderExecutor::with_runner(
+            store.clone(),
+            registry.clone(),
+            runner,
+        );
+        let router = build_router_with_execution(
+            store,
+            None,
+            Arc::new(registry.clone()),
+            Some(executor.clone()),
+        );
+        (router, registry, executor)
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !condition() {
+            assert!(Instant::now() < deadline, "condition did not become true");
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -2962,6 +3579,533 @@ mod tests {
         assert!(registry.cancel(unknown).is_err());
         assert!(registry.unregister(owned).unwrap());
         assert!(registry.cancel(owned).is_err());
+    }
+
+    #[tokio::test]
+    async fn daemon_owned_workers_start_both_adapters_finish_concurrently_and_block_shutdown() {
+        let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
+        let runner = Arc::new(FixtureProviderRunner::new(None, Duration::from_millis(250)));
+        let (router, registry, executor) = provider_router(store.clone(), runner.clone());
+        let catalog_revision = store.catalog().unwrap().revision;
+        let graph_revision = store.graph_execution(execution_id).unwrap().revision;
+        let started_at = Instant::now();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post(format!("/v1/graphs/{}/execute-ready", execution_id.value()))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&ExecuteReadyGraphCommand {
+                            expected_catalog_revision: catalog_revision,
+                            expected_graph_revision: graph_revision,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(started_at.elapsed() < Duration::from_millis(250));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let receipt: ExecuteReadyGraphReceipt = serde_json::from_slice(&body).unwrap();
+        assert_eq!(receipt.run_ids.len(), 2);
+        assert!(executor.has_active());
+
+        let snapshot = store.snapshot().unwrap();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/v1/shutdown")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&CheckpointCommand {
+                            expected_revision: snapshot.revision,
+                            reason: "test shutdown".into(),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(store.snapshot().unwrap().lifecycle, DaemonLifecycle::Ready);
+
+        wait_until(|| !executor.has_active());
+        let graph = store.graph_execution(execution_id).unwrap();
+        assert!(graph
+            .nodes
+            .iter()
+            .take(2)
+            .all(|node| node.state == bastet_core::GraphNodeState::Succeeded));
+        let adapters = runner
+            .started()
+            .into_iter()
+            .map(|(_, adapter)| adapter)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            adapters,
+            HashSet::from(["codex_cli".into(), "agy_cli".into()])
+        );
+        assert!(runner.max_active.load(Ordering::Acquire) >= 2);
+        for run_id in receipt.run_ids {
+            assert!(registry.cancel(run_id).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_provider_cancel_survives_immediate_terminal_race() {
+        let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
+        let runner = Arc::new(FixtureProviderRunner::new(
+            Some(true),
+            Duration::from_millis(100),
+        ));
+        let (router, registry, executor) = provider_router(store.clone(), runner.clone());
+        let command = ExecuteReadyGraphCommand {
+            expected_catalog_revision: store.catalog().unwrap().revision,
+            expected_graph_revision: store.graph_execution(execution_id).unwrap().revision,
+        };
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post(format!("/v1/graphs/{}/execute-ready", execution_id.value()))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&command).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        wait_until(|| runner.started().len() == 2);
+        let codex_run = runner
+            .started()
+            .into_iter()
+            .find(|(_, adapter)| adapter == "codex_cli")
+            .unwrap()
+            .0;
+        store
+            .record_provider_running(codex_run, Some("fixture-codex-session"))
+            .unwrap();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post(format!("/v1/runs/{}/cancel", codex_run.value()))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&bastet_protocol::CancelRunCommand {
+                            run_id: codex_run,
+                            expected_catalog_revision: store.catalog().unwrap().revision,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        wait_until(|| !executor.has_active());
+        let catalog = store.catalog().unwrap().catalog;
+        assert_eq!(
+            catalog
+                .runs
+                .iter()
+                .find(|run| run.metadata.id == codex_run)
+                .unwrap()
+                .state,
+            bastet_core::NormalizedRunState::Cancelled
+        );
+        let graph = store.graph_execution(execution_id).unwrap();
+        let cancelled_node = graph
+            .nodes
+            .iter()
+            .find(|node| node.run_id == Some(codex_run))
+            .unwrap();
+        assert_eq!(cancelled_node.state, bastet_core::GraphNodeState::Cancelled);
+        assert!(graph
+            .outputs
+            .iter()
+            .all(|output| output.run_id != codex_run));
+        assert!(registry.cancel(codex_run).is_err());
+        assert!(store.events_after(0).unwrap().iter().any(|event| {
+            event.event_type == "run.cancel_accepted"
+                || event.event_type == "run.cancel_accepted_terminal_won"
+        }));
+    }
+
+    #[tokio::test]
+    async fn provider_panics_are_persisted_as_uncertain_without_orphaned_runs() {
+        let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
+        let registry = RunControllerRegistry::default();
+        let executor = provider_executor::ProviderExecutor::with_runner(
+            store.clone(),
+            registry.clone(),
+            Arc::new(PanicProviderRunner),
+        );
+        let router = build_router_with_execution(
+            store.clone(),
+            None,
+            Arc::new(registry.clone()),
+            Some(executor.clone()),
+        );
+        let response = router
+            .oneshot(
+                Request::post(format!("/v1/graphs/{}/execute-ready", execution_id.value()))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&ExecuteReadyGraphCommand {
+                            expected_catalog_revision: store.catalog().unwrap().revision,
+                            expected_graph_revision: store
+                                .graph_execution(execution_id)
+                                .unwrap()
+                                .revision,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        wait_until(|| !executor.has_active());
+        let graph = store.graph_execution(execution_id).unwrap();
+        assert!(graph
+            .nodes
+            .iter()
+            .take(2)
+            .all(|node| node.state == bastet_core::GraphNodeState::Uncertain));
+        let catalog = store.catalog().unwrap().catalog;
+        assert!(catalog
+            .runs
+            .iter()
+            .all(|run| run.state == bastet_core::NormalizedRunState::Uncertain));
+        for run in catalog.runs {
+            assert!(registry.cancel(run.metadata.id).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_provider_cancel_is_not_persisted_as_cancelling() {
+        let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
+        let runner = Arc::new(FixtureProviderRunner::new(
+            Some(false),
+            Duration::from_millis(100),
+        ));
+        let (router, _registry, executor) = provider_router(store.clone(), runner.clone());
+        let command = ExecuteReadyGraphCommand {
+            expected_catalog_revision: store.catalog().unwrap().revision,
+            expected_graph_revision: store.graph_execution(execution_id).unwrap().revision,
+        };
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post(format!("/v1/graphs/{}/execute-ready", execution_id.value()))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&command).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        wait_until(|| runner.started().len() == 2);
+        let codex_run = runner
+            .started()
+            .into_iter()
+            .find(|(_, adapter)| adapter == "codex_cli")
+            .unwrap()
+            .0;
+        store
+            .record_provider_running(codex_run, Some("fixture-codex-session"))
+            .unwrap();
+        let response = router
+            .oneshot(
+                Request::post(format!("/v1/runs/{}/cancel", codex_run.value()))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&bastet_protocol::CancelRunCommand {
+                            run_id: codex_run,
+                            expected_catalog_revision: store.catalog().unwrap().revision,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        wait_until(|| !executor.has_active());
+        let catalog = store.catalog().unwrap().catalog;
+        assert_ne!(
+            catalog
+                .runs
+                .iter()
+                .find(|run| run.metadata.id == codex_run)
+                .unwrap()
+                .state,
+            bastet_core::NormalizedRunState::Cancelling
+        );
+        assert!(!store
+            .events_after(0)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type.starts_with("run.cancel_accepted")));
+    }
+
+    #[test]
+    fn provider_running_projection_is_exact_run_idempotent_and_non_regressing() {
+        let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
+        let graph = store.graph_execution(execution_id).unwrap();
+        let receipt = store
+            .begin_graph_node_run(
+                execution_id,
+                BeginGraphNodeRunCommand {
+                    expected_catalog_revision: store.catalog().unwrap().revision,
+                    expected_graph_revision: graph.revision,
+                    node_id: graph.nodes[0].node_id,
+                    owner: provider_executor::owner(graph.nodes[0].node_id),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            store.preflight_provider_cancel(
+                receipt.run_id,
+                store.catalog().unwrap().revision
+            ),
+            Err(StoreError::InvalidRunState(state)) if state == "starting"
+        ));
+        let revision = store
+            .record_provider_running(receipt.run_id, Some("provider-session"))
+            .unwrap();
+        assert_eq!(
+            store
+                .catalog()
+                .unwrap()
+                .catalog
+                .runs
+                .iter()
+                .find(|run| run.metadata.id == receipt.run_id)
+                .unwrap()
+                .state,
+            bastet_core::NormalizedRunState::Running
+        );
+        assert_eq!(
+            store
+                .catalog()
+                .unwrap()
+                .catalog
+                .sessions
+                .iter()
+                .find(|session| session.metadata.id == receipt.session_id)
+                .unwrap()
+                .provider_session_id
+                .as_deref(),
+            Some("provider-session")
+        );
+        assert_eq!(
+            store
+                .record_provider_running(receipt.run_id, Some("provider-session"))
+                .unwrap(),
+            revision
+        );
+        let cancel_revision = store.catalog().unwrap().revision;
+        store
+            .record_provider_cancel_accepted(receipt.run_id, cancel_revision)
+            .unwrap();
+        store
+            .record_provider_running(receipt.run_id, Some("provider-session"))
+            .unwrap();
+        assert_eq!(
+            store
+                .catalog()
+                .unwrap()
+                .catalog
+                .runs
+                .iter()
+                .find(|run| run.metadata.id == receipt.run_id)
+                .unwrap()
+                .state,
+            bastet_core::NormalizedRunState::Cancelling
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_execute_request_starts_no_provider_worker() {
+        let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
+        let runner = Arc::new(FixtureProviderRunner::new(None, Duration::from_millis(1)));
+        let (router, _registry, _executor) = provider_router(store.clone(), runner.clone());
+        let response = router
+            .oneshot(
+                Request::post(format!("/v1/graphs/{}/execute-ready", execution_id.value()))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&ExecuteReadyGraphCommand {
+                            expected_catalog_revision: store.catalog().unwrap().revision + 1,
+                            expected_graph_revision: store
+                                .graph_execution(execution_id)
+                                .unwrap()
+                                .revision,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(runner.started().is_empty());
+        assert!(store.catalog().unwrap().catalog.runs.is_empty());
+    }
+
+    #[test]
+    fn provider_begin_rejects_launch_inputs_changed_after_selection() {
+        let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
+        let catalog = store.catalog().unwrap();
+        let m3 = store.m3_catalog().unwrap();
+        let graph = store.graph_execution(execution_id).unwrap();
+        let node_id = graph.nodes[0].node_id;
+        let binding =
+            resolve_provider_run_binding(&catalog.catalog, &m3.catalog, &graph, node_id).unwrap();
+        let mut changed = catalog.catalog;
+        changed
+            .models
+            .iter_mut()
+            .find(|model| model.metadata.id == binding.model_id)
+            .unwrap()
+            .provider_model_id = "concurrently-changed-model".into();
+        store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: catalog.revision,
+                catalog: changed,
+            })
+            .unwrap();
+
+        assert!(matches!(
+            store.begin_provider_graph_node_run(
+                execution_id,
+                BeginGraphNodeRunCommand {
+                    expected_catalog_revision: store.catalog().unwrap().revision,
+                    expected_graph_revision: graph.revision,
+                    node_id,
+                    owner: provider_executor::owner(node_id),
+                },
+                &binding,
+            ),
+            Err(StoreError::InvalidRunState(state)) if state == "provider launch inputs changed"
+        ));
+        assert!(store.catalog().unwrap().catalog.runs.is_empty());
+        assert_eq!(store.graph_execution(execution_id).unwrap(), graph);
+    }
+
+    #[test]
+    fn provider_begin_and_shutdown_are_serialized_by_daemon_lifecycle() {
+        let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
+        let catalog = store.catalog().unwrap();
+        let m3 = store.m3_catalog().unwrap();
+        let graph = store.graph_execution(execution_id).unwrap();
+        let node_id = graph.nodes[0].node_id;
+        let binding =
+            resolve_provider_run_binding(&catalog.catalog, &m3.catalog, &graph, node_id).unwrap();
+        store
+            .shutdown(CheckpointCommand {
+                expected_revision: store.snapshot().unwrap().revision,
+                reason: "test serialized shutdown".into(),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            store.begin_provider_graph_node_run(
+                execution_id,
+                BeginGraphNodeRunCommand {
+                    expected_catalog_revision: catalog.revision,
+                    expected_graph_revision: graph.revision,
+                    node_id,
+                    owner: provider_executor::owner(node_id),
+                },
+                &binding,
+            ),
+            Err(StoreError::InvalidLifecycle { actual, .. }) if actual == "stopping"
+        ));
+        assert!(store.catalog().unwrap().catalog.runs.is_empty());
+    }
+
+    #[test]
+    fn shutdown_rejects_a_durable_starting_provider_run_atomically() {
+        let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
+        let graph = store.graph_execution(execution_id).unwrap();
+        store
+            .begin_graph_node_run(
+                execution_id,
+                BeginGraphNodeRunCommand {
+                    expected_catalog_revision: store.catalog().unwrap().revision,
+                    expected_graph_revision: graph.revision,
+                    node_id: graph.nodes[0].node_id,
+                    owner: provider_executor::owner(graph.nodes[0].node_id),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.shutdown(CheckpointCommand {
+                expected_revision: store.snapshot().unwrap().revision,
+                reason: "must not orphan starting provider".into(),
+            }),
+            Err(StoreError::ProviderRunsActive)
+        ));
+        assert_eq!(store.snapshot().unwrap().lifecycle, DaemonLifecycle::Ready);
+    }
+
+    #[test]
+    fn reopening_reconciles_starting_provider_run_and_graph_node_to_uncertain() {
+        let (directory, _workspace, store, execution_id) = provider_execution_fixture();
+        let graph = store.graph_execution(execution_id).unwrap();
+        let receipt = store
+            .begin_graph_node_run(
+                execution_id,
+                BeginGraphNodeRunCommand {
+                    expected_catalog_revision: store.catalog().unwrap().revision,
+                    expected_graph_revision: graph.revision,
+                    node_id: graph.nodes[0].node_id,
+                    owner: provider_executor::owner(graph.nodes[0].node_id),
+                },
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(directory.path().join("provider-execution.db")).unwrap();
+        assert_eq!(
+            reopened
+                .catalog()
+                .unwrap()
+                .catalog
+                .runs
+                .iter()
+                .find(|run| run.metadata.id == receipt.run_id)
+                .unwrap()
+                .state,
+            bastet_core::NormalizedRunState::Uncertain
+        );
+        assert_eq!(
+            reopened
+                .graph_execution(execution_id)
+                .unwrap()
+                .nodes
+                .iter()
+                .find(|node| node.node_id == receipt.node_id)
+                .unwrap()
+                .state,
+            bastet_core::GraphNodeState::Uncertain
+        );
+        assert!(reopened
+            .graph_execution(execution_id)
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|node| node.node_id == receipt.node_id)
+            .unwrap()
+            .run_id
+            .is_none());
     }
 
     fn metadata<I>(id: I) -> EntityMetadata<I> {

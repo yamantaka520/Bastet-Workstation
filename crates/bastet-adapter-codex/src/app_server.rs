@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 
 use crate::{
@@ -10,8 +13,23 @@ use crate::{
 
 pub trait AppServerTransport {
     fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError>;
+    /// Sends a request whose response wait is bounded by `max_wait`. Implementors
+    /// must not fall back to an unbounded or configured-default request wait.
+    fn request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        max_wait: Duration,
+    ) -> Result<Value, TransportError>;
     fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError>;
     fn next_notification(&mut self) -> Result<AppServerNotification, TransportError>;
+
+    /// Bounded notification observation. `None` is not a transport failure:
+    /// it means only that this caller's observation window elapsed.
+    fn poll_notification(
+        &mut self,
+        max_wait: Duration,
+    ) -> Result<Option<AppServerNotification>, TransportError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,16 +374,38 @@ impl<T: AppServerTransport> CodexAppServer<T> {
     }
 
     pub fn interrupt_turn(&mut self, thread_id: &str, turn_id: &str) -> Result<(), AppServerError> {
+        self.interrupt_turn_inner(thread_id, turn_id, None)
+    }
+
+    /// Interrupts a turn, waiting no longer than `max_wait` for the provider
+    /// acknowledgement. A timeout is not an accepted cancellation.
+    pub fn interrupt_turn_with_timeout(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        max_wait: Duration,
+    ) -> Result<(), AppServerError> {
+        self.interrupt_turn_inner(thread_id, turn_id, Some(max_wait))
+    }
+
+    fn interrupt_turn_inner(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        max_wait: Option<Duration>,
+    ) -> Result<(), AppServerError> {
         self.require_initialized()?;
         require_text(thread_id)?;
         require_text(turn_id)?;
-        let result = self
-            .transport
-            .request(
-                "turn/interrupt",
-                json!({ "threadId": thread_id, "turnId": turn_id }),
-            )
-            .map_err(AppServerError::Transport)?;
+        let params = json!({ "threadId": thread_id, "turnId": turn_id });
+        let result = match max_wait {
+            Some(max_wait) => {
+                self.transport
+                    .request_with_timeout("turn/interrupt", params, max_wait)
+            }
+            None => self.transport.request("turn/interrupt", params),
+        }
+        .map_err(AppServerError::Transport)?;
         if result.as_object().is_none_or(|object| !object.is_empty()) {
             return Err(AppServerError::ProtocolDrift);
         }
@@ -376,6 +416,16 @@ impl<T: AppServerTransport> CodexAppServer<T> {
         self.require_initialized()?;
         self.transport
             .next_notification()
+            .map_err(AppServerError::Transport)
+    }
+
+    pub fn poll_notification(
+        &mut self,
+        max_wait: Duration,
+    ) -> Result<Option<AppServerNotification>, AppServerError> {
+        self.require_initialized()?;
+        self.transport
+            .poll_notification(max_wait)
             .map_err(AppServerError::Transport)
     }
 
@@ -412,6 +462,61 @@ impl<T: AppServerTransport> CodexAppServer<T> {
         occurred_at: &str,
     ) -> Result<CodexRunUpdate, AppServerError> {
         self.next_run_update_inner(stream, evidence, Some(final_output), occurred_at)
+    }
+
+    /// Observes a run for no longer than `max_wait`. A `None` result is an
+    /// observation timeout, not a terminal lifecycle transition.
+    pub(crate) fn poll_run_update_with_output(
+        &mut self,
+        stream: &mut CodexRunStream,
+        evidence: &CodexRunEvidence,
+        final_output: &mut CodexFinalOutput,
+        occurred_at: &str,
+        max_wait: Duration,
+    ) -> Result<Option<CodexRunUpdate>, AppServerError> {
+        let deadline = Instant::now().checked_add(max_wait);
+        let mut first_observation = true;
+        loop {
+            let remaining = deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::MAX);
+            if remaining.is_zero() && !first_observation {
+                return Ok(None);
+            }
+            first_observation = false;
+            let notification = match self.poll_notification(remaining) {
+                Ok(Some(notification)) => notification,
+                Ok(None) => return Ok(None),
+                Err(AppServerError::Transport(TransportError::TimedOut)) => {
+                    return stream
+                        .deadline_exceeded(occurred_at)
+                        .map(CodexRunUpdate::Lifecycle)
+                        .map(Some)
+                        .map_err(|_| AppServerError::ProtocolDrift);
+                }
+                Err(AppServerError::Transport(TransportError::Unavailable)) => {
+                    return stream
+                        .transport_lost(occurred_at)
+                        .map(CodexRunUpdate::Lifecycle)
+                        .map(Some)
+                        .map_err(|_| AppServerError::ProtocolDrift);
+                }
+                Err(error) => return Err(error),
+            };
+            final_output.ingest(&notification)?;
+            if let Some(event) = stream
+                .ingest(&notification, occurred_at)
+                .map_err(|_| AppServerError::ProtocolDrift)?
+            {
+                return Ok(Some(CodexRunUpdate::Lifecycle(event)));
+            }
+            if let Some(update) = evidence
+                .ingest(&notification)
+                .map_err(|_| AppServerError::ProtocolDrift)?
+            {
+                return Ok(Some(CodexRunUpdate::Evidence(update)));
+            }
+        }
     }
 
     fn next_run_update_inner(
@@ -634,6 +739,15 @@ mod tests {
             self.responses.pop_front().unwrap()
         }
 
+        fn request_with_timeout(
+            &mut self,
+            method: &str,
+            params: Value,
+            _max_wait: Duration,
+        ) -> Result<Value, TransportError> {
+            self.request(method, params)
+        }
+
         fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
             self.notifications.push((method.into(), params));
             Ok(())
@@ -641,6 +755,17 @@ mod tests {
 
         fn next_notification(&mut self) -> Result<AppServerNotification, TransportError> {
             self.incoming_notifications.pop_front().unwrap()
+        }
+
+        fn poll_notification(
+            &mut self,
+            _max_wait: Duration,
+        ) -> Result<Option<AppServerNotification>, TransportError> {
+            match self.next_notification() {
+                Ok(notification) => Ok(Some(notification)),
+                Err(TransportError::TimedOut) => Ok(None),
+                Err(error) => Err(error),
+            }
         }
     }
 

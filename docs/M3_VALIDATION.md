@@ -3,6 +3,22 @@
 `docs/MASTER_PLAN.md` is the sole implementation authority. This record binds M3 evidence to an
 exact commit and keeps automated evidence separate from the required human usability decision.
 
+## 2026-09-09 prerequisite audit
+
+M3 is not ready for milestone acceptance. The M2 prerequisite has been reopened
+by a production-wiring audit (see `M2_TASK_GRAPH.md`). In addition, the current
+MVP prepares a fixed meeting summary rather than executing a bounded participant
+discussion; Pet preview uses fallback symbols rather than each profile's state
+asset; the Office shows a cost count instead of inspectable ledger evidence; and
+knowledge delivery preview content is not rendered before the delivery action.
+These are implementation gaps, not merely missing human signatures.
+
+The user's September 7 confirmation closed the research-output recovery incident:
+the recovered report was accepted, exported, and delivered. That incident receipt
+does not establish the full five-locale gate or supersede the gaps above. Historical
+provider canaries below remain evidence of their tested boundaries only, and must
+be rerun against the eventual daemon-owned execution path before broad claims.
+
 ## Automated evidence
 
 Record the final commit before signing the human gate.

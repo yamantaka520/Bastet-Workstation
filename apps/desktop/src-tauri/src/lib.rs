@@ -12,12 +12,13 @@ use bastet_protocol::{
     PROTOCOL_VERSION,
 };
 use serde::Serialize;
+#[cfg(test)]
+use std::time::Duration;
 use std::{
     env,
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
 };
 use supervisor::DaemonSupervisor;
 use tauri::{
@@ -58,6 +59,15 @@ struct RunProjection {
     session_id: String,
     state: String,
     can_cancel: bool,
+}
+
+fn run_can_cancel(state: bastet_core::NormalizedRunState) -> bool {
+    // Provider startup/handshake is not yet interruptible. Do not advertise
+    // cancellation until there is a confirmed provider run to interrupt.
+    matches!(
+        state,
+        bastet_core::NormalizedRunState::Running | bastet_core::NormalizedRunState::Recovering
+    )
 }
 
 #[derive(Serialize)]
@@ -126,14 +136,6 @@ struct MeetingProjection {
     summary: String,
 }
 
-struct ProviderOutcome {
-    terminal_state: bastet_core::NormalizedRunState,
-    provider_session_id: Option<String>,
-    cost: bastet_core::CostEvidence,
-    output_markdown: Option<String>,
-    failure: Option<bastet_core::AdapterFailure>,
-}
-
 fn failure_kind_label(kind: bastet_core::AdapterFailureKind) -> &'static str {
     use bastet_core::AdapterFailureKind::*;
     match kind {
@@ -146,50 +148,6 @@ fn failure_kind_label(kind: bastet_core::AdapterFailureKind) -> &'static str {
         Crashed => "provider_crashed",
         ProtocolDrift | MalformedOutput => "invalid_output",
         Unknown => "unknown",
-    }
-}
-
-fn output_failure(
-    state: bastet_core::NormalizedRunState,
-    output: Option<&str>,
-    failure: Option<bastet_core::AdapterFailure>,
-) -> Option<bastet_core::AdapterFailure> {
-    if state == bastet_core::NormalizedRunState::Succeeded
-        && output.is_none_or(|text| text.trim().is_empty())
-    {
-        Some(bastet_core::AdapterFailure {
-            kind: bastet_core::AdapterFailureKind::MalformedOutput,
-            message_key: "mvp.failure.invalid_output".into(),
-            retryable: true,
-            provider_code: None,
-            redacted_detail: None,
-        })
-    } else {
-        failure
-    }
-}
-
-fn unknown_cost() -> bastet_core::CostEvidence {
-    bastet_core::CostEvidence {
-        evidence_class: bastet_core::EvidenceClass::Unknown,
-        currency: None,
-        amount: None,
-        input_tokens: None,
-        output_tokens: None,
-        confidence: 0.0,
-    }
-}
-
-fn output_terminal_state(
-    state: bastet_core::NormalizedRunState,
-    output: Option<&str>,
-) -> bastet_core::NormalizedRunState {
-    if state == bastet_core::NormalizedRunState::Succeeded
-        && output.is_none_or(|text| text.trim().is_empty())
-    {
-        bastet_core::NormalizedRunState::Failed
-    } else {
-        state
     }
 }
 
@@ -272,16 +230,11 @@ async fn retry_failed_mvp_node(
 #[tauri::command]
 async fn run_ready_mvp_nodes(client: State<'_, DaemonClient>) -> Result<M3Projection, String> {
     let identity = client.catalog().await.map_err(|error| error.to_string())?;
-    let m3 = client
-        .m3_catalog()
-        .await
-        .map_err(|error| error.to_string())?;
-    let executions = client
+    let execution = client
         .graph_executions()
         .await
         .map_err(|error| error.to_string())?
-        .executions;
-    let execution = executions
+        .executions
         .into_iter()
         .find(|execution| {
             execution
@@ -289,105 +242,17 @@ async fn run_ready_mvp_nodes(client: State<'_, DaemonClient>) -> Result<M3Projec
                 .iter()
                 .any(|node| node.state == bastet_core::GraphNodeState::Pending)
         })
-        .ok_or_else(|| "no pending MVP graph nodes".to_string())?;
-    let states = execution
-        .nodes
-        .iter()
-        .map(|node| (node.node_id, node.state))
-        .collect::<std::collections::HashMap<_, _>>();
-    let ready = execution
-        .graph
-        .nodes
-        .iter()
-        .filter(|definition| {
-            states.get(&definition.id) == Some(&bastet_core::GraphNodeState::Pending)
-                && definition.needs.iter().all(|dependency| {
-                    states.get(dependency) == Some(&bastet_core::GraphNodeState::Succeeded)
-                })
-        })
-        .take(2)
-        .cloned()
-        .collect::<Vec<_>>();
-    if ready.is_empty() {
-        return Err("no graph node is ready; reconcile uncertain or failed work first".into());
-    }
-    let mut catalog_revision = identity.revision;
-    let mut graph_revision = execution.revision;
-    let mut begun = Vec::new();
-    for definition in ready {
-        let receipt = client
-            .begin_graph_node_run(
-                execution.id,
-                bastet_protocol::BeginGraphNodeRunCommand {
-                    expected_catalog_revision: catalog_revision,
-                    expected_graph_revision: graph_revision,
-                    node_id: definition.id,
-                    owner: format!("desktop-provider-{}", definition.id.value()),
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        catalog_revision = receipt.catalog_revision;
-        graph_revision = receipt.graph_revision;
-        begun.push(receipt);
-    }
-    let handles = begun
-        .iter()
-        .map(|receipt| {
-            let adapter = receipt.adapter_kind.clone();
-            let model = receipt.model.clone();
-            let prompt = receipt.prompt.clone();
-            let root = PathBuf::from(&receipt.workspace_root);
-            let run_id = receipt.run_id;
-            tauri::async_runtime::spawn_blocking(move || {
-                run_provider(&adapter, run_id, model, prompt, root)
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut outcomes = Vec::new();
-    for handle in handles {
-        outcomes.push(match handle.await {
-            Ok(Ok(outcome)) => outcome,
-            _ => ProviderOutcome {
-                terminal_state: bastet_core::NormalizedRunState::Uncertain,
-                provider_session_id: None,
-                cost: unknown_cost(),
-                output_markdown: None,
-                failure: Some(bastet_core::AdapterFailure {
-                    kind: bastet_core::AdapterFailureKind::Unknown,
-                    message_key: "mvp.failure.unknown".into(),
-                    retryable: false,
-                    provider_code: None,
-                    redacted_detail: None,
-                }),
+        .ok_or("no pending MVP graph nodes")?;
+    client
+        .execute_ready_graph(
+            execution.id,
+            bastet_protocol::ExecuteReadyGraphCommand {
+                expected_catalog_revision: identity.revision,
+                expected_graph_revision: execution.revision,
             },
-        });
-    }
-    let mut m3_revision = m3.revision;
-    for (receipt, outcome) in begun.into_iter().zip(outcomes) {
-        let finished = client
-            .finish_graph_node_run(
-                execution.id,
-                bastet_protocol::FinishGraphNodeRunCommand {
-                    expected_catalog_revision: catalog_revision,
-                    expected_graph_revision: graph_revision,
-                    expected_m3_revision: m3_revision,
-                    node_id: receipt.node_id,
-                    run_id: receipt.run_id,
-                    owner: format!("desktop-provider-{}", receipt.node_id.value()),
-                    terminal_state: outcome.terminal_state,
-                    provider_session_id: outcome.provider_session_id,
-                    cost: outcome.cost,
-                    output_markdown: outcome.output_markdown,
-                    failure: outcome.failure,
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        catalog_revision = finished.catalog_revision;
-        graph_revision = finished.graph_revision;
-        m3_revision = finished.m3_revision;
-    }
+        )
+        .await
+        .map_err(|error| error.to_string())?;
     let updated = client
         .m3_catalog()
         .await
@@ -397,134 +262,6 @@ async fn run_ready_mvp_nodes(client: State<'_, DaemonClient>) -> Result<M3Projec
         .await
         .map_err(|error| error.to_string())?;
     Ok(project_m3(updated, graphs.executions))
-}
-
-fn run_provider(
-    adapter: &str,
-    run_id: bastet_core::RunId,
-    model: String,
-    prompt: String,
-    root: PathBuf,
-) -> Result<ProviderOutcome, String> {
-    match adapter {
-        "codex_cli" => run_codex(run_id, model, prompt, root),
-        "agy_cli" => run_agy(run_id, model, prompt, root),
-        _ => Err(format!("unsupported reference adapter: {adapter}")),
-    }
-}
-
-fn run_codex(
-    run_id: bastet_core::RunId,
-    model: String,
-    prompt: String,
-    root: PathBuf,
-) -> Result<ProviderOutcome, String> {
-    let executable =
-        configured_executable("BASTET_CODEX_BIN", "codex").ok_or("Codex CLI is unavailable")?;
-    let adapter = bastet_adapter_codex::CodexAdapter::new(executable);
-    let mut server = adapter
-        .connect_app_server(Duration::from_secs(120))
-        .map_err(|error| error.to_string())?;
-    let mut started = server
-        .start_tracked_run(bastet_adapter_codex::CodexRunRequest {
-            run_id,
-            model,
-            prompt,
-            cwd: root,
-            approval_policy: bastet_adapter_codex::ApprovalPolicy::Never,
-            sandbox_policy: bastet_adapter_codex::TurnSandboxPolicy::ReadOnly,
-            effort: Some("medium".into()),
-        })
-        .map_err(|error| error.to_string())?;
-    let provider_session_id = Some(started.thread.thread_id.clone());
-    let mut cost = unknown_cost();
-    loop {
-        match started
-            .tracker
-            .next_update(&mut server, &timestamp_ms().to_string())
-            .map_err(|error| error.to_string())?
-        {
-            bastet_adapter_codex::CodexRunUpdate::Evidence(
-                bastet_adapter_codex::CodexRunEvidenceUpdate::Cost(observed),
-            ) => cost = observed,
-            bastet_adapter_codex::CodexRunUpdate::Evidence(_) => {}
-            bastet_adapter_codex::CodexRunUpdate::Lifecycle(event) => match event.event.state {
-                bastet_core::NormalizedRunState::Succeeded
-                | bastet_core::NormalizedRunState::Failed
-                | bastet_core::NormalizedRunState::Cancelled
-                | bastet_core::NormalizedRunState::Blocked
-                | bastet_core::NormalizedRunState::Uncertain => {
-                    return Ok(ProviderOutcome {
-                        terminal_state: output_terminal_state(
-                            event.event.state,
-                            started.tracker.final_output(),
-                        ),
-                        provider_session_id,
-                        cost,
-                        output_markdown: started.tracker.final_output().map(str::to_owned),
-                        failure: output_failure(
-                            event.event.state,
-                            started.tracker.final_output(),
-                            event.failure,
-                        ),
-                    })
-                }
-                _ => {}
-            },
-        }
-    }
-}
-
-fn run_agy(
-    run_id: bastet_core::RunId,
-    model: String,
-    prompt: String,
-    root: PathBuf,
-) -> Result<ProviderOutcome, String> {
-    let executable =
-        configured_executable("BASTET_AGY_BIN", "agy").ok_or("Agy CLI is unavailable")?;
-    let mut process = bastet_adapter_agy::AgyProcess::spawn(
-        executable,
-        bastet_adapter_agy::AgyRunRequest {
-            run_id,
-            model,
-            effort: None,
-            prompt,
-            cwd: root,
-            read_only: true,
-            timeout: Duration::from_secs(120),
-            conversation_id: None,
-        },
-    )
-    .map_err(|error| error.to_string())?;
-    let mut cost = unknown_cost();
-    loop {
-        match process
-            .next_update(&timestamp_ms().to_string())
-            .map_err(|error| error.to_string())?
-        {
-            bastet_adapter_agy::AgyRunUpdate::Cost(observed) => cost = observed,
-            bastet_adapter_agy::AgyRunUpdate::WriteReceipt(_) => {
-                return Err("read-only Agy run reported a write".into())
-            }
-            bastet_adapter_agy::AgyRunUpdate::Lifecycle { event, failure } => match event.state {
-                bastet_core::NormalizedRunState::Succeeded
-                | bastet_core::NormalizedRunState::Failed
-                | bastet_core::NormalizedRunState::Cancelled
-                | bastet_core::NormalizedRunState::Blocked
-                | bastet_core::NormalizedRunState::Uncertain => {
-                    return Ok(ProviderOutcome {
-                        terminal_state: output_terminal_state(event.state, process.final_output()),
-                        provider_session_id: process.conversation_id().map(str::to_owned),
-                        cost,
-                        output_markdown: process.final_output().map(str::to_owned),
-                        failure: output_failure(event.state, process.final_output(), failure),
-                    })
-                }
-                _ => {}
-            },
-        }
-    }
 }
 
 #[tauri::command]
@@ -1167,12 +904,7 @@ async fn work_projection(client: State<'_, DaemonClient>) -> Result<WorkProjecti
             .runs
             .into_iter()
             .map(|run| {
-                let can_cancel = matches!(
-                    run.state,
-                    bastet_core::NormalizedRunState::Starting
-                        | bastet_core::NormalizedRunState::Running
-                        | bastet_core::NormalizedRunState::Recovering
-                );
+                let can_cancel = run_can_cancel(run.state);
                 RunProjection {
                     run_id: run.metadata.id.value().to_string(),
                     session_id: run.session_id.value().to_string(),
@@ -1554,25 +1286,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_success_has_safe_failure_evidence() {
-        use bastet_core::{AdapterFailureKind, NormalizedRunState};
-        let failure = output_failure(NormalizedRunState::Succeeded, Some("  "), None).unwrap();
-        assert_eq!(failure.kind, AdapterFailureKind::MalformedOutput);
-        assert_eq!(failure.provider_code, None);
-        assert_eq!(failure.redacted_detail, None);
-        assert_eq!(failure_kind_label(failure.kind), "invalid_output");
-        assert!(output_failure(NormalizedRunState::Succeeded, Some("# Report"), None).is_none());
-        let timed_out = bastet_core::AdapterFailure {
-            kind: AdapterFailureKind::Timeout,
-            message_key: "adapter.agy.timed_out".into(),
-            retryable: true,
-            provider_code: None,
-            redacted_detail: None,
-        };
-        assert_eq!(
-            output_failure(NormalizedRunState::Failed, None, Some(timed_out.clone())),
-            Some(timed_out)
-        );
+    fn cancellation_is_not_advertised_during_uninterruptible_startup() {
+        use bastet_core::NormalizedRunState::*;
+        assert!(run_can_cancel(Running));
+        assert!(run_can_cancel(Recovering));
+        for state in [
+            Starting, Cancelling, Succeeded, Failed, Cancelled, Blocked, Uncertain,
+        ] {
+            assert!(!run_can_cancel(state));
+        }
     }
 
     #[test]
@@ -1656,9 +1378,9 @@ mod tests {
         assert_eq!(receipt, "agent-memory:mem_fixture_receipt");
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "requires explicit installed/authenticated Codex and Agy CLIs; starts three real read-only provider runs"]
-    fn real_two_branch_mvp_and_join_survive_restart() {
+    async fn real_two_branch_mvp_and_join_survive_restart() {
         let codex_model = env::var("BASTET_CODEX_MODEL").expect("BASTET_CODEX_MODEL must be set");
         let agy_model = env::var("BASTET_AGY_MODEL").expect("BASTET_AGY_MODEL must be set");
         let root = tempfile::tempdir().unwrap();
@@ -1679,153 +1401,92 @@ mod tests {
             content: "Independently assess this statement: a matching SHA-256 digest can verify that document bytes have not changed, but does not prove that its factual claims are correct. Explain the distinction briefly, then integrate the two assessments. No external tools are needed for this bounded conceptual task.".into(),
             accepted_by: "m3-real-gate".into(), accepted_at: "2026-09-07T00:00:00Z".into(),
         }).unwrap();
-        let graph = store.graph_execution(accepted.graph_execution_id).unwrap();
-        let first = store
-            .begin_graph_node_run(
-                graph.id,
-                bastet_protocol::BeginGraphNodeRunCommand {
-                    expected_catalog_revision: prepared.catalog_revision,
-                    expected_graph_revision: graph.revision,
-                    node_id: graph.nodes[0].node_id,
-                    owner: "real-codex".into(),
-                },
-            )
-            .unwrap();
-        let second = store
-            .begin_graph_node_run(
-                graph.id,
-                bastet_protocol::BeginGraphNodeRunCommand {
-                    expected_catalog_revision: first.catalog_revision,
-                    expected_graph_revision: first.graph_revision,
-                    node_id: graph.nodes[1].node_id,
-                    owner: "real-agy".into(),
-                },
-            )
-            .unwrap();
-        let (left, right) = std::thread::scope(|scope| {
-            let left = scope.spawn(|| {
-                run_provider(
-                    &first.adapter_kind,
-                    first.run_id,
-                    first.model.clone(),
-                    first.prompt.clone(),
-                    PathBuf::from(&first.workspace_root),
-                )
-            });
-            let right = scope.spawn(|| {
-                run_provider(
-                    &second.adapter_kind,
-                    second.run_id,
-                    second.model.clone(),
-                    second.prompt.clone(),
-                    PathBuf::from(&second.workspace_root),
-                )
-            });
-            (
-                left.join().unwrap().unwrap(),
-                right.join().unwrap().unwrap(),
-            )
+        store.mark_ready().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = DaemonClient::new(format!("http://{}", listener.local_addr().unwrap()));
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let router =
+            bastet_daemon::production_router_with_shutdown(store.clone(), shutdown_tx.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.changed().await;
+                })
+                .await
+                .unwrap();
         });
-        assert_eq!(
-            left.terminal_state,
-            bastet_core::NormalizedRunState::Succeeded
-        );
-        assert_eq!(
-            right.terminal_state,
-            bastet_core::NormalizedRunState::Succeeded
-        );
-        let first_done = store
-            .finish_graph_node_run(
-                graph.id,
-                bastet_protocol::FinishGraphNodeRunCommand {
-                    expected_catalog_revision: second.catalog_revision,
-                    expected_graph_revision: second.graph_revision,
-                    expected_m3_revision: accepted.m3_revision,
-                    node_id: first.node_id,
-                    run_id: first.run_id,
-                    owner: "real-codex".into(),
-                    terminal_state: left.terminal_state,
-                    provider_session_id: left.provider_session_id,
-                    cost: left.cost,
-                    output_markdown: left.output_markdown,
-                    failure: left.failure,
-                },
-            )
-            .unwrap();
-        let second_done = store
-            .finish_graph_node_run(
-                graph.id,
-                bastet_protocol::FinishGraphNodeRunCommand {
-                    expected_catalog_revision: first_done.catalog_revision,
-                    expected_graph_revision: first_done.graph_revision,
-                    expected_m3_revision: first_done.m3_revision,
-                    node_id: second.node_id,
-                    run_id: second.run_id,
-                    owner: "real-agy".into(),
-                    terminal_state: right.terminal_state,
-                    provider_session_id: right.provider_session_id,
-                    cost: right.cost,
-                    output_markdown: right.output_markdown,
-                    failure: right.failure,
-                },
-            )
-            .unwrap();
-        let graph = store.graph_execution(graph.id).unwrap();
+        for expected_runs in [2, 1] {
+            let graph = store.graph_execution(accepted.graph_execution_id).unwrap();
+            let receipt = client
+                .execute_ready_graph(
+                    graph.id,
+                    bastet_protocol::ExecuteReadyGraphCommand {
+                        expected_catalog_revision: store.catalog().unwrap().revision,
+                        expected_graph_revision: graph.revision,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt.run_ids.len(), expected_runs);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+            loop {
+                let snapshot = store.catalog().unwrap();
+                let runs = snapshot
+                    .catalog
+                    .runs
+                    .iter()
+                    .filter(|run| receipt.run_ids.contains(&run.metadata.id))
+                    .collect::<Vec<_>>();
+                assert_eq!(runs.len(), expected_runs);
+                if runs.iter().all(|run| {
+                    !matches!(
+                        run.state,
+                        bastet_core::NormalizedRunState::Starting
+                            | bastet_core::NormalizedRunState::Running
+                            | bastet_core::NormalizedRunState::Cancelling
+                            | bastet_core::NormalizedRunState::Recovering
+                    )
+                }) {
+                    assert!(
+                        runs.iter()
+                            .all(|run| run.state == bastet_core::NormalizedRunState::Succeeded),
+                        "daemon-owned provider run did not succeed"
+                    );
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    // Do not silently abandon live work if this opt-in canary
+                    // times out. Request cancellation using the same client path.
+                    for run in runs {
+                        let revision = store.catalog().unwrap().revision;
+                        let _ = client.cancel_run(run.metadata.id, revision).await;
+                    }
+                    panic!("daemon-owned provider canary exceeded its bounded wait");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        let graph = store.graph_execution(accepted.graph_execution_id).unwrap();
+        assert_eq!(graph.outputs.len(), 3);
         let join_node = graph
+            .graph
             .nodes
             .iter()
-            .find(|node| node.state == bastet_core::GraphNodeState::Pending)
-            .unwrap()
-            .node_id;
-        let join = store
-            .begin_graph_node_run(
-                graph.id,
-                bastet_protocol::BeginGraphNodeRunCommand {
-                    expected_catalog_revision: second_done.catalog_revision,
-                    expected_graph_revision: second_done.graph_revision,
-                    node_id: join_node,
-                    owner: "real-join".into(),
-                },
-            )
+            .find(|node| !node.needs.is_empty())
             .unwrap();
-        let joined = run_provider(
-            &join.adapter_kind,
-            join.run_id,
-            join.model.clone(),
-            join.prompt.clone(),
-            PathBuf::from(&join.workspace_root),
-        )
-        .unwrap();
-        assert_eq!(
-            joined.terminal_state,
-            bastet_core::NormalizedRunState::Succeeded
-        );
-        let joined_markdown = joined
-            .output_markdown
-            .clone()
-            .expect("join must return actual text");
+        let joined_markdown = graph
+            .outputs
+            .iter()
+            .find(|output| output.node_id == join_node.id)
+            .expect("join must persist actual text")
+            .markdown
+            .clone();
         assert!(!joined_markdown.trim().is_empty());
-        let joined_done = store
-            .finish_graph_node_run(
-                graph.id,
-                bastet_protocol::FinishGraphNodeRunCommand {
-                    expected_catalog_revision: join.catalog_revision,
-                    expected_graph_revision: join.graph_revision,
-                    expected_m3_revision: second_done.m3_revision,
-                    node_id: join.node_id,
-                    run_id: join.run_id,
-                    owner: "real-join".into(),
-                    terminal_state: joined.terminal_state,
-                    provider_session_id: joined.provider_session_id,
-                    cost: joined.cost,
-                    output_markdown: joined.output_markdown,
-                    failure: joined.failure,
-                },
-            )
-            .unwrap();
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap();
         let document = store
             .create_mvp_document(bastet_protocol::CreateDocumentCommand {
-                expected_m3_revision: joined_done.m3_revision,
+                expected_m3_revision: store.m3_catalog().unwrap().revision,
                 graph_execution_id: graph.id,
                 title: "Real provider report".into(),
                 markdown: joined_markdown.clone(),

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use bastet_core::{NormalizedRunState, RunId};
 use thiserror::Error;
@@ -93,6 +93,24 @@ impl CodexRunTracker {
         ))
     }
 
+    /// Records `Cancelling` only after the provider acknowledges an interrupt
+    /// within `max_wait`; a timeout remains an error/uncertain daemon outcome.
+    pub fn request_cancellation_with_timeout<T: AppServerTransport>(
+        &mut self,
+        server: &mut CodexAppServer<T>,
+        occurred_at: &str,
+        max_wait: Duration,
+    ) -> Result<CodexRunUpdate, RunTrackerError> {
+        server.interrupt_turn_with_timeout(
+            &self.provider_thread_id,
+            &self.provider_turn_id,
+            max_wait,
+        )?;
+        Ok(CodexRunUpdate::Lifecycle(
+            self.stream.cancellation_requested(occurred_at)?,
+        ))
+    }
+
     pub fn resume_thread<T: AppServerTransport>(
         &mut self,
         server: &mut CodexAppServer<T>,
@@ -120,6 +138,30 @@ impl CodexRunTracker {
             occurred_at,
         )?;
         self.order_update(update)
+    }
+
+    /// Waits at most `max_wait` for an update. `None` means no observable
+    /// update arrived in that interval; it never synthesizes a timeout state.
+    pub fn poll_update<T: AppServerTransport>(
+        &mut self,
+        server: &mut CodexAppServer<T>,
+        occurred_at: &str,
+        max_wait: Duration,
+    ) -> Result<Option<CodexRunUpdate>, RunTrackerError> {
+        if let Some(terminal) = self.pending_terminal.take() {
+            return Ok(Some(terminal));
+        }
+        let Some(update) = server.poll_run_update_with_output(
+            &mut self.stream,
+            &self.evidence,
+            &mut self.final_output,
+            occurred_at,
+            max_wait,
+        )?
+        else {
+            return Ok(None);
+        };
+        self.order_update(update).map(Some)
     }
 
     fn order_update(&mut self, update: CodexRunUpdate) -> Result<CodexRunUpdate, RunTrackerError> {
@@ -219,6 +261,7 @@ mod tests {
         responses: VecDeque<Result<serde_json::Value, TransportError>>,
         incoming_notifications: VecDeque<Result<AppServerNotification, TransportError>>,
         requests: Vec<(String, serde_json::Value)>,
+        bounded_waits: Vec<Duration>,
     }
 
     impl AppServerTransport for FixtureTransport {
@@ -229,6 +272,16 @@ mod tests {
         ) -> Result<serde_json::Value, TransportError> {
             self.requests.push((method.into(), params));
             self.responses.pop_front().unwrap()
+        }
+
+        fn request_with_timeout(
+            &mut self,
+            method: &str,
+            params: serde_json::Value,
+            max_wait: Duration,
+        ) -> Result<serde_json::Value, TransportError> {
+            self.bounded_waits.push(max_wait);
+            self.request(method, params)
         }
 
         fn notify(
@@ -243,6 +296,17 @@ mod tests {
             self.incoming_notifications
                 .pop_front()
                 .unwrap_or(Err(TransportError::Unavailable))
+        }
+
+        fn poll_notification(
+            &mut self,
+            _max_wait: Duration,
+        ) -> Result<Option<AppServerNotification>, TransportError> {
+            match self.next_notification() {
+                Ok(notification) => Ok(Some(notification)),
+                Err(TransportError::TimedOut) => Ok(None),
+                Err(error) => Err(error),
+            }
         }
     }
 
@@ -492,6 +556,106 @@ mod tests {
                 .event
                 .sequence,
             1
+        );
+    }
+
+    #[test]
+    fn silent_poll_is_nonterminal_and_the_next_provider_event_is_preserved() {
+        let run_id = RunId::from_bytes([41; 16]);
+        let mut tracker = CodexRunTracker::new(run_id, "thr_1", "turn_1", None).unwrap();
+        let mut server = CodexAppServer::new(FixtureTransport {
+            responses: VecDeque::from([Ok(json!({}))]),
+            incoming_notifications: VecDeque::from([
+                Err(TransportError::TimedOut),
+                Ok(AppServerNotification {
+                    method: "turn/started".into(),
+                    params: json!({"turn": {"id": "turn_1", "status": "inProgress"}}),
+                }),
+            ]),
+            ..FixtureTransport::default()
+        });
+        server.initialize().unwrap();
+        assert!(tracker
+            .poll_update(&mut server, "silent", Duration::from_millis(5))
+            .unwrap()
+            .is_none());
+        let Some(CodexRunUpdate::Lifecycle(update)) = tracker
+            .poll_update(&mut server, "event", Duration::from_millis(5))
+            .unwrap()
+        else {
+            panic!("a silent observation must not discard the later event");
+        };
+        assert_eq!(update.event.state, NormalizedRunState::Running);
+    }
+
+    #[test]
+    fn cancellation_is_accepted_after_a_silent_poll() {
+        let run_id = RunId::from_bytes([42; 16]);
+        let mut tracker = CodexRunTracker::new(run_id, "thr_1", "turn_1", None).unwrap();
+        let mut server = CodexAppServer::new(FixtureTransport {
+            responses: VecDeque::from([Ok(json!({})), Ok(json!({}))]),
+            incoming_notifications: VecDeque::from([Err(TransportError::TimedOut)]),
+            ..FixtureTransport::default()
+        });
+        server.initialize().unwrap();
+        assert!(tracker
+            .poll_update(&mut server, "silent", Duration::from_millis(5))
+            .unwrap()
+            .is_none());
+        let CodexRunUpdate::Lifecycle(update) =
+            tracker.request_cancellation(&mut server, "cancel").unwrap()
+        else {
+            panic!("accepted interruption must remain responsive after polling");
+        };
+        assert_eq!(update.event.state, NormalizedRunState::Cancelling);
+    }
+
+    #[test]
+    fn bounded_cancellation_records_cancelling_only_after_a_timely_ack() {
+        let run_id = RunId::from_bytes([43; 16]);
+        let mut tracker = CodexRunTracker::new(run_id, "thr_1", "turn_1", None).unwrap();
+        let mut server = CodexAppServer::new(FixtureTransport {
+            responses: VecDeque::from([Ok(json!({})), Ok(json!({}))]),
+            ..FixtureTransport::default()
+        });
+        server.initialize().unwrap();
+        let CodexRunUpdate::Lifecycle(event) = tracker
+            .request_cancellation_with_timeout(&mut server, "cancel", Duration::from_secs(1))
+            .unwrap()
+        else {
+            panic!("accepted bounded interrupt must emit Cancelling");
+        };
+        assert_eq!(event.event.state, NormalizedRunState::Cancelling);
+        assert_eq!(
+            server.into_transport().bounded_waits,
+            vec![Duration::from_secs(1)]
+        );
+    }
+
+    #[test]
+    fn bounded_cancellation_timeout_does_not_record_cancelling() {
+        let run_id = RunId::from_bytes([44; 16]);
+        let mut tracker = CodexRunTracker::new(run_id, "thr_1", "turn_1", None).unwrap();
+        let mut server = CodexAppServer::new(FixtureTransport {
+            responses: VecDeque::from([Ok(json!({})), Err(TransportError::TimedOut)]),
+            ..FixtureTransport::default()
+        });
+        server.initialize().unwrap();
+        assert!(tracker
+            .request_cancellation_with_timeout(&mut server, "cancel", Duration::from_secs(1))
+            .is_err());
+        assert_eq!(
+            tracker
+                .stream
+                .cancellation_requested("later")
+                .unwrap()
+                .event
+                .sequence,
+            1
+        );
+        assert_eq!(
+            server.into_transport().bounded_waits,
+            vec![Duration::from_secs(1)]
         );
     }
 

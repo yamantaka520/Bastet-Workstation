@@ -20,6 +20,8 @@ pub struct StdioTransport {
     reader: Option<JoinHandle<()>>,
     next_request_id: u64,
     timeout: Duration,
+    notification_deadline: Option<Instant>,
+    abandoned_request_ids: VecDeque<u64>,
 }
 
 impl StdioTransport {
@@ -58,6 +60,8 @@ impl StdioTransport {
             reader: Some(reader),
             next_request_id: 0,
             timeout,
+            notification_deadline: None,
+            abandoned_request_ids: VecDeque::new(),
         })
     }
 
@@ -89,12 +93,19 @@ impl StdioTransport {
         stdin.flush().map_err(|_| TransportError::Unavailable)
     }
 
-    fn receive_message(&self, deadline: Instant) -> Result<Value, TransportError> {
+    fn receive_message(&mut self, deadline: Instant) -> Result<Value, TransportError> {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or(TransportError::TimedOut)?;
         match self.responses.recv_timeout(remaining) {
-            Ok(message) => message,
+            Ok(message) => {
+                let message = message?;
+                // Activity observed while an RPC is in flight is still
+                // provider transport activity. Preserve it for subsequent
+                // bounded run polling rather than carrying a stale deadline.
+                self.notification_deadline = Some(Instant::now() + self.timeout);
+                Ok(message)
+            }
             Err(RecvTimeoutError::Timeout) => Err(TransportError::TimedOut),
             Err(RecvTimeoutError::Disconnected) => Err(TransportError::Unavailable),
         }
@@ -103,6 +114,71 @@ impl StdioTransport {
 
 impl AppServerTransport for StdioTransport {
     fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError> {
+        self.request_inner(method, params, self.timeout, false)
+    }
+
+    fn request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        max_wait: Duration,
+    ) -> Result<Value, TransportError> {
+        self.request_inner(method, params, max_wait, true)
+    }
+
+    fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
+        self.write_message(&json!({"method": method, "params": params}))
+    }
+
+    fn next_notification(&mut self) -> Result<AppServerNotification, TransportError> {
+        self.poll_notification(self.timeout)?
+            .ok_or(TransportError::TimedOut)
+    }
+
+    fn poll_notification(
+        &mut self,
+        max_wait: Duration,
+    ) -> Result<Option<AppServerNotification>, TransportError> {
+        if let Some(notification) = self.pending_notifications.pop_front() {
+            self.notification_deadline = Some(Instant::now() + self.timeout);
+            return Ok(Some(notification));
+        }
+        let now = Instant::now();
+        let inactivity_deadline = self.notification_deadline.unwrap_or_else(|| {
+            let deadline = now + self.timeout;
+            self.notification_deadline = Some(deadline);
+            deadline
+        });
+        if now >= inactivity_deadline {
+            return Err(TransportError::TimedOut);
+        }
+        let wait = max_wait.min(inactivity_deadline.saturating_duration_since(now));
+        loop {
+            match self.responses.recv_timeout(wait) {
+                Ok(Ok(message)) if self.discard_abandoned_response(&message) => continue,
+                Ok(Ok(message)) => {
+                    self.notification_deadline = Some(Instant::now() + self.timeout);
+                    return decode_notification(message).map(Some);
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(RecvTimeoutError::Disconnected) => return Err(TransportError::Unavailable),
+                Err(RecvTimeoutError::Timeout) if Instant::now() >= inactivity_deadline => {
+                    return Err(TransportError::TimedOut);
+                }
+                Err(RecvTimeoutError::Timeout) => return Ok(None),
+            }
+        }
+    }
+}
+
+impl StdioTransport {
+    fn request_inner(
+        &mut self,
+        method: &str,
+        params: Value,
+        max_wait: Duration,
+        abandon_on_timeout: bool,
+    ) -> Result<Value, TransportError> {
         let request_id = self.next_request_id;
         self.next_request_id = self
             .next_request_id
@@ -113,9 +189,19 @@ impl AppServerTransport for StdioTransport {
             "id": request_id,
             "params": params
         }))?;
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + max_wait;
         loop {
-            let message = self.receive_message(deadline)?;
+            let message = match self.receive_message(deadline) {
+                Ok(message) => message,
+                Err(TransportError::TimedOut) if abandon_on_timeout => {
+                    self.remember_abandoned_request(request_id);
+                    return Err(TransportError::TimedOut);
+                }
+                Err(error) => return Err(error),
+            };
+            if self.discard_abandoned_response(&message) {
+                continue;
+            }
             if let Some(result) =
                 route_request_message(message, request_id, &mut self.pending_notifications)?
             {
@@ -124,16 +210,27 @@ impl AppServerTransport for StdioTransport {
         }
     }
 
-    fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
-        self.write_message(&json!({"method": method, "params": params}))
+    fn remember_abandoned_request(&mut self, request_id: u64) {
+        const MAX_ABANDONED_REQUESTS: usize = 64;
+        if self.abandoned_request_ids.len() == MAX_ABANDONED_REQUESTS {
+            self.abandoned_request_ids.pop_front();
+        }
+        self.abandoned_request_ids.push_back(request_id);
     }
 
-    fn next_notification(&mut self) -> Result<AppServerNotification, TransportError> {
-        if let Some(notification) = self.pending_notifications.pop_front() {
-            return Ok(notification);
-        }
-        let message = self.receive_message(Instant::now() + self.timeout)?;
-        decode_notification(message)
+    fn discard_abandoned_response(&mut self, message: &Value) -> bool {
+        let Some(id) = message.get("id").and_then(Value::as_u64) else {
+            return false;
+        };
+        let Some(position) = self
+            .abandoned_request_ids
+            .iter()
+            .position(|known| *known == id)
+        else {
+            return false;
+        };
+        self.abandoned_request_ids.remove(position);
+        true
     }
 }
 
@@ -219,6 +316,133 @@ fn decode_notification(message: Value) -> Result<AppServerNotification, Transpor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use std::{
+        process::{Command, Stdio},
+        sync::mpsc::{self, Sender},
+        thread,
+    };
+
+    #[cfg(unix)]
+    fn clock_transport(
+        timeout: Duration,
+    ) -> (StdioTransport, Sender<Result<Value, TransportError>>) {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 1"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take();
+        let _stdout = child.stdout.take();
+        let (sender, responses) = mpsc::channel();
+        (
+            StdioTransport {
+                child,
+                stdin,
+                responses,
+                pending_notifications: VecDeque::new(),
+                reader: None,
+                next_request_id: 0,
+                timeout,
+                notification_deadline: None,
+                abandoned_request_ids: VecDeque::new(),
+            },
+            sender,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repeated_short_polls_do_not_extend_the_stdio_inactivity_deadline() {
+        let (mut transport, _sender) = clock_transport(Duration::from_millis(80));
+        assert_eq!(
+            transport
+                .poll_notification(Duration::from_millis(15))
+                .unwrap(),
+            None
+        );
+        thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            transport
+                .poll_notification(Duration::from_millis(15))
+                .unwrap(),
+            None
+        );
+        thread::sleep(Duration::from_millis(35));
+        assert_eq!(
+            transport.poll_notification(Duration::ZERO).unwrap_err(),
+            TransportError::TimedOut
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rpc_and_queued_notification_activity_renew_the_stdio_deadline() {
+        let (mut transport, sender) = clock_transport(Duration::from_millis(50));
+        assert_eq!(
+            transport
+                .poll_notification(Duration::from_millis(5))
+                .unwrap(),
+            None
+        );
+        thread::sleep(Duration::from_millis(30));
+        sender
+            .send(Ok(json!({"method": "turn/started", "params": {}})))
+            .unwrap();
+        sender.send(Ok(json!({"id": 0, "result": {}}))).unwrap();
+        transport.request("test/request", json!({})).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            transport.next_notification().unwrap().method,
+            "turn/started"
+        );
+        assert_eq!(transport.poll_notification(Duration::ZERO).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_next_notification_honors_an_elapsed_stdio_deadline() {
+        let (mut transport, _sender) = clock_transport(Duration::from_millis(30));
+        assert_eq!(
+            transport
+                .poll_notification(Duration::from_millis(5))
+                .unwrap(),
+            None
+        );
+        thread::sleep(Duration::from_millis(35));
+        assert_eq!(
+            transport.next_notification().unwrap_err(),
+            TransportError::TimedOut
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_request_times_out_without_accepting_a_late_response() {
+        let (mut transport, sender) = clock_transport(Duration::from_millis(50));
+        let started = Instant::now();
+        assert_eq!(
+            transport
+                .request_with_timeout("turn/interrupt", json!({}), Duration::ZERO)
+                .unwrap_err(),
+            TransportError::TimedOut
+        );
+        assert!(started.elapsed() <= Duration::from_millis(50));
+        // Request 0 timed out. Its eventual response must be discarded while
+        // request 1 waits, rather than being treated as request 1's success.
+        sender
+            .send(Ok(json!({"id": 0, "result": {"old": true}})))
+            .unwrap();
+        sender
+            .send(Ok(json!({"id": 1, "result": {"fresh": true}})))
+            .unwrap();
+        assert_eq!(
+            transport.request("next/request", json!({})).unwrap(),
+            json!({"fresh": true})
+        );
+    }
 
     #[test]
     fn matching_response_is_returned() {

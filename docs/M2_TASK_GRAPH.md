@@ -29,6 +29,72 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-09 completion audit — supersedes earlier completion claims
+
+M2 is **open**. The historical slice results below describe tested boundaries,
+not proof that the complete desktop product satisfies the milestone. Inspection
+of `a602572` found these production integration gaps:
+
+- Desktop graph execution owned provider processes while the daemon's real
+  `RunControllerRegistry` was never populated. Live cancellation therefore failed
+  closed despite the registry fixture passing. Daemon-owned execution and actual
+  controller registration are being implemented; fixture success alone will not
+  close this item.
+- Agent Center projects discovery/auth/model/reasoning status but lacks the full
+  install, doctor, interactive authentication, and configuration workflow. A label
+  displaying a capability is not an implementation of its operation.
+- OS credential references are typed and durable but have no production credential
+  storage/retrieval integration. No secrets should be added to catalog state as a
+  shortcut.
+- Initial sandbox plans exist, but production provider execution does not use
+  them. Windows fails closed as unavailable; Linux lacks an actual enforcement
+  probe. Provider read-only flags do not prove the required OS enforcement.
+- Both ten-case conformance reports use protocol fixtures with capabilities
+  broader than the production declarations (including Authenticate). They prove
+  normalization, not the whole production adapter gate. Explicit real canaries
+  cover only the scenarios recorded below; missing scenarios remain unverified.
+- Existing locale tests do not establish non-technical usability testing. M3's
+  complete five-locale human gate remains open independently of the accepted
+  September 7 research report.
+
+Closure requires production-path evidence for each item, with failure injection
+distinguished from live-provider evidence. No release or deployment is authorized
+by this audit.
+
+### 2026-09-09 daemon-owned execution slice
+
+The desktop now submits ready graph work through the daemon's execution endpoint
+and returns without owning provider processes. The production daemon registers
+exact-run controllers, persists provider Running/session evidence and terminal
+output/cost/failure records, and rechecks originally selected launch bindings.
+Short observation polls remain nonterminal; genuine inactivity deadlines still
+produce failures. Codex interrupt acknowledgement has a separate one-second
+deadline, and late RPC replies cannot acknowledge a different request.
+
+Cancellation is available only after confirmed Running/Recovering, not during
+the still-uninterruptible startup handshake. Accepted interruption and immediate
+terminal completion can race without regressing state or reporting a false CAS
+failure. Partial text from Cancelled/Blocked/Uncertain outcomes is not accepted as
+document output. A started-but-not-yet-Running attempt reopens as Uncertain, with
+no automatic replay. Never-launched catalog placeholders are not assigned an
+invented start timestamp.
+
+Normal desktop shutdown refuses while work remains active. Ctrl-C and Unix
+SIGTERM wait for a safe checkpoint; store/signal errors do not authorize abandoning
+workers. Forced process death remains a separate recovery/enforcement gate.
+Permanent database faults still need better structured diagnostics; completion
+data is retained for persistence retry rather than replaying provider work.
+
+Local verification passed: workspace Rust tests (including 38 daemon tests),
+Clippy with warnings denied, 16 frontend tests, TypeScript, and Vite build. The
+desktop's ignored two-branch/join canary was changed to use the real production
+daemon route instead of a duplicate desktop runner. **It was not executed**:
+safety review rejected the attempted invocation because transmitting the test
+prompt to authenticated Codex/Agy services and consuming provider quota requires
+explicit user approval. No real provider work was started by that attempt.
+Cross-platform CI and live-provider evidence for this new slice remain separate
+from these local results. M2 and M3 remain open for the requirements listed above.
+
 - M2.1a contract primitives: committed as `774d075`; typed IDs, durable metadata, opaque
   credential references, policy inheritance, and versioned normalized adapter wire types have
   passing tests.

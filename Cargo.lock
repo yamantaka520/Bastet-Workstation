@@ -245,6 +245,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bastet-adapter-agy",
+ "bastet-adapter-codex",
  "bastet-core",
  "bastet-protocol",
  "rusqlite",
@@ -261,6 +263,7 @@ dependencies = [
 name = "bastet-desktop"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "bastet-adapter-agy",
  "bastet-adapter-codex",
  "bastet-client",

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { locales, type Locale, translate, translateFailure } from "./i18n";
@@ -34,25 +35,53 @@ export function App() {
   const [documentDraftId, setDocumentDraftId] = useState<string | null>(null);
   const [workspaceFiles, setWorkspaceFiles] = useState<Record<string, string>>({});
   const [actionError, setActionError] = useState(false);
+  const [quitError, setQuitError] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
+  const [pendingCancels, setPendingCancels] = useState<string[]>([]);
+  const cancelRequests = useRef(new Set<string>());
   const [prepareError, setPrepareError] = useState(false);
   const [prepareBusy, setPrepareBusy] = useState(false);
   const preparePending = useRef(false);
   const [autostart, setAutostart] = useState(false);
+  const agentDiscoveryPending = useRef(false);
+  const refreshSequence = useRef(0);
 
-  const reconnect = useCallback(async () => {
-    setConnection("connecting");
+  // CLI discovery can take longer than a status poll. It must not delay live
+  // run state or start overlapping provider processes on every timer tick.
+  const refreshAgents = useCallback(async () => {
+    if (agentDiscoveryPending.current) return;
+    agentDiscoveryPending.current = true;
     try {
-      const [next, list, agentList, workList, m3List] = await Promise.all([invoke<DaemonSnapshot>("daemon_snapshot"), invoke<ApprovalList>("approval_center_snapshot"), invoke<AgentCenterSnapshot>("agent_center_snapshot"), invoke<WorkProjection>("work_projection"), invoke<M3Projection>("m3_projection")]);
-      if (next.protocol_version !== 1 || list.protocol_version !== 1) throw new Error("protocol mismatch");
-      setSnapshot(next); setApprovals(list.records); setAgents(agentList.agents); setWork(workList); setM3(m3List);
+      const agentList = await invoke<AgentCenterSnapshot>("agent_center_snapshot");
+      setAgents(agentList.agents);
       setCodexModel((current) => current || agentList.agents.find((agent) => agent.adapter_kind === "codex_cli")?.models[0] || "");
       setAgyModel((current) => current || agentList.agents.find((agent) => agent.adapter_kind === "agy_cli")?.models[0] || "");
-      setConnection("ready");
-    } catch { setSnapshot(null); setConnection("offline"); }
+    } catch { /* Discovery failure is not a daemon disconnection. */ }
+    finally { agentDiscoveryPending.current = false; }
   }, []);
+
+  const reconnect = useCallback(async () => {
+    const sequence = ++refreshSequence.current;
+    void refreshAgents();
+    setConnection("connecting");
+    try {
+      const [next, list, workList, m3List] = await Promise.all([invoke<DaemonSnapshot>("daemon_snapshot"), invoke<ApprovalList>("approval_center_snapshot"), invoke<WorkProjection>("work_projection"), invoke<M3Projection>("m3_projection")]);
+      if (sequence !== refreshSequence.current) return;
+      if (next.protocol_version !== 1 || list.protocol_version !== 1) throw new Error("protocol mismatch");
+      setSnapshot(next); setApprovals(list.records); setWork(workList); setM3(m3List);
+      setConnection("ready");
+    } catch { if (sequence === refreshSequence.current) { setSnapshot(null); setConnection("offline"); } }
+  }, [refreshAgents]);
   useEffect(() => { void reconnect(); const timer = window.setInterval(() => void reconnect(), 5_000); return () => window.clearInterval(timer); }, [reconnect]);
   useEffect(() => { void isEnabled().then(setAutostart).catch(() => setAutostart(false)); }, []);
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen("quit-checkpoint-failed", () => setQuitError(true)).then((stop) => {
+      if (disposed) stop(); else unlisten = stop;
+    }).catch(() => {});
+    return () => { disposed = true; unlisten?.(); };
+  }, []);
 
   const changeAutostart = async (enabled: boolean) => { if (enabled) await enable(); else await disable(); setAutostart(await isEnabled()); };
   const decide = async (record: ApprovalRecord, kind: "approve" | "deny") => {
@@ -60,9 +89,14 @@ export function App() {
     await reconnect();
   };
   const cancelRun = async (runId: string) => {
+    if (cancelRequests.current.has(runId)) return;
+    cancelRequests.current.add(runId);
+    setPendingCancels([...cancelRequests.current]);
+    setQuitError(false);
     setActionError(false);
     try { await invoke("cancel_run", { runId, expectedCatalogRevision: work.revision }); await reconnect(); }
     catch { setActionError(true); }
+    finally { cancelRequests.current.delete(runId); setPendingCancels([...cancelRequests.current]); }
   };
   const changeBuiltinPet = async (apply: boolean) => {
     setActionError(false);
@@ -147,6 +181,7 @@ export function App() {
     <p role="status" className="connection" data-state={connection}>{translate(locale, connection)}</p>
     {actionBusy && <p role="status">{translate(locale, "working")}</p>}
     {actionError && <p role="alert">{translate(locale, "actionFailed")}</p>}
+    {quitError && <p role="alert">{translate(locale, "quitBlocked")}</p>}
 
     {view === "office" && <section aria-labelledby="office-heading"><h2 id="office-heading">{translate(locale, "office")}</h2><p>{translate(locale, "officeHelp")}</p>
       <dl><dt>{translate(locale, "revision")}</dt><dd>{m3.revision}</dd><dt>{translate(locale, "rooms")}</dt><dd>{m3.rooms}</dd><dt>{translate(locale, "meetings")}</dt><dd>{m3.meetings}</dd><dt>{translate(locale, "documents")}</dt><dd>{m3.documents}</dd><dt>{translate(locale, "costs")}</dt><dd>{m3.costs}</dd></dl>
@@ -169,7 +204,7 @@ export function App() {
           <dt>{translate(locale, "models")}</dt><dd>{agent.model_count ?? translate(locale, "unknown")}</dd><dt>{translate(locale, "reasoning")}</dt><dd>{agent.reasoning_controls.join(" · ") || translate(locale, "unknown")}</dd>
           <dt>{translate(locale, "runControl")}</dt><dd>{agent.operations.join(" · ") || translate(locale, "unavailable")}</dd></dl></article>)}</div>
       <h3>{translate(locale, "sessionsAndRuns")}</h3><p>{translate(locale, "sessions")}: {work.sessions} · {translate(locale, "revision")}: {work.revision}</p>
-      {work.runs.length === 0 ? <p>{translate(locale, "noRuns")}</p> : <ul>{work.runs.map((run) => <li key={run.run_id}><code>{run.run_id}</code> — {run.state} {run.can_cancel && <button type="button" onClick={() => void cancelRun(run.run_id)}>{translate(locale, "cancel")}</button>}</li>)}</ul>}</section>}
+      {work.runs.length === 0 ? <p>{translate(locale, "noRuns")}</p> : <ul>{work.runs.map((run) => <li key={run.run_id}><code>{run.run_id}</code> — {run.state} {run.can_cancel && <button type="button" disabled={pendingCancels.includes(run.run_id)} onClick={() => void cancelRun(run.run_id)}>{translate(locale, "cancel")}</button>}</li>)}</ul>}</section>}
 
     {view === "approvals" && <section aria-labelledby="approvals-heading"><h2 id="approvals-heading">{translate(locale, "approvals")}</h2><p>{translate(locale, "approvalHelp")}</p>
       {approvals.length === 0 ? <p>{translate(locale, "noApprovals")}</p> : approvals.map((record) => <article key={record.request.id} className="approval-card"><h3>{record.request.action.action_key}</h3>

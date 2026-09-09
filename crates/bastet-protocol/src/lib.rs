@@ -184,6 +184,20 @@ pub struct CompleteGraphNodeReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteReadyGraphCommand {
+    pub expected_catalog_revision: u64,
+    pub expected_graph_revision: u64,
+}
+
+/// Accepted daemon-owned work; provider output remains in the durable ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteReadyGraphReceipt {
+    pub protocol_version: u32,
+    pub execution_id: bastet_core::GraphRunId,
+    pub run_ids: Vec<bastet_core::RunId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BeginGraphNodeRunCommand {
     pub expected_catalog_revision: u64,
     pub expected_graph_revision: u64,

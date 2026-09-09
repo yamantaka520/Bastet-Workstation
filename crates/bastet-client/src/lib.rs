@@ -130,6 +130,28 @@ impl DaemonClient {
         Ok(snapshot)
     }
 
+    pub async fn execute_ready_graph(
+        &self,
+        execution_id: bastet_core::GraphRunId,
+        command: bastet_protocol::ExecuteReadyGraphCommand,
+    ) -> Result<bastet_protocol::ExecuteReadyGraphReceipt, ClientError> {
+        let receipt = self
+            .http
+            .post(format!(
+                "{}/v1/graphs/{}/execute-ready",
+                self.base_url,
+                execution_id.value()
+            ))
+            .json(&command)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<bastet_protocol::ExecuteReadyGraphReceipt>()
+            .await?;
+        require_protocol(receipt.protocol_version)?;
+        Ok(receipt)
+    }
+
     pub async fn graph_executions(&self) -> Result<GraphExecutionList, ClientError> {
         let list = self
             .http
@@ -692,6 +714,24 @@ mod tests {
             .unwrap()
             .executions
             .remove(0);
+        let denied = client
+            .execute_ready_graph(
+                execution_id,
+                bastet_protocol::ExecuteReadyGraphCommand {
+                    expected_catalog_revision: prepared.catalog_revision,
+                    expected_graph_revision: graph.revision,
+                },
+            )
+            .await;
+        assert!(matches!(denied, Err(ClientError::Request(error))
+            if error.status() == Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)));
+        // A transport-only/test daemon never silently falls back to executing
+        // providers in the client or creates runs without a worker owner.
+        assert!(client.catalog().await.unwrap().catalog.runs.is_empty());
+        assert_eq!(
+            client.graph_executions().await.unwrap().executions[0].revision,
+            graph.revision
+        );
         let begun = client
             .begin_graph_node_run(
                 execution_id,

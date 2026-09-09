@@ -1,10 +1,10 @@
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { hasExplicitWorkflowTranslation, locales, translate, workflowKeys } from "./i18n";
 
-const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
+const { invokeMock, listenMock } = vi.hoisted(() => ({ invokeMock: vi.fn(), listenMock: vi.fn() }));
 
 const defaultInvoke = (command: string) => Promise.resolve(command === "approval_center_snapshot"
     ? { protocol_version: 1, records: [] }
@@ -17,6 +17,7 @@ const defaultInvoke = (command: string) => Promise.resolve(command === "approval
       : { protocol_version: 1, daemon_id: "test-daemon", revision: 7, lifecycle: "ready" });
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: listenMock }));
 vi.mock("@tauri-apps/plugin-autostart", () => ({
   disable: vi.fn().mockResolvedValue(undefined),
   enable: vi.fn().mockResolvedValue(undefined),
@@ -24,7 +25,7 @@ vi.mock("@tauri-apps/plugin-autostart", () => ({
 }));
 
 describe("M1 shell", () => {
-  beforeEach(() => { invokeMock.mockReset(); invokeMock.mockImplementation(defaultInvoke); });
+  beforeEach(() => { invokeMock.mockReset(); invokeMock.mockImplementation(defaultInvoke); listenMock.mockReset(); listenMock.mockResolvedValue(() => {}); });
   it("has every required locale and no missing critical keys", () => {
     expect(locales).toEqual(["zh-Hant", "zh-Hans", "en", "ja", "ko"]);
     for (const locale of locales) expect(translate(locale, "ready")).not.toMatch(/^\[missing:/);
@@ -35,6 +36,19 @@ describe("M1 shell", () => {
         expect(hasExplicitWorkflowTranslation(locale, key)).toBe(true);
         expect(translate(locale, key)).not.toMatch(/^\[missing:/);
       }
+    }
+  });
+
+  it("shows safe localized guidance when an active run prevents quitting", async () => {
+    render(<App />);
+    await waitFor(() => expect(listenMock).toHaveBeenCalledWith("quit-checkpoint-failed", expect.any(Function)));
+    const handler = listenMock.mock.calls.find(([name]) => name === "quit-checkpoint-failed")![1];
+    act(() => handler({ payload: "raw internal error must not be displayed" }));
+    for (const locale of locales) {
+      fireEvent.change(screen.getByLabelText("Language"), { target: { value: locale } });
+      expect(screen.getByRole("alert")).toHaveTextContent(translate(locale, "quitBlocked"));
+      expect(screen.getByRole("alert")).not.toHaveTextContent("raw internal error");
+      expect(translate(locale, "quitBlocked")).not.toMatch(/^\[missing:/);
     }
   });
   it("switches locale using an accessible native control", () => {
@@ -76,6 +90,35 @@ describe("M1 shell", () => {
     fireEvent.click(await screen.findByRole("button", { name: "取消" }));
 
     expect(invokeMock).toHaveBeenCalledWith("cancel_run", { runId: "run-1", expectedCatalogRevision: 9 });
+  });
+
+  it("keeps daemon status and cancellation usable while provider discovery is pending", async () => {
+    invokeMock.mockImplementation((command: string) => command === "agent_center_snapshot"
+      ? new Promise(() => {})
+      : command === "work_projection"
+        ? Promise.resolve({ revision: 12, sessions: 1, runs: [{ run_id: "owned-run", session_id: "s", state: "running", can_cancel: true }] })
+        : defaultInvoke(command));
+    render(<App />);
+    expect(await screen.findByText("本機服務已連線")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Agents 與模型" }));
+    fireEvent.click(await screen.findByRole("button", { name: "取消" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("cancel_run", { runId: "owned-run", expectedCatalogRevision: 12 }));
+    expect(invokeMock.mock.calls.filter(([command]) => command === "agent_center_snapshot")).toHaveLength(1);
+  });
+
+  it("disables duplicate cancellation while awaiting provider acknowledgement", async () => {
+    invokeMock.mockImplementation((command: string) => command === "cancel_run"
+      ? new Promise(() => {})
+      : command === "work_projection"
+        ? Promise.resolve({ revision: 12, sessions: 1, runs: [{ run_id: "owned-run", session_id: "s", state: "running", can_cancel: true }] })
+        : defaultInvoke(command));
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Agents 與模型" }));
+    const cancel = await screen.findByRole("button", { name: "取消" });
+    fireEvent.click(cancel);
+    expect(cancel).toBeDisabled();
+    fireEvent.click(cancel);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "cancel_run")).toHaveLength(1);
   });
 
   it("previews every accessible Pet state before applying the built-in profile", async () => {
@@ -178,7 +221,7 @@ describe("M1 shell", () => {
     fireEvent.change(screen.getByLabelText("Agy 模型"), { target: { value: "agy-test" } });
     fireEvent.click(screen.getByRole("button", { name: "準備會議" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("操作失敗，已確認的狀態未變更。");
+    expect(await screen.findByRole("alert")).toHaveTextContent("操作結果無法確認。請先重新確認狀態，再決定是否重試。");
     expect(projectName).toHaveValue("Demo");
     expect(workspaceRoot).toHaveValue("/tmp/demo");
     expect(screen.getByLabelText("Codex 模型")).toHaveValue("gpt-test");
