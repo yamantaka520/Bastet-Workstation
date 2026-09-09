@@ -104,6 +104,15 @@ settle the sibling before testing the post-preflight terminal race; production
 timeouts and CAS checks are unchanged. The corrected workspace tests pass locally;
 the new cross-platform run must still establish the correction remotely.
 
+The listener boundary now rejects non-loopback overrides and claims its socket
+before opening/recovering SQLite, so a second process losing the same-port claim
+cannot alter a live store. Compiled-binary fixtures cover non-loopback rejection,
+occupied-port rejection before database creation, and unchanged existing state.
+This is not authenticated IPC or a same-database/different-port process lock.
+Before adding credential operations, M2 still needs authenticated local transport,
+exact account/reference launch binding, and provider environment allowlisting;
+no credential read/write endpoint has been added to the unauthenticated router.
+
 - M2.1a contract primitives: committed as `774d075`; typed IDs, durable metadata, opaque
   credential references, policy inheritance, and versioned normalized adapter wire types have
   passing tests.
