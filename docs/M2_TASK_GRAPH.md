@@ -113,6 +113,14 @@ Before adding credential operations, M2 still needs authenticated local transpor
 exact account/reference launch binding, and provider environment allowlisting;
 no credential read/write endpoint has been added to the unauthenticated router.
 
+The `d77fc03` follow-up run `34315405532` exposed a separate Linux fixture
+startup failure (`Unavailable` before polling). The normalized error did not
+retain the underlying OS reason, so no specific errno is claimed. Agy process
+tests now use a committed executable fixture instead of writing/chmodding an
+executable immediately before parallel startup, removing that possible file-handle
+race. Their inactivity-expiry assertion also sets an elapsed deadline directly.
+This changes the test harness only; provider failures remain fail-closed.
+
 - M2.1a contract primitives: committed as `774d075`; typed IDs, durable metadata, opaque
   credential references, policy inheritance, and versioned normalized adapter wire types have
   passing tests.

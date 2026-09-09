@@ -319,9 +319,6 @@ fn is_terminal(update: &AgyRunUpdate) -> bool {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-    use std::{fs, thread};
-
     use bastet_core::NormalizedRunState;
 
     use super::*;
@@ -331,18 +328,17 @@ mod tests {
         _root: tempfile::TempDir,
     }
 
-    fn fixture_process(script: &str, timeout: Duration) -> FixtureProcess {
+    fn fixture_process(mode: &str, timeout: Duration) -> FixtureProcess {
         let root = tempfile::tempdir().unwrap();
-        let executable = root.path().join("fake-agy.sh");
-        fs::write(&executable, format!("#!/bin/sh\n{script}\n")).unwrap();
-        let mut permissions = fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&executable, permissions).unwrap();
+        // Use a committed executable, not a just-written temporary script:
+        // parallel process startup must not race writable fixture handles.
+        let executable =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/poll-provider.sh");
         let process = AgyProcess::spawn(
             executable,
             AgyRunRequest {
                 run_id: RunId::from_bytes([61; 16]),
-                model: "agy-test".into(),
+                model: mode.into(),
                 effort: None,
                 prompt: "test".into(),
                 cwd: root.path().to_path_buf(),
@@ -360,13 +356,7 @@ mod tests {
 
     #[test]
     fn short_polls_are_nonterminal_and_later_events_are_observed() {
-        let mut fixture = fixture_process(
-            r#"IFS= read -r request
-IFS= read -r trigger
-printf '%s\n' '{"event":"init","conversation_id":"2200c74a-8a2f-4d0e-90f2-524463c987f4","init":{}}'
-exec sleep 5"#,
-            Duration::from_secs(10),
-        );
+        let mut fixture = fixture_process("delayed-init", Duration::from_secs(10));
         assert!(fixture
             .process
             .poll_update("now", Duration::from_millis(5))
@@ -387,16 +377,7 @@ exec sleep 5"#,
 
     #[test]
     fn legacy_wait_survives_activity_beyond_its_first_observation_window() {
-        let mut fixture = fixture_process(
-            r##"IFS= read -r request
-printf '%s\n' '{"event":"init","conversation_id":"poll-test","init":{}}'
-IFS= read -r trigger
-sleep 0.2
-printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"poll-test","step_type":"agent_response","text_delta":"# Answer"}}'
-sleep 0.2
-printf '%s\n' '{"event":"result","result":{"conversation_id":"poll-test","status":"SUCCESS"}}'"##,
-            Duration::from_secs(2),
-        );
+        let mut fixture = fixture_process("activity", Duration::from_secs(10));
         assert!(
             matches!(fixture.process.next_update("started").unwrap(), AgyRunUpdate::Lifecycle { event, .. } if event.state == NormalizedRunState::Running)
         );
@@ -416,13 +397,13 @@ printf '%s\n' '{"event":"result","result":{"conversation_id":"poll-test","status
 
     #[test]
     fn configured_inactivity_deadline_still_becomes_terminal_after_short_poll() {
-        let mut fixture = fixture_process("sleep 2", Duration::from_secs(1));
+        let mut fixture = fixture_process("silent", Duration::from_secs(10));
         assert!(fixture
             .process
             .poll_update("first", Duration::from_millis(5))
             .unwrap()
             .is_none());
-        thread::sleep(Duration::from_millis(1100));
+        fixture.process.inactivity_deadline = Instant::now() - Duration::from_secs(1);
         let Some(AgyRunUpdate::Lifecycle { event, .. }) = fixture
             .process
             .poll_update("expired", Duration::ZERO)
@@ -435,11 +416,7 @@ printf '%s\n' '{"event":"result","result":{"conversation_id":"poll-test","status
 
     #[test]
     fn cancellation_remains_responsive_after_a_silent_poll() {
-        let mut fixture = fixture_process(
-            r#"printf '%s\n' '{"event":"init","conversation_id":"cancel-test","init":{}}'
-exec sleep 5"#,
-            Duration::from_secs(2),
-        );
+        let mut fixture = fixture_process("cancel", Duration::from_secs(10));
         assert!(
             matches!(fixture.process.next_update("started").unwrap(), AgyRunUpdate::Lifecycle { event, .. } if event.state == NormalizedRunState::Running)
         );
