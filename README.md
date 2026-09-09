@@ -2,14 +2,28 @@
 
 Bastet Workstation is a local-first desktop workspace for personal Agent Teams. It is designed for macOS, Windows, and Linux and keeps one human in control of agent execution, approvals, artifacts, costs, memory, and project knowledge.
 
-Development is now closing **M3: Office vertical slice**. M0–M2 are complete. The current slice contains the versioned Rust protocol, supervised local daemon and SQLite recovery foundation; Codex/Agy reference adapters; typed Projects, Roles, Role-bound Pets and meetings; a human-accepted DecisionBaseline; durable two-branch execution plus explicit join; versioned accepted documents; cost evidence; and explicit AgentMemoryOS/BastetMind delivery. Automated and real-provider gates pass locally. M3 remains open until the final cross-platform CI and the five-locale non-technical usability protocol in `docs/M3_VALIDATION.md` pass on the exact delivery commit.
+**M2 is open; M3 is not accepted.** The September 9 production-path audit supersedes earlier completion claims. Daemon-owned execution, cancellation, durable output, and restart handling are implemented, but Agent setup workflows, native credential integration, OS sandbox enforcement, and complete real-adapter gates still need work. M3 also has implementation gaps in meetings, Pet assets, cost inspection, and delivery preview, in addition to its five-locale human gate. Fixture and historical real-provider results prove only their recorded scenarios; they do not establish complete milestone acceptance.
 
 ## Authoritative plan
 
 [`docs/MASTER_PLAN.md`](docs/MASTER_PLAN.md) is the single authority for product scope, architecture, milestones, gates, and accepted decisions. Architecture decisions under [`docs/adr`](docs/adr) record the M0 baseline without replacing that plan.
 
-M1 evidence is tracked in [`docs/M1_VALIDATION.md`](docs/M1_VALIDATION.md); the active M3 automated
+M1 evidence is tracked in [`docs/M1_VALIDATION.md`](docs/M1_VALIDATION.md); the active M2 audit is
+in [`docs/M2_TASK_GRAPH.md`](docs/M2_TASK_GRAPH.md). The M3 automated
 and human gate is tracked in [`docs/M3_VALIDATION.md`](docs/M3_VALIDATION.md).
+
+## Local daemon connection
+
+The desktop derives its native local IPC endpoint from its database location.
+Production does not listen on TCP or use `BASTET_DAEMON_URL`; `BASTET_LISTEN` is
+rejected by the standalone daemon. Unix sockets and Windows named pipes enforce
+the OS-user boundary. This does not isolate malicious applications running as
+the same user: provider sandboxing and credential grants remain separate work.
+
+Before replacing a pre-IPC build, explicitly quit the old desktop/daemon so it
+checkpoints its database. Do not run old TCP and new IPC daemons against the same
+database. The new endpoint ownership guard coordinates new IPC builds; it cannot
+retroactively lock an older binary that does not implement that guard.
 
 ## M0 checks
 

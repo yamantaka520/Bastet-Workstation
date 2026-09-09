@@ -33,5 +33,6 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["N
 
 [dev-dependencies]
 axum.workspace = true
+bastet-local-ipc = { path = "../../../crates/bastet-local-ipc" }
 bastet-daemon = { path = "../../../crates/bastet-daemon" }
 tempfile.workspace = true

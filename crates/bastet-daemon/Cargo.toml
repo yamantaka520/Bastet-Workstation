@@ -11,6 +11,7 @@ repository.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 bastet-core = { path = "../bastet-core" }
+bastet-local-ipc = { path = "../bastet-local-ipc" }
 bastet-adapter-agy = { path = "../bastet-adapter-agy" }
 bastet-adapter-codex = { path = "../bastet-adapter-codex" }
 bastet-protocol = { path = "../bastet-protocol" }

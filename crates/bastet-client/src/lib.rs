@@ -1,4 +1,4 @@
-use std::{env, time::Duration};
+use std::{path::Path, time::Duration};
 
 use bastet_core::{ApprovalDecision, ApprovalRequest, ApprovalRequestId, IdentityCatalog, RunId};
 use bastet_protocol::{
@@ -17,35 +17,55 @@ use bastet_protocol::{
 };
 use thiserror::Error;
 
+mod transport;
+use transport::{LocalResponse, LocalTransport, LocalTransportError};
+
+const LOCAL_HTTP_ORIGIN: &str = "http://bastet.local";
+
 #[derive(Clone)]
 pub struct DaemonClient {
     base_url: String,
-    http: reqwest::Client,
+    http: ClientTransport,
 }
 
 #[derive(Debug, Error)]
 pub enum ClientError {
     #[error("daemon request failed: {0}")]
     Request(#[from] reqwest::Error),
+    #[error("local daemon transport failed: {0}")]
+    LocalTransport(#[from] LocalTransportError),
+    #[error("local daemon returned HTTP status {0}")]
+    LocalStatus(u16),
+    #[error("daemon response could not be decoded")]
+    InvalidResponse,
     #[error("daemon protocol mismatch: expected {expected}, received {actual}")]
     ProtocolMismatch { expected: u32, actual: u32 },
 }
 
 impl DaemonClient {
-    pub fn from_env() -> Self {
-        Self::new(
-            env::var("BASTET_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:17841".to_owned()),
-        )
+    /// Constructs the production client. Every request opens a freshly
+    /// authenticated local IPC connection; it never resolves or dials a URL.
+    pub fn for_database(database: &Path) -> Result<Self, ClientError> {
+        let endpoint = bastet_local_ipc::Endpoint::for_database(database)
+            .map_err(|_| LocalTransportError::EndpointUnavailable)?;
+        Ok(Self {
+            base_url: LOCAL_HTTP_ORIGIN.to_owned(),
+            http: ClientTransport::Local(LocalTransport::new(endpoint)),
+        })
     }
 
+    /// Test-fixture-only HTTP constructor. Production code must use
+    /// [`DaemonClient::for_database`].
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
-            http: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(1))
-                .timeout(Duration::from_secs(3))
-                .build()
-                .expect("static HTTP client configuration must be valid"),
+            http: ClientTransport::Fixture(
+                reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(1))
+                    .timeout(Duration::from_secs(3))
+                    .build()
+                    .expect("static HTTP client configuration must be valid"),
+            ),
         }
     }
 
@@ -620,6 +640,96 @@ impl DaemonClient {
     }
 }
 
+#[derive(Clone)]
+enum ClientTransport {
+    Fixture(reqwest::Client),
+    Local(LocalTransport),
+}
+
+impl ClientTransport {
+    fn get(&self, url: String) -> ClientRequest {
+        ClientRequest::new(self.clone(), reqwest::Method::GET, url)
+    }
+
+    fn post(&self, url: String) -> ClientRequest {
+        ClientRequest::new(self.clone(), reqwest::Method::POST, url)
+    }
+
+    fn put(&self, url: String) -> ClientRequest {
+        ClientRequest::new(self.clone(), reqwest::Method::PUT, url)
+    }
+}
+
+struct ClientRequest {
+    transport: ClientTransport,
+    method: reqwest::Method,
+    url: String,
+    body: Result<Option<Vec<u8>>, ClientError>,
+}
+
+impl ClientRequest {
+    fn new(transport: ClientTransport, method: reqwest::Method, url: String) -> Self {
+        Self {
+            transport,
+            method,
+            url,
+            body: Ok(None),
+        }
+    }
+
+    fn json<T: serde::Serialize>(mut self, value: &T) -> Self {
+        self.body = serde_json::to_vec(value)
+            .map(Some)
+            .map_err(|_| ClientError::InvalidResponse);
+        self
+    }
+
+    async fn send(self) -> Result<ClientResponse, ClientError> {
+        let body = self.body?;
+        match self.transport {
+            ClientTransport::Fixture(http) => {
+                let request = http.request(self.method, self.url);
+                let request = match body {
+                    Some(body) => request
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .body(body),
+                    None => request,
+                };
+                Ok(ClientResponse::Fixture(request.send().await?))
+            }
+            ClientTransport::Local(transport) => Ok(ClientResponse::Local(
+                transport
+                    .send(self.method, self.url, body.unwrap_or_default())
+                    .await?,
+            )),
+        }
+    }
+}
+
+enum ClientResponse {
+    Fixture(reqwest::Response),
+    Local(LocalResponse),
+}
+
+impl ClientResponse {
+    fn error_for_status(self) -> Result<Self, ClientError> {
+        match self {
+            Self::Fixture(response) => Ok(Self::Fixture(response.error_for_status()?)),
+            Self::Local(response) if response.status.is_success() => Ok(Self::Local(response)),
+            Self::Local(response) => Err(ClientError::LocalStatus(response.status.as_u16())),
+        }
+    }
+
+    async fn json<T: serde::de::DeserializeOwned>(self) -> Result<T, ClientError> {
+        match self {
+            Self::Fixture(response) => Ok(response.json().await?),
+            Self::Local(response) => {
+                serde_json::from_slice(&response.body).map_err(|_| ClientError::InvalidResponse)
+            }
+        }
+    }
+}
+
 fn require_protocol(actual: u32) -> Result<(), ClientError> {
     if actual == PROTOCOL_VERSION {
         Ok(())
@@ -636,6 +746,40 @@ mod tests {
     use super::*;
     use bastet_daemon::{router_with_shutdown, Store};
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn checkpoints_through_authenticated_local_ipc() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("bastet.db");
+        let store = Store::open(&database).unwrap();
+        store.mark_ready().unwrap();
+        let endpoint = bastet_local_ipc::Endpoint::for_database(&database).unwrap();
+        let (listener, guard) = bastet_local_ipc::bind(&endpoint).unwrap();
+        let server_store = store.clone();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(async move {
+            let _guard = guard;
+            axum::serve(listener, router_with_shutdown(server_store, shutdown_tx))
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.changed().await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let client = DaemonClient::for_database(&database).unwrap();
+        let initial = client.snapshot().await.unwrap();
+        let receipt = client
+            .checkpoint(initial.revision, "local IPC test")
+            .await
+            .unwrap();
+        assert_eq!(receipt.revision, initial.revision + 1);
+        client
+            .shutdown(receipt.revision, "test complete")
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn reconnects_and_checkpoints_through_real_loopback_api() {

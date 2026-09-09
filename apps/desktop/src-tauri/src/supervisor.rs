@@ -22,7 +22,6 @@ struct Inner {
     executable: PathBuf,
     database: PathBuf,
     diagnostics_dir: PathBuf,
-    listen: String,
     shutting_down: AtomicBool,
     exit_authorized: AtomicBool,
 }
@@ -42,11 +41,14 @@ impl DaemonSupervisor {
                 executable,
                 database: data_dir.join("bastet-workstation.db"),
                 diagnostics_dir,
-                listen: env::var("BASTET_LISTEN").unwrap_or_else(|_| "127.0.0.1:17841".to_owned()),
                 shutting_down: AtomicBool::new(false),
                 exit_authorized: AtomicBool::new(false),
             }),
         })
+    }
+
+    pub fn client(&self) -> Result<DaemonClient, String> {
+        DaemonClient::for_database(&self.inner.database).map_err(|error| error.to_string())
     }
 
     pub async fn ensure_running(&self, client: &DaemonClient) -> Result<(), String> {
@@ -124,7 +126,8 @@ impl DaemonSupervisor {
         let stderr = diagnostic_log(&self.inner.diagnostics_dir.join("daemon.stderr.log"))?;
         let process = Command::new(&self.inner.executable)
             .env("BASTET_DATABASE", &self.inner.database)
-            .env("BASTET_LISTEN", &self.inner.listen)
+            .env_remove("BASTET_LISTEN")
+            .env_remove("BASTET_DAEMON_URL")
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))

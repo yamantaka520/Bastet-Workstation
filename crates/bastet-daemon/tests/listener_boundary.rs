@@ -1,13 +1,14 @@
-use std::{net::TcpListener, process::Command};
+use std::process::Command;
 
-#[test]
-fn occupied_listener_fails_before_creating_or_recovering_a_database() {
+#[tokio::test]
+async fn occupied_listener_fails_before_creating_or_recovering_a_database() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("must-not-open.db");
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = bastet_local_ipc::Endpoint::for_database(&database).unwrap();
+    let (_listener, _guard) = bastet_local_ipc::bind(&endpoint).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_bastet-daemon"))
         .env("BASTET_DATABASE", &database)
-        .env("BASTET_LISTEN", listener.local_addr().unwrap().to_string())
+        .env_remove("BASTET_LISTEN")
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -15,7 +16,7 @@ fn occupied_listener_fails_before_creating_or_recovering_a_database() {
 }
 
 #[test]
-fn non_loopback_override_fails_before_creating_a_database() {
+fn legacy_tcp_override_fails_before_creating_a_database() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("must-not-open.db");
     let output = Command::new(env!("CARGO_BIN_EXE_bastet-daemon"))
@@ -24,21 +25,22 @@ fn non_loopback_override_fails_before_creating_a_database() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("must be loopback"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires local IPC"));
     assert!(!database.exists());
 }
 
-#[test]
-fn occupied_listener_does_not_advance_an_existing_store() {
+#[tokio::test]
+async fn occupied_listener_does_not_advance_an_existing_store() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("existing.db");
     let store = bastet_daemon::Store::open(&database).unwrap();
     store.mark_ready().unwrap();
     let before = store.snapshot().unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = bastet_local_ipc::Endpoint::for_database(&database).unwrap();
+    let (_listener, _guard) = bastet_local_ipc::bind(&endpoint).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_bastet-daemon"))
         .env("BASTET_DATABASE", &database)
-        .env("BASTET_LISTEN", listener.local_addr().unwrap().to_string())
+        .env_remove("BASTET_LISTEN")
         .output()
         .unwrap();
     assert!(!output.status.success());

@@ -1,6 +1,5 @@
-use std::{env, net::SocketAddr, path::PathBuf};
+use std::{env, path::PathBuf};
 
-use anyhow::Context;
 use bastet_daemon::{production_router_with_shutdown, Store, StoreError};
 
 #[tokio::main]
@@ -8,15 +7,14 @@ async fn main() -> anyhow::Result<()> {
     let database = env::var_os("BASTET_DATABASE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("bastet-workstation.db"));
-    let address = local_listen_address(
-        &env::var("BASTET_LISTEN").unwrap_or_else(|_| "127.0.0.1:17841".into()),
-    )?;
-    // A second process must fail its listener claim before opening the shared
-    // store, whose startup recovery would otherwise mark live runs uncertain.
-    let listener = tokio::net::TcpListener::bind(address).await?;
+    reject_legacy_tcp_override(env::var_os("BASTET_LISTEN").is_some())?;
+    let endpoint = bastet_local_ipc::Endpoint::for_database(&database)?;
+    // Hold the OS-account-scoped endpoint guard through complete HTTP shutdown.
+    // A competing process must fail before Store startup recovery can run.
+    let (listener, _endpoint_guard) = bastet_local_ipc::bind(&endpoint)?;
     let store = Store::open(database)?;
     store.mark_ready()?;
-    println!("bastet-daemon listening on {}", listener.local_addr()?);
+    println!("bastet-daemon local IPC ready");
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let signal_store = store.clone();
     let mut ctrl_c_available = true;
@@ -80,12 +78,12 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn local_listen_address(value: &str) -> anyhow::Result<SocketAddr> {
-    let address: SocketAddr = value
-        .parse()
-        .context("BASTET_LISTEN must be a socket address")?;
-    anyhow::ensure!(address.ip().is_loopback(), "BASTET_LISTEN must be loopback");
-    Ok(address)
+fn reject_legacy_tcp_override(present: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !present,
+        "BASTET_LISTEN is unsupported; daemon requires local IPC"
+    );
+    Ok(())
 }
 
 async fn checkpoint_for_signal(store: &Store, reason: &str) {
@@ -123,12 +121,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn listener_is_local_only_even_with_an_explicit_override() {
-        for address in ["127.0.0.1:17841", "127.0.0.2:0", "[::1]:17841"] {
-            assert!(local_listen_address(address).is_ok());
-        }
-        for address in ["0.0.0.0:17841", "[::]:17841", "192.0.2.1:17841", "bad"] {
-            assert!(local_listen_address(address).is_err());
-        }
+    fn production_listener_has_no_legacy_tcp_override() {
+        assert!(reject_legacy_tcp_override(false).is_ok());
+        assert!(reject_legacy_tcp_override(true).is_err());
     }
 }

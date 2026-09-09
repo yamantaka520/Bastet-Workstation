@@ -1179,7 +1179,6 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
-        .manage(DaemonClient::from_env())
         .menu(|app| {
             let quit = MenuItem::with_id(
                 app,
@@ -1198,6 +1197,7 @@ pub fn run() {
         })
         .setup(|app| {
             let supervisor = DaemonSupervisor::new(&app.path().app_local_data_dir()?)?;
+            app.manage(supervisor.client()?);
             app.manage(supervisor.clone());
             #[cfg(target_os = "macos")]
             macos_power::install(app.handle().clone());
@@ -1402,8 +1402,9 @@ mod tests {
             accepted_by: "m3-real-gate".into(), accepted_at: "2026-09-07T00:00:00Z".into(),
         }).unwrap();
         store.mark_ready().unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = DaemonClient::new(format!("http://{}", listener.local_addr().unwrap()));
+        let endpoint = bastet_local_ipc::Endpoint::for_database(&database).unwrap();
+        let (listener, _endpoint_guard) = bastet_local_ipc::bind(&endpoint).unwrap();
+        let client = DaemonClient::for_database(&database).unwrap();
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let router =
             bastet_daemon::production_router_with_shutdown(store.clone(), shutdown_tx.clone());

@@ -9,6 +9,14 @@ repository.workspace = true
 
 [dependencies]
 bastet-core = { path = "../bastet-core" }
+bastet-local-ipc = { path = "../bastet-local-ipc" }
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
 bastet-protocol = { path = "../bastet-protocol" }
 reqwest.workspace = true
 thiserror.workspace = true

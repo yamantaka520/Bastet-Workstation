@@ -29,6 +29,36 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-09 authenticated local IPC slice
+
+Production desktop/daemon traffic now uses Unix-domain sockets on macOS/Linux
+and local named pipes on Windows, with no TCP/environment-URL fallback. Unix
+checks a private owner-only directory, socket permissions, and the connected
+peer UID. Windows gives each instance a protected current-user DACL, rejects
+remote clients, and checks the connected server process SID on the actual handle
+used for HTTP. This authenticates an OS account, not applications sharing that
+account; provider sandbox enforcement remains a separate open M2 requirement.
+
+The daemon claims a canonical-database-path singleton before opening SQLite.
+Unix retains a locked file and Windows a first-instance sentinel through graceful
+HTTP drain. Existing symlinks are resolved, but this is not a universal file-ID
+lock: hard-link aliases and concurrent case aliases are outside its guarantee.
+The desktop uses one fixed database path. Legacy TCP builds must first Quit at a
+safe checkpoint before replacement, because those binaries do not honor this
+new guard. No installed application was replaced as part of this slice.
+
+Native HTTP is bounded, does not follow redirects, and sanitizes transport
+errors. Local macOS workspace tests, Clippy, formatting, and a compiled-daemon
+smoke passed. The smoke covers readiness, suspend/resume, checkpoint rejection,
+graceful restart, forced termination/restart, and stable identity without starting
+providers. Windows compilation/runtime and Linux runtime verification remain
+pending CI; a real second-account denial test is also outstanding. No credential
+endpoint or real-provider canary was introduced or executed. M2 remains open.
+
+The preceding `1aa4ba1` daemon-execution fixture correction passed all ten jobs
+in CI run `34315939591`, including macOS, Windows, and Linux. This result does
+not establish the new IPC slice's cross-platform behavior.
+
 ### 2026-09-09 completion audit — supersedes earlier completion claims
 
 M2 is **open**. The historical slice results below describe tested boundaries,
