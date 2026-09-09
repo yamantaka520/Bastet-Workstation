@@ -84,6 +84,16 @@ pub enum ApprovalError {
     EmptyActor,
     #[error("approval request references missing {0}")]
     MissingReference(&'static str),
+    #[error("approval credential scope requires an account for the acting agent")]
+    CredentialAccountRequired,
+    #[error("approval credential scope requires a credential reference on the acting account")]
+    AccountCredentialRequired,
+    #[error("approval credential scope does not match the acting account")]
+    CredentialAccountMismatch,
+    #[error("approval run scope belongs to a different agent")]
+    RunAgentMismatch,
+    #[error("approval run scope belongs to a different project")]
+    RunProjectMismatch,
 }
 
 impl ApprovalRequest {
@@ -137,13 +147,11 @@ impl ApprovalRequest {
 
     pub fn validate_against(&self, catalog: &crate::IdentityCatalog) -> Result<(), ApprovalError> {
         self.validate_unchanged()?;
-        if !catalog
+        let agent = catalog
             .agent_instances
             .iter()
-            .any(|item| item.metadata.id == self.action.agent_instance_id)
-        {
-            return Err(ApprovalError::MissingReference("agent_instance_id"));
-        }
+            .find(|item| item.metadata.id == self.action.agent_instance_id)
+            .ok_or(ApprovalError::MissingReference("agent_instance_id"))?;
         let project = catalog
             .projects
             .iter()
@@ -160,17 +168,48 @@ impl ApprovalRequest {
             &project.policy
         };
         if let Some(run_id) = self.action.scope.run_id {
-            if !catalog.runs.iter().any(|item| item.metadata.id == run_id) {
-                return Err(ApprovalError::MissingReference("run_id"));
+            let run = catalog
+                .runs
+                .iter()
+                .find(|item| item.metadata.id == run_id)
+                .ok_or(ApprovalError::MissingReference("run_id"))?;
+            let session = catalog
+                .sessions
+                .iter()
+                .find(|item| item.metadata.id == run.session_id)
+                .ok_or(ApprovalError::MissingReference("session_id"))?;
+            if session.agent_instance_id != self.action.agent_instance_id {
+                return Err(ApprovalError::RunAgentMismatch);
+            }
+            if session.project_id != self.action.scope.project_id {
+                return Err(ApprovalError::RunProjectMismatch);
             }
         }
-        for reference_id in &self.action.scope.credential_reference_ids {
-            if !catalog
-                .credential_references
+        if !self.action.scope.credential_reference_ids.is_empty() {
+            for reference_id in &self.action.scope.credential_reference_ids {
+                if !catalog
+                    .credential_references
+                    .iter()
+                    .any(|item| item.metadata.id == *reference_id)
+                {
+                    return Err(ApprovalError::MissingReference("credential_reference_id"));
+                }
+            }
+            let account_id = agent
+                .account_id
+                .ok_or(ApprovalError::CredentialAccountRequired)?;
+            let account = catalog
+                .accounts
                 .iter()
-                .any(|item| item.metadata.id == *reference_id)
-            {
-                return Err(ApprovalError::MissingReference("credential_reference_id"));
+                .find(|item| item.metadata.id == account_id)
+                .ok_or(ApprovalError::MissingReference("account_id"))?;
+            let account_reference = account
+                .credential_reference_id
+                .ok_or(ApprovalError::AccountCredentialRequired)?;
+            for reference_id in &self.action.scope.credential_reference_ids {
+                if *reference_id != account_reference {
+                    return Err(ApprovalError::CredentialAccountMismatch);
+                }
             }
         }
         validate_action(&self.action, parent_policy)
@@ -228,7 +267,12 @@ fn canonical_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PermissionLevel, PolicyCeiling};
+    use crate::{
+        Account, AccountId, AgentInstance, AgentProvider, AgentProviderId, CredentialBackend,
+        CredentialReference, EntityLifecycle, EntityMetadata, IdentityCatalog, Model, ModelId,
+        ModelProvider, ModelProviderId, NormalizedRunState, PermissionLevel, PolicyCeiling,
+        Project, Provenance, Run, Session, SessionId,
+    };
 
     fn policy(layer: PolicyLayer, level: PermissionLevel, persistent: bool) -> ScopedPolicy {
         ScopedPolicy {
@@ -272,6 +316,176 @@ mod tests {
             200,
             action(),
             &policy(PolicyLayer::RoleOrAgent, PermissionLevel::Use, true),
+        )
+        .unwrap()
+    }
+
+    fn metadata<I>(id: I) -> EntityMetadata<I> {
+        EntityMetadata {
+            id,
+            revision: 0,
+            created_at: "2026-09-09T00:00:00Z".into(),
+            updated_at: "2026-09-09T00:00:00Z".into(),
+            provenance: Provenance {
+                source_kind: "test".into(),
+                source_id: "approval".into(),
+                recorded_by: "test".into(),
+            },
+            lifecycle: EntityLifecycle::Active,
+        }
+    }
+
+    fn bound_catalog() -> IdentityCatalog {
+        let own_credential = CredentialReferenceId::from_bytes([10; 16]);
+        let other_credential = CredentialReferenceId::from_bytes([11; 16]);
+        let account_id = AccountId::from_bytes([12; 16]);
+        let other_account_id = AccountId::from_bytes([17; 16]);
+        let agent_id = AgentInstanceId::from_bytes([1; 16]);
+        let other_agent_id = AgentInstanceId::from_bytes([6; 16]);
+        let project_id = ProjectId::from_bytes([3; 16]);
+        let other_project_id = ProjectId::from_bytes([13; 16]);
+        let session_id = SessionId::from_bytes([7; 16]);
+        let other_agent_session_id = SessionId::from_bytes([8; 16]);
+        let other_project_session_id = SessionId::from_bytes([9; 16]);
+        let agent_provider_id = AgentProviderId::from_bytes([2; 16]);
+        let model_provider_id = ModelProviderId::from_bytes([18; 16]);
+        let model_id = ModelId::from_bytes([16; 16]);
+        let project_policy = policy(PolicyLayer::Project, PermissionLevel::Use, true);
+        let catalog = IdentityCatalog {
+            credential_references: vec![
+                CredentialReference {
+                    metadata: metadata(own_credential),
+                    backend: CredentialBackend::MacosKeychain,
+                    service: "test.own".into(),
+                    account_label: "own".into(),
+                },
+                CredentialReference {
+                    metadata: metadata(other_credential),
+                    backend: CredentialBackend::MacosKeychain,
+                    service: "test.other".into(),
+                    account_label: "other".into(),
+                },
+            ],
+            agent_providers: vec![AgentProvider {
+                metadata: metadata(agent_provider_id),
+                adapter_kind: "test_adapter".into(),
+                display_name: "Test adapter".into(),
+            }],
+            model_providers: vec![ModelProvider {
+                metadata: metadata(model_provider_id),
+                provider_key: "test-model-provider".into(),
+                display_name: "Test model provider".into(),
+            }],
+            accounts: vec![
+                Account {
+                    metadata: metadata(account_id),
+                    agent_provider_id,
+                    provider_identity: "own-account".into(),
+                    credential_reference_id: Some(own_credential),
+                },
+                Account {
+                    metadata: metadata(other_account_id),
+                    agent_provider_id,
+                    provider_identity: "other-account".into(),
+                    credential_reference_id: Some(other_credential),
+                },
+            ],
+            models: vec![Model {
+                metadata: metadata(model_id),
+                model_provider_id,
+                provider_model_id: "test-model".into(),
+                reasoning_controls: Vec::new(),
+            }],
+            agent_instances: vec![
+                AgentInstance {
+                    metadata: metadata(agent_id),
+                    agent_provider_id,
+                    account_id: Some(account_id),
+                    default_model_id: None,
+                },
+                AgentInstance {
+                    metadata: metadata(other_agent_id),
+                    agent_provider_id,
+                    account_id: Some(other_account_id),
+                    default_model_id: None,
+                },
+            ],
+            projects: vec![
+                Project {
+                    metadata: metadata(project_id),
+                    name: "own project".into(),
+                    workspace_root: "/own".into(),
+                    policy: project_policy.clone(),
+                },
+                Project {
+                    metadata: metadata(other_project_id),
+                    name: "other project".into(),
+                    workspace_root: "/other".into(),
+                    policy: project_policy,
+                },
+            ],
+            sessions: vec![
+                Session {
+                    metadata: metadata(session_id),
+                    agent_instance_id: agent_id,
+                    project_id,
+                    provider_session_id: None,
+                },
+                Session {
+                    metadata: metadata(other_agent_session_id),
+                    agent_instance_id: other_agent_id,
+                    project_id,
+                    provider_session_id: None,
+                },
+                Session {
+                    metadata: metadata(other_project_session_id),
+                    agent_instance_id: agent_id,
+                    project_id: other_project_id,
+                    provider_session_id: None,
+                },
+            ],
+            runs: vec![
+                Run {
+                    metadata: metadata(RunId::from_bytes([4; 16])),
+                    session_id,
+                    model_id,
+                    state: NormalizedRunState::Starting,
+                    started_at: None,
+                    finished_at: None,
+                },
+                Run {
+                    metadata: metadata(RunId::from_bytes([14; 16])),
+                    session_id: other_agent_session_id,
+                    model_id,
+                    state: NormalizedRunState::Starting,
+                    started_at: None,
+                    finished_at: None,
+                },
+                Run {
+                    metadata: metadata(RunId::from_bytes([15; 16])),
+                    session_id: other_project_session_id,
+                    model_id,
+                    state: NormalizedRunState::Starting,
+                    started_at: None,
+                    finished_at: None,
+                },
+            ],
+            ..IdentityCatalog::default()
+        };
+        catalog.validate().unwrap();
+        catalog
+    }
+
+    fn bound_request() -> ApprovalRequest {
+        let mut action = action();
+        action.role_id = None;
+        action.scope.credential_reference_ids = vec![CredentialReferenceId::from_bytes([10; 16])];
+        ApprovalRequest::create(
+            ApprovalRequestId::from_bytes([5; 16]),
+            100,
+            200,
+            action,
+            &policy(PolicyLayer::Project, PermissionLevel::Use, true),
         )
         .unwrap()
     }
@@ -366,5 +580,96 @@ mod tests {
                 actor: "local-user".into(),
             })
             .unwrap();
+    }
+
+    #[test]
+    fn matching_own_credential_and_run_scope_succeeds() {
+        bound_request().validate_against(&bound_catalog()).unwrap();
+    }
+
+    #[test]
+    fn other_account_credential_is_rejected() {
+        let mut request = bound_request();
+        request.action.scope.credential_reference_ids =
+            vec![CredentialReferenceId::from_bytes([11; 16])];
+        request.request_hash = canonical_hash(
+            request.id,
+            request.created_at_ms,
+            request.expires_at_ms,
+            &request.action,
+        );
+        assert_eq!(
+            request.validate_against(&bound_catalog()),
+            Err(ApprovalError::CredentialAccountMismatch)
+        );
+    }
+
+    #[test]
+    fn credential_scope_without_an_account_is_rejected() {
+        let request = bound_request();
+        let mut catalog = bound_catalog();
+        catalog.agent_instances[0].account_id = None;
+        catalog.validate().unwrap();
+        assert_eq!(
+            request.validate_against(&catalog),
+            Err(ApprovalError::CredentialAccountRequired)
+        );
+    }
+
+    #[test]
+    fn credential_scope_without_an_account_reference_is_rejected() {
+        let request = bound_request();
+        let mut catalog = bound_catalog();
+        catalog.accounts[0].credential_reference_id = None;
+        catalog.validate().unwrap();
+        assert_eq!(
+            request.validate_against(&catalog),
+            Err(ApprovalError::AccountCredentialRequired)
+        );
+    }
+
+    #[test]
+    fn run_for_another_agent_is_rejected() {
+        let mut request = bound_request();
+        request.action.scope.run_id = Some(RunId::from_bytes([14; 16]));
+        request.request_hash = canonical_hash(
+            request.id,
+            request.created_at_ms,
+            request.expires_at_ms,
+            &request.action,
+        );
+        assert_eq!(
+            request.validate_against(&bound_catalog()),
+            Err(ApprovalError::RunAgentMismatch)
+        );
+    }
+
+    #[test]
+    fn run_for_another_project_is_rejected() {
+        let mut request = bound_request();
+        request.action.scope.run_id = Some(RunId::from_bytes([15; 16]));
+        request.request_hash = canonical_hash(
+            request.id,
+            request.created_at_ms,
+            request.expires_at_ms,
+            &request.action,
+        );
+        assert_eq!(
+            request.validate_against(&bound_catalog()),
+            Err(ApprovalError::RunProjectMismatch)
+        );
+    }
+
+    #[test]
+    fn matching_run_scope_succeeds_without_a_credential_scope() {
+        let mut request = bound_request();
+        request.action.scope.credential_reference_ids.clear();
+        request.request_hash = canonical_hash(
+            request.id,
+            request.created_at_ms,
+            request.expires_at_ms,
+            &request.action,
+        );
+        request.validate_against(&bound_catalog()).unwrap();
     }
 }

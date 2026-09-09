@@ -29,6 +29,22 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-09 approval identity binding slice
+
+Approval validation now resolves the acting Agent's exact Account and requires
+every scoped credential reference to match that Account's reference. Missing
+account/reference and cross-account scopes fail closed. An optional run scope
+must resolve through its Session to the same Agent and Project; globally existing
+but unrelated IDs are insufficient. Seven focused cases use a validated identity
+catalog, including another real Account, accountless/reference-less negatives,
+cross-Agent/cross-Project runs, and matching positive controls.
+
+Local core tests (48), full workspace tests, formatting, and warnings-denied
+Clippy pass. This does not implement native credential storage, a credential
+grant lifecycle, launch-time grant consumption, or selected-account provider
+authentication. Those remain open M2 work; no credential access or provider run
+is needed for these fixture checks.
+
 ### 2026-09-09 authenticated local IPC slice
 
 Production desktop/daemon traffic now uses Unix-domain sockets on macOS/Linux
@@ -52,7 +68,10 @@ errors. Local macOS workspace tests, Clippy, formatting, and a compiled-daemon
 smoke passed. The smoke covers readiness, suspend/resume, checkpoint rejection,
 graceful restart, forced termination/restart, and stable identity without starting
 providers. Windows compilation/runtime and Linux runtime verification remain
-pending CI; a real second-account denial test is also outstanding. No credential
+pending in the original local snapshot; follow-up CI run `34317757966` for
+`c5d6e71` passed all ten jobs, including Rust/Clippy, desktop build and compiled
+IPC lifecycle/recovery smoke on all three platforms. A real second-account
+denial test is still outstanding. No credential
 endpoint or real-provider canary was introduced or executed. M2 remains open.
 
 The preceding `1aa4ba1` daemon-execution fixture correction passed all ten jobs
