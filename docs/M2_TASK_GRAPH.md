@@ -95,6 +95,15 @@ explicit user approval. No real provider work was started by that attempt.
 Cross-platform CI and live-provider evidence for this new slice remain separate
 from these local results. M2 and M3 remain open for the requirements listed above.
 
+CI run `34314839204` for `41e9ae8` completed with Linux and seven other jobs
+passing, but macOS and Windows failed test scheduling assumptions. macOS hit a
+30–80 ms deadline before an expected nonterminal observation. Windows committed
+the unrelated sibling between cancel revision capture and preflight, correctly
+returning 409. The follow-up tests inspect exact deadline preservation/expiry and
+settle the sibling before testing the post-preflight terminal race; production
+timeouts and CAS checks are unchanged. The corrected workspace tests pass locally;
+the new cross-platform run must still establish the correction remotely.
+
 - M2.1a contract primitives: committed as `774d075`; typed IDs, durable metadata, opaque
   credential references, policy inheritance, and versioned normalized adapter wire types have
   passing tests.

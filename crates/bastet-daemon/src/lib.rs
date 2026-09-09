@@ -3432,7 +3432,7 @@ mod tests {
             let (terminal_state, failure, output_markdown) = if receipt.adapter_kind == "codex_cli"
             {
                 if let Some(accepted) = self.cancel_codex {
-                    let request = control.recv_timeout(Duration::from_secs(2)).unwrap();
+                    let request = control.recv_timeout(Duration::from_secs(10)).unwrap();
                     assert_eq!(request.run_id(), receipt.run_id);
                     request.acknowledge(accepted);
                     if accepted {
@@ -3686,6 +3686,17 @@ mod tests {
             .find(|(_, adapter)| adapter == "codex_cli")
             .unwrap()
             .0;
+        // Settle the unrelated sibling before capturing the cancel revision.
+        // This test targets completion AFTER cancel preflight; a sibling commit
+        // before preflight legitimately makes the request stale (HTTP 409).
+        wait_until(|| {
+            store
+                .graph_execution(execution_id)
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|node| node.state == bastet_core::GraphNodeState::Succeeded)
+        });
         store
             .record_provider_running(codex_run, Some("fixture-codex-session"))
             .unwrap();

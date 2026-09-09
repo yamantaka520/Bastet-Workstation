@@ -321,7 +321,6 @@ mod tests {
     use std::{
         process::{Command, Stdio},
         sync::mpsc::{self, Sender},
-        thread,
     };
 
     #[cfg(unix)]
@@ -356,21 +355,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn repeated_short_polls_do_not_extend_the_stdio_inactivity_deadline() {
-        let (mut transport, _sender) = clock_transport(Duration::from_millis(80));
-        assert_eq!(
-            transport
-                .poll_notification(Duration::from_millis(15))
-                .unwrap(),
-            None
-        );
-        thread::sleep(Duration::from_millis(25));
-        assert_eq!(
-            transport
-                .poll_notification(Duration::from_millis(15))
-                .unwrap(),
-            None
-        );
-        thread::sleep(Duration::from_millis(35));
+        let (mut transport, _sender) = clock_transport(Duration::from_secs(10));
+        assert_eq!(transport.poll_notification(Duration::ZERO).unwrap(), None);
+        let deadline = transport.notification_deadline;
+        for _ in 0..3 {
+            assert_eq!(transport.poll_notification(Duration::ZERO).unwrap(), None);
+            assert_eq!(transport.notification_deadline, deadline);
+        }
+        // Exercise expiry without depending on the runner's scheduling latency.
+        transport.notification_deadline = Some(Instant::now() - Duration::from_secs(1));
         assert_eq!(
             transport.poll_notification(Duration::ZERO).unwrap_err(),
             TransportError::TimedOut
@@ -380,38 +373,29 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn rpc_and_queued_notification_activity_renew_the_stdio_deadline() {
-        let (mut transport, sender) = clock_transport(Duration::from_millis(50));
-        assert_eq!(
-            transport
-                .poll_notification(Duration::from_millis(5))
-                .unwrap(),
-            None
-        );
-        thread::sleep(Duration::from_millis(30));
+        let (mut transport, sender) = clock_transport(Duration::from_secs(10));
+        transport.notification_deadline = Some(Instant::now() - Duration::from_secs(1));
         sender
             .send(Ok(json!({"method": "turn/started", "params": {}})))
             .unwrap();
         sender.send(Ok(json!({"id": 0, "result": {}}))).unwrap();
         transport.request("test/request", json!({})).unwrap();
-        thread::sleep(Duration::from_millis(30));
+        assert!(transport.notification_deadline.unwrap() > Instant::now());
+        transport.notification_deadline = Some(Instant::now() - Duration::from_secs(1));
         assert_eq!(
             transport.next_notification().unwrap().method,
             "turn/started"
         );
+        assert!(transport.notification_deadline.unwrap() > Instant::now());
         assert_eq!(transport.poll_notification(Duration::ZERO).unwrap(), None);
     }
 
     #[cfg(unix)]
     #[test]
     fn legacy_next_notification_honors_an_elapsed_stdio_deadline() {
-        let (mut transport, _sender) = clock_transport(Duration::from_millis(30));
-        assert_eq!(
-            transport
-                .poll_notification(Duration::from_millis(5))
-                .unwrap(),
-            None
-        );
-        thread::sleep(Duration::from_millis(35));
+        let (mut transport, _sender) = clock_transport(Duration::from_secs(10));
+        assert_eq!(transport.poll_notification(Duration::ZERO).unwrap(), None);
+        transport.notification_deadline = Some(Instant::now() - Duration::from_secs(1));
         assert_eq!(
             transport.next_notification().unwrap_err(),
             TransportError::TimedOut
@@ -421,15 +405,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bounded_request_times_out_without_accepting_a_late_response() {
-        let (mut transport, sender) = clock_transport(Duration::from_millis(50));
-        let started = Instant::now();
+        let (mut transport, sender) = clock_transport(Duration::from_secs(10));
         assert_eq!(
             transport
                 .request_with_timeout("turn/interrupt", json!({}), Duration::ZERO)
                 .unwrap_err(),
             TransportError::TimedOut
         );
-        assert!(started.elapsed() <= Duration::from_millis(50));
+        assert_eq!(transport.abandoned_request_ids, VecDeque::from([0]));
         // Request 0 timed out. Its eventual response must be discarded while
         // request 1 waits, rather than being treated as request 1's success.
         sender
