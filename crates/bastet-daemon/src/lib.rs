@@ -41,7 +41,7 @@ use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -116,6 +116,7 @@ struct ProviderRunBinding {
     provider_model: String,
     workspace_root: String,
     prompt: String,
+    launch_identity: bastet_protocol::ProviderLaunchIdentity,
 }
 
 pub trait RunController: Send + Sync + 'static {
@@ -809,6 +810,62 @@ impl Store {
                 actual,
             });
         }
+        // Generic catalog editing cannot rewrite daemon-owned run/session
+        // identity or lifecycle. Dedicated run operations retain authority.
+        let previous: IdentityCatalog =
+            serde_json::from_str(&transaction.query_row::<String, _, _>(
+                "SELECT catalog_json FROM identity_catalog WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?)?;
+        for previous_run in &previous.runs {
+            let previous_session = previous
+                .sessions
+                .iter()
+                .find(|session| session.metadata.id == previous_run.session_id)
+                .ok_or(StoreError::RunNotFound)?;
+            if command
+                .catalog
+                .runs
+                .iter()
+                .find(|run| run.metadata.id == previous_run.metadata.id)
+                != Some(previous_run)
+                || command
+                    .catalog
+                    .sessions
+                    .iter()
+                    .find(|session| session.metadata.id == previous_session.metadata.id)
+                    != Some(previous_session)
+            {
+                return Err(StoreError::InvalidRunState(
+                    "daemon-owned run or session cannot be replaced".into(),
+                ));
+            }
+        }
+        for run in &command.catalog.runs {
+            if !previous
+                .runs
+                .iter()
+                .any(|previous| previous.metadata.id == run.metadata.id)
+                && (run.state != bastet_core::NormalizedRunState::Starting
+                    || run.started_at.is_some())
+            {
+                return Err(StoreError::InvalidRunState(
+                    "catalog cannot introduce an active provider run".into(),
+                ));
+            }
+        }
+        let m3: M3Catalog = serde_json::from_str(&transaction.query_row::<String, _, _>(
+            "SELECT catalog_json FROM m3_catalog WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?)?;
+        M3State {
+            catalog: m3,
+            graph_executions: load_graph_executions(&transaction)?,
+        }
+        .validate(&command.catalog)
+        .map_err(|error| StoreError::InvalidM3(error.to_string()))?;
         let revision = actual + 1;
         transaction.execute(
             "UPDATE identity_catalog SET revision = ?1, catalog_json = ?2, updated_at = ?3
@@ -1955,6 +2012,90 @@ impl Store {
         self.begin_graph_node_run_inner(id, command, Some(expected_binding))
     }
 
+    /// Recheck the receipt and current selection just before handing work to a
+    /// provider runner. The persisted selection is not an authentication grant.
+    fn preflight_provider_launch(
+        &self,
+        receipt: &BeginGraphNodeRunReceipt,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection()?;
+        let selected = load_launch_identity(&connection, receipt.run_id)?
+            .ok_or_else(|| StoreError::InvalidRunState("launch selection unavailable".into()))?;
+        if receipt.launch_identity.as_ref() != Some(&selected)
+            || receipt.adapter_kind != selected.adapter_kind
+            || receipt.model != selected.model
+        {
+            return Err(StoreError::InvalidRunState(
+                "launch receipt differs from durable selection".into(),
+            ));
+        }
+        let (execution_id, node_id): (String, String) = connection.query_row(
+            "SELECT execution_id, node_id FROM graph_node_runs WHERE run_id=?1",
+            [receipt.run_id.value().to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if execution_id != receipt.execution_id.value().to_string()
+            || node_id != receipt.node_id.value().to_string()
+        {
+            return Err(StoreError::InvalidRunState(
+                "launch receipt belongs to another node".into(),
+            ));
+        }
+        let identity: IdentityCatalog =
+            serde_json::from_str(&connection.query_row::<String, _, _>(
+                "SELECT catalog_json FROM identity_catalog WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?)?;
+        let run = identity
+            .runs
+            .iter()
+            .find(|run| run.metadata.id == receipt.run_id)
+            .ok_or(StoreError::RunNotFound)?;
+        let session = identity
+            .sessions
+            .iter()
+            .find(|session| session.metadata.id == run.session_id)
+            .ok_or(StoreError::RunNotFound)?;
+        if run.state != bastet_core::NormalizedRunState::Starting
+            || run.session_id != receipt.session_id
+            || run.model_id != selected.model_id
+            || session.agent_instance_id != selected.agent_instance_id
+            || session.project_id != selected.project_id
+        {
+            return Err(StoreError::InvalidRunState(
+                "launch run identity changed".into(),
+            ));
+        }
+        let m3: M3Catalog = serde_json::from_str(&connection.query_row::<String, _, _>(
+            "SELECT catalog_json FROM m3_catalog WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?)?;
+        let execution: GraphExecution =
+            serde_json::from_str(&connection.query_row::<String, _, _>(
+                "SELECT execution_json FROM graph_executions WHERE execution_id=?1",
+                [execution_id],
+                |row| row.get(0),
+            )?)?;
+        let binding = resolve_provider_run_binding(&identity, &m3, &execution, receipt.node_id)?;
+        if binding.launch_identity != selected
+            || binding.workspace_root != receipt.workspace_root
+            || binding.prompt != receipt.prompt
+            || execution
+                .nodes
+                .iter()
+                .find(|node| node.node_id == receipt.node_id)
+                .and_then(|node| node.run_id)
+                != Some(receipt.run_id)
+        {
+            return Err(StoreError::InvalidRunState(
+                "provider launch inputs changed".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn begin_graph_node_run_inner(
         &self,
         id: GraphRunId,
@@ -2049,14 +2190,15 @@ impl Store {
         transaction.execute("UPDATE graph_executions SET revision=?1,execution_json=?2,updated_at=?3 WHERE execution_id=?4",
             params![execution.revision, serde_json::to_string(&execution)?, timestamp(), id.value().to_string()])?;
         transaction.execute(
-            "INSERT INTO graph_node_runs(execution_id, node_id, run_id, attempt, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO graph_node_runs(execution_id, node_id, run_id, attempt, created_at, launch_identity_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 id.value().to_string(),
                 command.node_id.value().to_string(),
                 run_id.value().to_string(),
                 attempt,
-                timestamp()
+                timestamp(),
+                serde_json::to_string(&binding.launch_identity)?
             ],
         )?;
         let event = insert_event(
@@ -2072,6 +2214,7 @@ impl Store {
             node_id: command.node_id,
             session_id,
             run_id,
+            launch_identity: Some(binding.launch_identity),
             adapter_kind: binding.adapter_kind,
             model: binding.provider_model,
             workspace_root: binding.workspace_root,
@@ -2085,7 +2228,7 @@ impl Store {
     pub fn finish_graph_node_run(
         &self,
         id: GraphRunId,
-        command: FinishGraphNodeRunCommand,
+        mut command: FinishGraphNodeRunCommand,
     ) -> Result<FinishGraphNodeRunReceipt, StoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2180,35 +2323,74 @@ impl Store {
             .ok_or(StoreError::RunNotFound)?;
         let agent_id = identity.sessions[session_index].agent_instance_id;
         let project_id = identity.sessions[session_index].project_id;
-        let agent = identity
-            .agent_instances
-            .iter()
-            .find(|agent| agent.metadata.id == agent_id)
-            .ok_or(StoreError::RunNotFound)?;
-        let provider = identity
-            .agent_providers
-            .iter()
-            .find(|provider| provider.metadata.id == agent.agent_provider_id)
-            .ok_or(StoreError::RunNotFound)?
-            .adapter_kind
-            .clone();
-        let account = agent
-            .account_id
-            .and_then(|account_id| {
-                identity
-                    .accounts
-                    .iter()
-                    .find(|account| account.metadata.id == account_id)
-            })
-            .map(|account| account.provider_identity.clone())
-            .unwrap_or_else(|| "local-default".into());
-        let model = identity
-            .models
-            .iter()
-            .find(|model| model.metadata.id == model_id)
-            .ok_or(StoreError::RunNotFound)?
-            .provider_model_id
-            .clone();
+        let (mut launch_identity, mut malformed_selection) =
+            match load_launch_identity(&transaction, command.run_id) {
+                Ok(selected) => (selected, false),
+                Err(StoreError::Serialization(_)) => (None, true),
+                Err(error) => return Err(error),
+            };
+        if launch_identity.as_ref().is_some_and(|selected| {
+            selected.agent_instance_id != agent_id
+                || selected.project_id != project_id
+                || selected.model_id != model_id
+                || selected.adapter_kind.trim().is_empty()
+                || selected.model.trim().is_empty()
+                || selected.account.as_ref().is_some_and(|account| {
+                    account.provider_identity.trim().is_empty()
+                        || account.credential.as_ref().is_some_and(|reference| {
+                            reference.service.trim().is_empty()
+                                || reference.account_label.trim().is_empty()
+                        })
+                })
+        }) {
+            launch_identity = None;
+            malformed_selection = true;
+        }
+        if malformed_selection {
+            // Corrupt metadata cannot strand an owned worker or authorize a
+            // successful result. Preserve the corrupt row for diagnosis, mark
+            // this exact attempt uncertain and discard untrusted attribution.
+            command.terminal_state = bastet_core::NormalizedRunState::Uncertain;
+            command.output_markdown = None;
+            command.provider_session_id = None;
+            command.cost = bastet_core::CostEvidence {
+                evidence_class: bastet_core::EvidenceClass::Unknown,
+                input_tokens: None,
+                output_tokens: None,
+                currency: None,
+                amount: None,
+                confidence: 0.0,
+            };
+            command.failure = Some(AdapterFailure {
+                kind: AdapterFailureKind::Unknown,
+                message_key: "mvp.failure.unknown".into(),
+                retryable: false,
+                provider_code: None,
+                redacted_detail: None,
+            });
+        }
+        let (provider, account, model, attribution_source) = match launch_identity {
+            Some(selected) => (
+                selected.adapter_kind,
+                selected
+                    .account
+                    .map_or_else(|| "unknown".into(), |account| account.provider_identity),
+                selected.model,
+                "adapter normalized cost event; selected account is not provider-authenticated",
+            ),
+            // Forward migration cannot reconstruct historical selected identity
+            // from a mutable catalog. Retain explicit unknowns, not invented data.
+            None => (
+                "unknown".into(),
+                "unknown".into(),
+                "unknown".into(),
+                if malformed_selection {
+                    "local recovery; malformed launch selection; attribution unavailable"
+                } else {
+                    "adapter normalized cost event; legacy launch attribution unavailable"
+                },
+            ),
+        };
         let graph_state = match command.terminal_state {
             bastet_core::NormalizedRunState::Succeeded => GraphNodeState::Succeeded,
             bastet_core::NormalizedRunState::Failed => GraphNodeState::Failed,
@@ -2285,7 +2467,7 @@ impl Store {
             input_tokens: command.cost.input_tokens,
             output_tokens: command.cost.output_tokens,
             evidence_class: command.cost.evidence_class,
-            source: "adapter normalized cost event".into(),
+            source: attribution_source.into(),
             formula_version: None,
             confidence: command.cost.confidence,
             reconciliation_state: if graph_state == GraphNodeState::Uncertain {
@@ -2321,7 +2503,7 @@ impl Store {
         )?;
         transaction.execute("UPDATE graph_executions SET revision=?1,execution_json=?2,updated_at=?3 WHERE execution_id=?4",
             params![execution.revision, serde_json::to_string(&execution)?, timestamp(), id.value().to_string()])?;
-        transaction.execute(
+        let finished_rows = transaction.execute(
             "UPDATE graph_node_runs
              SET finished_at=?1, terminal_state=?2, failure_json=?3
              WHERE run_id=?4",
@@ -2332,6 +2514,9 @@ impl Store {
                 command.run_id.value().to_string()
             ],
         )?;
+        if finished_rows != 1 {
+            return Err(StoreError::RunNotFound);
+        }
         if let Some(output) = &output {
             transaction.execute(
                 "INSERT INTO graph_node_outputs(
@@ -2957,6 +3142,16 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StoreError> {
         )?;
         transaction.commit()?;
     }
+    if current < 9 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction
+            .execute_batch("ALTER TABLE graph_node_runs ADD COLUMN launch_identity_json TEXT;")?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (9, ?1)",
+            [timestamp()],
+        )?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -3043,6 +3238,19 @@ fn m3_is_unconfigured(catalog: &M3Catalog) -> bool {
         && catalog.deliverables == bastet_core::DeliverableCatalog::default()
 }
 
+fn load_launch_identity(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<Option<bastet_protocol::ProviderLaunchIdentity>, StoreError> {
+    let json: Option<String> = connection.query_row(
+        "SELECT launch_identity_json FROM graph_node_runs WHERE run_id=?1",
+        [run_id.value().to_string()],
+        |row| row.get(0),
+    )?;
+    json.map(|json| serde_json::from_str(&json).map_err(StoreError::from))
+        .transpose()
+}
+
 fn resolve_provider_run_binding(
     identity: &IdentityCatalog,
     m3: &M3Catalog,
@@ -3099,6 +3307,53 @@ fn resolve_provider_run_binding(
         .find(|project| project.metadata.id == meeting.project_id)
         .ok_or_else(|| StoreError::InvalidMvp("project not found".into()))?;
 
+    let account = agent
+        .account_id
+        .map(|account_id| {
+            let account = identity
+                .accounts
+                .iter()
+                .find(|account| account.metadata.id == account_id)
+                .ok_or_else(|| StoreError::InvalidMvp("selected account not found".into()))?;
+            if account.agent_provider_id != agent.agent_provider_id {
+                return Err(StoreError::InvalidMvp(
+                    "selected account provider differs".into(),
+                ));
+            }
+            let credential = account
+                .credential_reference_id
+                .map(|reference_id| {
+                    let reference = identity
+                        .credential_references
+                        .iter()
+                        .find(|reference| reference.metadata.id == reference_id)
+                        .ok_or_else(|| {
+                            StoreError::InvalidMvp("selected credential reference not found".into())
+                        })?;
+                    Ok::<_, StoreError>(bastet_protocol::ProviderCredentialSelection {
+                        reference_id,
+                        backend: reference.backend.clone(),
+                        service: reference.service.clone(),
+                        account_label: reference.account_label.clone(),
+                    })
+                })
+                .transpose()?;
+            Ok::<_, StoreError>(bastet_protocol::ProviderAccountSelection {
+                account_id,
+                provider_identity: account.provider_identity.clone(),
+                credential,
+            })
+        })
+        .transpose()?;
+    let launch_identity = bastet_protocol::ProviderLaunchIdentity {
+        agent_instance_id: agent.metadata.id,
+        agent_provider_id: agent.agent_provider_id,
+        project_id: meeting.project_id,
+        model_id,
+        adapter_kind: provider.adapter_kind.clone(),
+        model: model.provider_model_id.clone(),
+        account,
+    };
     Ok(ProviderRunBinding {
         agent_instance_id: agent.metadata.id,
         project_id: meeting.project_id,
@@ -3107,6 +3362,7 @@ fn resolve_provider_run_binding(
         provider_model: model.provider_model_id.clone(),
         workspace_root: project.workspace_root.clone(),
         prompt: graph_node_prompt(execution, definition, &baseline.content)?,
+        launch_identity,
     })
 }
 
@@ -4010,6 +4266,466 @@ mod tests {
     }
 
     #[test]
+    fn account_selection_and_locator_changes_invalidate_provider_begin() {
+        for change_locator in [false, true] {
+            let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
+            let graph = store.graph_execution(execution_id).unwrap();
+            let node_id = graph.nodes[0].node_id;
+            attach_selected_account(&store, execution_id, node_id);
+            let catalog = store.catalog().unwrap();
+            let binding = resolve_provider_run_binding(
+                &catalog.catalog,
+                &store.m3_catalog().unwrap().catalog,
+                &graph,
+                node_id,
+            )
+            .unwrap();
+            let mut changed = catalog.catalog;
+            if change_locator {
+                changed.credential_references[0].account_label = "another-os-store-entry".into();
+            } else {
+                changed
+                    .agent_instances
+                    .iter_mut()
+                    .find(|agent| agent.metadata.id == binding.agent_instance_id)
+                    .unwrap()
+                    .account_id = None;
+            }
+            store
+                .replace_catalog(ReplaceCatalogCommand {
+                    expected_revision: catalog.revision,
+                    catalog: changed,
+                })
+                .unwrap();
+            assert!(matches!(
+                store.begin_provider_graph_node_run(
+                    execution_id,
+                    BeginGraphNodeRunCommand {
+                        expected_catalog_revision: store.catalog().unwrap().revision,
+                        expected_graph_revision: graph.revision,
+                        node_id,
+                        owner: provider_executor::owner(node_id),
+                    },
+                    &binding
+                ),
+                Err(StoreError::InvalidRunState(_))
+            ));
+            assert!(store.catalog().unwrap().catalog.runs.is_empty());
+            assert_eq!(store.graph_execution(execution_id).unwrap(), graph);
+        }
+    }
+
+    // Models a pre-existing legacy database for recovery/cancellation tests.
+    // The current public catalog API must never create a fake active worker.
+    fn seed_legacy_active_catalog(store: &Store, catalog: &IdentityCatalog) {
+        catalog.validate().unwrap();
+        assert_eq!(store.connection().unwrap().execute(
+            "UPDATE identity_catalog SET revision=1,catalog_json=?1 WHERE singleton=1 AND revision=0",
+            [serde_json::to_string(catalog).unwrap()],
+        ).unwrap(), 1);
+    }
+
+    fn attach_selected_account(store: &Store, execution_id: GraphRunId, node_id: GraphNodeId) {
+        let mut catalog = store.catalog().unwrap();
+        let binding = resolve_provider_run_binding(
+            &catalog.catalog,
+            &store.m3_catalog().unwrap().catalog,
+            &store.graph_execution(execution_id).unwrap(),
+            node_id,
+        )
+        .unwrap();
+        let account_id = AccountId::new();
+        let reference_id = CredentialReferenceId::new();
+        let agent = catalog
+            .catalog
+            .agent_instances
+            .iter_mut()
+            .find(|agent| agent.metadata.id == binding.agent_instance_id)
+            .unwrap();
+        agent.account_id = Some(account_id);
+        catalog.catalog.accounts.push(Account {
+            metadata: metadata(account_id),
+            agent_provider_id: agent.agent_provider_id,
+            provider_identity: "selected-account-before-run".into(),
+            credential_reference_id: Some(reference_id),
+        });
+        catalog
+            .catalog
+            .credential_references
+            .push(CredentialReference {
+                metadata: metadata(reference_id),
+                backend: CredentialBackend::MacosKeychain,
+                service: "fixture-only-service".into(),
+                account_label: "fixture-only-locator".into(),
+            });
+        store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: catalog.revision,
+                catalog: catalog.catalog,
+            })
+            .unwrap();
+    }
+
+    fn begin_fixture_node(store: &Store, execution_id: GraphRunId) -> BeginGraphNodeRunReceipt {
+        let graph = store.graph_execution(execution_id).unwrap();
+        let node_id = graph.nodes[0].node_id;
+        store
+            .begin_graph_node_run(
+                execution_id,
+                BeginGraphNodeRunCommand {
+                    expected_catalog_revision: store.catalog().unwrap().revision,
+                    expected_graph_revision: graph.revision,
+                    node_id,
+                    owner: provider_executor::owner(node_id),
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn provider_preflight_requires_durable_receipt_and_unchanged_selected_account() {
+        let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
+        let node_id = store.graph_execution(execution_id).unwrap().nodes[0].node_id;
+        attach_selected_account(&store, execution_id, node_id);
+        let receipt = begin_fixture_node(&store, execution_id);
+        store.preflight_provider_launch(&receipt).unwrap();
+        let mut tampered = receipt.clone();
+        tampered.launch_identity = None;
+        assert!(store.preflight_provider_launch(&tampered).is_err());
+        tampered = receipt.clone();
+        tampered.model = "not-selected".into();
+        assert!(store.preflight_provider_launch(&tampered).is_err());
+        tampered = receipt.clone();
+        tampered.session_id = bastet_core::SessionId::new();
+        assert!(store.preflight_provider_launch(&tampered).is_err());
+        let mut catalog = store.catalog().unwrap();
+        catalog.catalog.accounts[0].provider_identity = "changed-before-spawn".into();
+        store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: catalog.revision,
+                catalog: catalog.catalog,
+            })
+            .unwrap();
+        assert!(store.preflight_provider_launch(&receipt).is_err());
+    }
+
+    #[test]
+    fn completion_uses_immutable_selected_attribution_not_current_catalog() {
+        let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
+        let node_id = store.graph_execution(execution_id).unwrap().nodes[0].node_id;
+        attach_selected_account(&store, execution_id, node_id);
+        let receipt = begin_fixture_node(&store, execution_id);
+        let selected = receipt.launch_identity.clone().unwrap();
+        let mut catalog = store.catalog().unwrap();
+        catalog.catalog.accounts[0].provider_identity = "changed-after-spawn".into();
+        catalog
+            .catalog
+            .models
+            .iter_mut()
+            .find(|model| model.metadata.id == selected.model_id)
+            .unwrap()
+            .provider_model_id = "changed-model-after-spawn".into();
+        store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: catalog.revision,
+                catalog: catalog.catalog,
+            })
+            .unwrap();
+        finish_fixture_node(&store, &receipt);
+        let m3 = store.m3_catalog().unwrap();
+        let record = m3
+            .catalog
+            .deliverables
+            .costs
+            .iter()
+            .find(|record| record.run_id == receipt.run_id)
+            .unwrap();
+        assert_eq!(record.account, "selected-account-before-run");
+        assert_eq!(record.model, selected.model);
+        assert!(record.source.contains("not provider-authenticated"));
+        assert_eq!(
+            load_launch_identity(&store.connection().unwrap(), receipt.run_id).unwrap(),
+            Some(selected)
+        );
+    }
+
+    fn finish_fixture_node(store: &Store, receipt: &BeginGraphNodeRunReceipt) {
+        store
+            .finish_graph_node_run(
+                receipt.execution_id,
+                FinishGraphNodeRunCommand {
+                    expected_catalog_revision: store.catalog().unwrap().revision,
+                    expected_graph_revision: store
+                        .graph_execution(receipt.execution_id)
+                        .unwrap()
+                        .revision,
+                    expected_m3_revision: store.m3_catalog().unwrap().revision,
+                    node_id: receipt.node_id,
+                    run_id: receipt.run_id,
+                    owner: provider_executor::owner(receipt.node_id),
+                    terminal_state: bastet_core::NormalizedRunState::Succeeded,
+                    failure: None,
+                    provider_session_id: None,
+                    output_markdown: Some("# Fixture\n\nBounded local fixture evidence.".into()),
+                    cost: cost(1),
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn legacy_missing_launch_selection_does_not_invent_account_attribution() {
+        let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
+        let receipt = begin_fixture_node(&store, execution_id);
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE graph_node_runs SET launch_identity_json=NULL WHERE run_id=?1",
+                [receipt.run_id.value().to_string()],
+            )
+            .unwrap();
+        assert!(store.preflight_provider_launch(&receipt).is_err());
+        finish_fixture_node(&store, &receipt);
+        let costs = store.m3_catalog().unwrap().catalog.deliverables.costs;
+        assert_eq!(costs[0].account, "unknown");
+        assert_eq!(costs[0].provider, "unknown");
+        assert_eq!(costs[0].model, "unknown");
+        assert!(costs[0]
+            .source
+            .contains("legacy launch attribution unavailable"));
+    }
+
+    #[test]
+    fn catalog_replacement_cannot_remove_or_retarget_a_daemon_owned_run() {
+        let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
+        let receipt = begin_fixture_node(&store, execution_id);
+        let snapshot = store.catalog().unwrap();
+        let mut changed = snapshot.catalog.clone();
+        changed.runs.retain(|run| run.metadata.id != receipt.run_id);
+        assert!(store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: snapshot.revision,
+                catalog: changed,
+            })
+            .is_err());
+        let mut changed = snapshot.catalog.clone();
+        let other_agent = changed
+            .agent_instances
+            .iter()
+            .find(|agent| {
+                agent.metadata.id != receipt.launch_identity.as_ref().unwrap().agent_instance_id
+            })
+            .unwrap()
+            .metadata
+            .id;
+        changed
+            .sessions
+            .iter_mut()
+            .find(|session| session.metadata.id == receipt.session_id)
+            .unwrap()
+            .agent_instance_id = other_agent;
+        assert!(store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: snapshot.revision,
+                catalog: changed,
+            })
+            .is_err());
+        assert_eq!(store.catalog().unwrap(), snapshot);
+    }
+
+    #[test]
+    fn malformed_launch_selection_finalizes_exact_attempt_without_blocking_shutdown() {
+        for corrupted in ["not-json".to_string(), "{}".to_string()] {
+            let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
+            let receipt = begin_fixture_node(&store, execution_id);
+            store
+                .connection()
+                .unwrap()
+                .execute(
+                    "UPDATE graph_node_runs SET launch_identity_json=?1 WHERE run_id=?2",
+                    params![corrupted, receipt.run_id.value().to_string()],
+                )
+                .unwrap();
+            assert!(store.preflight_provider_launch(&receipt).is_err());
+            // Even an incoming success must not turn corrupt metadata into a
+            // successful artifact or strand its worker during finalization.
+            finish_fixture_node(&store, &receipt);
+            let catalog = store.catalog().unwrap();
+            assert_eq!(
+                catalog
+                    .catalog
+                    .runs
+                    .iter()
+                    .find(|run| run.metadata.id == receipt.run_id)
+                    .unwrap()
+                    .state,
+                bastet_core::NormalizedRunState::Uncertain
+            );
+            let execution = store.graph_execution(execution_id).unwrap();
+            assert!(execution.output(receipt.node_id).is_none());
+            assert_eq!(
+                execution
+                    .nodes
+                    .iter()
+                    .find(|node| node.node_id == receipt.node_id)
+                    .unwrap()
+                    .state,
+                GraphNodeState::Uncertain
+            );
+            let costs = store.m3_catalog().unwrap().catalog.deliverables.costs;
+            assert_eq!(costs[0].account, "unknown");
+            assert!(costs[0].source.contains("malformed launch selection"));
+            assert_eq!(costs[0].input_tokens, None);
+            store
+                .shutdown(CheckpointCommand {
+                    expected_revision: store.snapshot().unwrap().revision,
+                    reason: "fixture safe shutdown after corruption".into(),
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn malformed_selection_never_reaches_runner_and_executor_can_drain() {
+        let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
+        let receipt = begin_fixture_node(&store, execution_id);
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE graph_node_runs SET launch_identity_json='malformed' WHERE run_id=?1",
+                [receipt.run_id.value().to_string()],
+            )
+            .unwrap();
+        let runner = Arc::new(FixtureProviderRunner::new(None, Duration::from_millis(1)));
+        let registry = RunControllerRegistry::default();
+        let executor = provider_executor::ProviderExecutor::with_runner(
+            store.clone(),
+            registry,
+            runner.clone(),
+        );
+        executor.start(receipt.clone()).unwrap();
+        wait_until(|| !executor.has_active());
+        assert!(runner.started().is_empty());
+        assert_eq!(
+            store
+                .catalog()
+                .unwrap()
+                .catalog
+                .runs
+                .iter()
+                .find(|run| run.metadata.id == receipt.run_id)
+                .unwrap()
+                .state,
+            bastet_core::NormalizedRunState::Uncertain
+        );
+        store
+            .shutdown(CheckpointCommand {
+                expected_revision: store.snapshot().unwrap().revision,
+                reason: "corrupt launch drained".into(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn catalog_cannot_inject_active_work_or_break_persisted_graph_references() {
+        let (_directory, _workspace, store, _execution_id) = provider_execution_fixture();
+        let before = store.catalog().unwrap();
+        let events = store.events_after(0).unwrap();
+        let mut removed = before.catalog.clone();
+        removed.agent_instances.clear();
+        assert!(store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: before.revision,
+                catalog: removed,
+            })
+            .is_err());
+        let mut fabricated = before.catalog.clone();
+        let session_id = bastet_core::SessionId::new();
+        fabricated.sessions.push(bastet_core::Session {
+            metadata: metadata(session_id),
+            agent_instance_id: fabricated.agent_instances[0].metadata.id,
+            project_id: fabricated.projects[0].metadata.id,
+            provider_session_id: None,
+        });
+        fabricated.runs.push(bastet_core::Run {
+            metadata: metadata(RunId::new()),
+            session_id,
+            model_id: fabricated.models[0].metadata.id,
+            state: bastet_core::NormalizedRunState::Running,
+            started_at: Some("2026-09-09T00:00:00Z".into()),
+            finished_at: None,
+        });
+        fabricated.validate().unwrap();
+        assert!(matches!(
+            store.replace_catalog(ReplaceCatalogCommand {
+                expected_revision: before.revision,
+                catalog: fabricated,
+            }),
+            Err(StoreError::InvalidRunState(_))
+        ));
+        assert_eq!(store.catalog().unwrap(), before);
+        assert_eq!(store.events_after(0).unwrap(), events);
+        store
+            .shutdown(CheckpointCommand {
+                expected_revision: store.snapshot().unwrap().revision,
+                reason: "no fabricated worker".into(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn upgrades_v8_without_backfilling_unproven_launch_identity() {
+        let (directory, _workspace, store, execution_id) = provider_execution_fixture();
+        let receipt = begin_fixture_node(&store, execution_id);
+        let connection = store.connection().unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE graph_node_runs DROP COLUMN launch_identity_json;
+             DELETE FROM schema_migrations WHERE version=9;",
+            )
+            .unwrap();
+        let original: (String, u64, String) = connection
+            .query_row(
+                "SELECT run_id, attempt, created_at FROM graph_node_runs WHERE run_id=?1",
+                [receipt.run_id.value().to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        drop(connection);
+        drop(store);
+        let upgraded = Store::open(directory.path().join("provider-execution.db")).unwrap();
+        assert_eq!(upgraded.schema_version().unwrap(), SCHEMA_VERSION);
+        let connection = upgraded.connection().unwrap();
+        assert_eq!(
+            load_launch_identity(&connection, receipt.run_id).unwrap(),
+            None
+        );
+        let preserved: (String, u64, String) = connection
+            .query_row(
+                "SELECT run_id, attempt, created_at FROM graph_node_runs WHERE run_id=?1",
+                [receipt.run_id.value().to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved, original);
+        drop(connection);
+        assert_eq!(
+            upgraded
+                .catalog()
+                .unwrap()
+                .catalog
+                .runs
+                .iter()
+                .find(|run| run.metadata.id == receipt.run_id)
+                .unwrap()
+                .state,
+            bastet_core::NormalizedRunState::Uncertain
+        );
+    }
+
+    #[test]
     fn provider_begin_and_shutdown_are_serialized_by_daemon_lifecycle() {
         let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
         let catalog = store.catalog().unwrap();
@@ -4337,7 +5053,7 @@ mod tests {
         drop(fixture);
 
         let upgraded = Store::open(&path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 8);
+        assert_eq!(upgraded.schema_version().unwrap(), SCHEMA_VERSION);
         let output_table: String = upgraded
             .connection()
             .unwrap()
@@ -4359,7 +5075,7 @@ mod tests {
         let fixture = Connection::open(&path).unwrap();
         fixture
             .execute_batch(
-                "DELETE FROM schema_migrations WHERE version = 8;
+                "DELETE FROM schema_migrations WHERE version >= 8;
                  DROP TABLE graph_node_outputs;
                  DROP TABLE graph_node_runs;
                  CREATE TABLE graph_node_runs (
@@ -4386,7 +5102,7 @@ mod tests {
         drop(fixture);
 
         let upgraded = Store::open(&path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 8);
+        assert_eq!(upgraded.schema_version().unwrap(), SCHEMA_VERSION);
         let connection = upgraded.connection().unwrap();
         let migrated: (u64, String) = connection
             .query_row(
@@ -4577,12 +5293,7 @@ mod tests {
         let mut catalog = catalog_fixture();
         catalog.runs[0].state = bastet_core::NormalizedRunState::Running;
         catalog.runs[0].started_at = Some("2026-09-06T00:00:01Z".into());
-        store
-            .replace_catalog(ReplaceCatalogCommand {
-                expected_revision: 0,
-                catalog,
-            })
-            .unwrap();
+        seed_legacy_active_catalog(&store, &catalog);
         drop(store);
 
         let reopened = Store::open(&path).unwrap();
@@ -4796,12 +5507,7 @@ mod tests {
         catalog.runs[0].state = bastet_core::NormalizedRunState::Running;
         catalog.runs[0].started_at = Some("2026-09-06T00:00:01Z".into());
         let run_id = catalog.runs[0].metadata.id;
-        store
-            .replace_catalog(ReplaceCatalogCommand {
-                expected_revision: 0,
-                catalog,
-            })
-            .unwrap();
+        seed_legacy_active_catalog(&store, &catalog);
         let receipt = store.record_provider_cancel_accepted(run_id, 1).unwrap();
         assert_eq!(receipt.catalog_revision, 2);
         assert_eq!(
@@ -5313,12 +6019,7 @@ mod tests {
         catalog.runs[0].state = bastet_core::NormalizedRunState::Running;
         catalog.runs[0].started_at = Some("2026-09-06T00:00:01Z".into());
         let run_id = catalog.runs[0].metadata.id;
-        store
-            .replace_catalog(ReplaceCatalogCommand {
-                expected_revision: 0,
-                catalog,
-            })
-            .unwrap();
+        seed_legacy_active_catalog(&store, &catalog);
         let command = bastet_protocol::CancelRunCommand {
             run_id,
             expected_catalog_revision: 1,
@@ -5350,12 +6051,7 @@ mod tests {
         catalog.runs[0].state = bastet_core::NormalizedRunState::Running;
         catalog.runs[0].started_at = Some("2026-09-06T00:00:01Z".into());
         let run_id = catalog.runs[0].metadata.id;
-        store
-            .replace_catalog(ReplaceCatalogCommand {
-                expected_revision: 0,
-                catalog,
-            })
-            .unwrap();
+        seed_legacy_active_catalog(&store, &catalog);
         let command = bastet_protocol::CancelRunCommand {
             run_id,
             expected_catalog_revision: 1,

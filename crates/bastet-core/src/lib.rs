@@ -11,6 +11,7 @@ pub mod meeting;
 pub mod mvp;
 pub mod office;
 pub mod policy;
+pub mod process_environment;
 pub mod workspace;
 
 pub use adapter::*;
@@ -24,4 +25,5 @@ pub use meeting::*;
 pub use mvp::*;
 pub use office::*;
 pub use policy::*;
+pub use process_environment::*;
 pub use workspace::*;

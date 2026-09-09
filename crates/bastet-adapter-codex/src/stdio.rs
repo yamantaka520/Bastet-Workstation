@@ -11,6 +11,7 @@ use std::{
 use serde_json::{json, Value};
 
 use crate::{AppServerNotification, AppServerTransport, TransportError};
+use bastet_core::configure_adapter_process_environment;
 
 pub struct StdioTransport {
     child: Child,
@@ -29,7 +30,9 @@ impl StdioTransport {
         if timeout.is_zero() {
             return Err(TransportError::ProtocolDrift);
         }
-        let mut child = Command::new(executable)
+        let mut command = Command::new(executable);
+        configure_adapter_process_environment(&mut command);
+        let mut child = command
             .args(["app-server", "--listen", "stdio://"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

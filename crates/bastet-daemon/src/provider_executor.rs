@@ -170,8 +170,13 @@ impl ProviderExecutor {
                     run_id,
                     active,
                 };
-                let outcome = catch_unwind(AssertUnwindSafe(|| runner.run(&receipt, control)))
-                    .unwrap_or_else(|_| ProviderOutcome::unavailable());
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    if store.preflight_provider_launch(&receipt).is_err() {
+                        return ProviderOutcome::unavailable();
+                    }
+                    runner.run(&receipt, control)
+                }))
+                .unwrap_or_else(|_| ProviderOutcome::unavailable());
                 if persist_outcome(&store, &receipt, outcome).is_err() {
                     eprintln!("provider terminal outcome could not be persisted safely");
                 }
@@ -214,6 +219,28 @@ impl ProviderRunner for SystemProviderRunner {
         receipt: &BeginGraphNodeRunReceipt,
         control: Receiver<CancelRequest>,
     ) -> ProviderOutcome {
+        // A metadata selection must never silently use a different ambient
+        // CLI login. Enable selected accounts only when a credential broker
+        // can bind the exact account/reference/grant to this process.
+        if receipt
+            .launch_identity
+            .as_ref()
+            .is_none_or(|identity| identity.account.is_some())
+        {
+            return ProviderOutcome {
+                terminal_state: NormalizedRunState::Blocked,
+                provider_session_id: None,
+                cost: unknown_cost(),
+                output_markdown: None,
+                failure: Some(AdapterFailure {
+                    kind: AdapterFailureKind::Unsupported,
+                    message_key: "adapter.failure.unsupported".into(),
+                    retryable: false,
+                    provider_code: None,
+                    redacted_detail: None,
+                }),
+            };
+        }
         match receipt.adapter_kind.as_str() {
             "codex_cli" => run_codex(receipt, control, &self.store)
                 .unwrap_or_else(|_| ProviderOutcome::unavailable()),
@@ -537,6 +564,50 @@ fn configured_executable(variable: &str, name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_account_cannot_fall_back_to_ambient_authentication() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = SystemProviderRunner {
+            store: Store::open(directory.path().join("account-boundary.db")).unwrap(),
+        };
+        let identity = bastet_protocol::ProviderLaunchIdentity {
+            agent_instance_id: bastet_core::AgentInstanceId::new(),
+            agent_provider_id: bastet_core::AgentProviderId::new(),
+            project_id: bastet_core::ProjectId::new(),
+            model_id: bastet_core::ModelId::new(),
+            adapter_kind: "nonexistent-fixture-adapter".into(),
+            model: "fixture-model".into(),
+            account: Some(bastet_protocol::ProviderAccountSelection {
+                account_id: bastet_core::AccountId::new(),
+                provider_identity: "selected-not-authenticated".into(),
+                credential: None,
+            }),
+        };
+        let receipt = BeginGraphNodeRunReceipt {
+            protocol_version: bastet_protocol::PROTOCOL_VERSION,
+            execution_id: bastet_core::GraphRunId::new(),
+            node_id: bastet_core::GraphNodeId::new(),
+            session_id: bastet_core::SessionId::new(),
+            run_id: RunId::new(),
+            adapter_kind: identity.adapter_kind.clone(),
+            model: identity.model.clone(),
+            launch_identity: Some(identity),
+            workspace_root: directory.path().display().to_string(),
+            prompt: "fixture never starts a provider".into(),
+            catalog_revision: 0,
+            graph_revision: 0,
+            event_sequence: 0,
+        };
+        let (_sender, control) = mpsc::sync_channel(1);
+        let result = runner.run(&receipt, control);
+        assert_eq!(result.terminal_state, NormalizedRunState::Blocked);
+        assert_eq!(
+            result.failure.unwrap().kind,
+            AdapterFailureKind::Unsupported
+        );
+        assert_eq!(result.provider_session_id, None);
+    }
 
     #[test]
     fn successful_provider_without_bounded_output_becomes_safe_failure() {

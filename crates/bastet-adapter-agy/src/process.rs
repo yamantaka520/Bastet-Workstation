@@ -7,7 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bastet_core::{RunId, WorkspaceEvidenceError, WorkspaceSnapshot};
+use bastet_core::{
+    configure_adapter_process_environment, RunId, WorkspaceEvidenceError, WorkspaceSnapshot,
+};
 use serde_json::json;
 use thiserror::Error;
 
@@ -69,6 +71,7 @@ impl AgyProcess {
             .to_str()
             .ok_or(AgyProcessError::InvalidRequest)?;
         let mut command = Command::new(&executable);
+        configure_adapter_process_environment(&mut command);
         command
             .args([
                 "--input-format",

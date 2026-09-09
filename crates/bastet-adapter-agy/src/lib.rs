@@ -12,7 +12,9 @@ use std::{
     process::Command,
 };
 
-use bastet_core::{AdapterCapabilities, AdapterOperation, EvidenceClass};
+use bastet_core::{
+    configure_adapter_process_environment, AdapterCapabilities, AdapterOperation, EvidenceClass,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -33,7 +35,9 @@ pub struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
     fn run(&self, executable: &Path, arguments: &[&str]) -> io::Result<CommandOutput> {
-        let output = Command::new(executable).args(arguments).output()?;
+        let mut command = Command::new(executable);
+        configure_adapter_process_environment(&mut command);
+        let output = command.args(arguments).output()?;
         Ok(CommandOutput {
             success: output.status.success(),
             stdout: output.stdout,

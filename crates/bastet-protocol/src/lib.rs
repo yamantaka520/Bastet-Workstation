@@ -206,12 +206,46 @@ pub struct BeginGraphNodeRunCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCredentialSelection {
+    pub reference_id: bastet_core::CredentialReferenceId,
+    pub backend: bastet_core::CredentialBackend,
+    pub service: String,
+    pub account_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderAccountSelection {
+    pub account_id: bastet_core::AccountId,
+    pub provider_identity: String,
+    pub credential: Option<ProviderCredentialSelection>,
+}
+
+/// Immutable selected identity, not evidence of provider authentication or a
+/// credential grant. Secrets and arbitrary provider payloads are never included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderLaunchIdentity {
+    pub agent_instance_id: bastet_core::AgentInstanceId,
+    pub agent_provider_id: bastet_core::AgentProviderId,
+    pub project_id: bastet_core::ProjectId,
+    pub model_id: bastet_core::ModelId,
+    pub adapter_kind: String,
+    pub model: String,
+    pub account: Option<ProviderAccountSelection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BeginGraphNodeRunReceipt {
     pub protocol_version: u32,
     pub execution_id: bastet_core::GraphRunId,
     pub node_id: bastet_core::GraphNodeId,
     pub session_id: bastet_core::SessionId,
     pub run_id: bastet_core::RunId,
+    /// Absent on old wire receipts; new daemon-owned launches require it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_identity: Option<ProviderLaunchIdentity>,
     pub adapter_kind: String,
     pub model: String,
     pub workspace_root: String,
@@ -366,6 +400,45 @@ pub struct CancelRunReceipt {
 mod tests {
     use super::*;
 
+    fn receipt(launch_identity: Option<ProviderLaunchIdentity>) -> BeginGraphNodeRunReceipt {
+        BeginGraphNodeRunReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            execution_id: bastet_core::GraphRunId::from_bytes([1; 16]),
+            node_id: bastet_core::GraphNodeId::from_bytes([2; 16]),
+            session_id: bastet_core::SessionId::from_bytes([3; 16]),
+            run_id: bastet_core::RunId::from_bytes([4; 16]),
+            launch_identity,
+            adapter_kind: "codex_cli".into(),
+            model: "gpt-fixture".into(),
+            workspace_root: "/fixture".into(),
+            prompt: "bounded fixture prompt".into(),
+            catalog_revision: 5,
+            graph_revision: 6,
+            event_sequence: 7,
+        }
+    }
+
+    fn launch_identity() -> ProviderLaunchIdentity {
+        ProviderLaunchIdentity {
+            agent_instance_id: bastet_core::AgentInstanceId::from_bytes([8; 16]),
+            agent_provider_id: bastet_core::AgentProviderId::from_bytes([9; 16]),
+            project_id: bastet_core::ProjectId::from_bytes([10; 16]),
+            model_id: bastet_core::ModelId::from_bytes([11; 16]),
+            adapter_kind: "codex_cli".into(),
+            model: "gpt-fixture".into(),
+            account: Some(ProviderAccountSelection {
+                account_id: bastet_core::AccountId::from_bytes([12; 16]),
+                provider_identity: "fixture-account".into(),
+                credential: Some(ProviderCredentialSelection {
+                    reference_id: bastet_core::CredentialReferenceId::from_bytes([13; 16]),
+                    backend: bastet_core::CredentialBackend::MacosKeychain,
+                    service: "dev.bastet.fixture".into(),
+                    account_label: "fixture-label".into(),
+                }),
+            }),
+        }
+    }
+
     #[test]
     fn protocol_serializes_stable_snake_case_states() {
         let json = serde_json::to_string(&DaemonLifecycle::Checkpointing).unwrap();
@@ -374,5 +447,85 @@ mod tests {
             serde_json::to_string(&DaemonLifecycle::Suspended).unwrap(),
             "\"suspended\""
         );
+    }
+
+    #[test]
+    fn legacy_begin_run_receipt_without_launch_identity_decodes_to_none() {
+        let encoded = serde_json::to_value(receipt(None)).unwrap();
+        assert!(encoded.get("launch_identity").is_none());
+        let decoded = serde_json::from_value::<BeginGraphNodeRunReceipt>(encoded).unwrap();
+        assert_eq!(decoded.launch_identity, None);
+    }
+
+    #[test]
+    fn new_launch_identity_is_ignored_by_a_minimal_old_receipt_fixture() {
+        #[derive(serde::Deserialize)]
+        struct OldBeginGraphNodeRunReceipt {
+            protocol_version: u32,
+            execution_id: bastet_core::GraphRunId,
+            node_id: bastet_core::GraphNodeId,
+            session_id: bastet_core::SessionId,
+            run_id: bastet_core::RunId,
+            adapter_kind: String,
+            model: String,
+            workspace_root: String,
+            prompt: String,
+            catalog_revision: u64,
+            graph_revision: u64,
+            event_sequence: u64,
+        }
+
+        let expected = receipt(Some(launch_identity()));
+        let old = serde_json::from_value::<OldBeginGraphNodeRunReceipt>(
+            serde_json::to_value(&expected).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(old.protocol_version, expected.protocol_version);
+        assert_eq!(old.execution_id, expected.execution_id);
+        assert_eq!(old.node_id, expected.node_id);
+        assert_eq!(old.session_id, expected.session_id);
+        assert_eq!(old.run_id, expected.run_id);
+        assert_eq!(old.adapter_kind, expected.adapter_kind);
+        assert_eq!(old.model, expected.model);
+        assert_eq!(old.workspace_root, expected.workspace_root);
+        assert_eq!(old.prompt, expected.prompt);
+        assert_eq!(old.catalog_revision, expected.catalog_revision);
+        assert_eq!(old.graph_revision, expected.graph_revision);
+        assert_eq!(old.event_sequence, expected.event_sequence);
+    }
+
+    #[test]
+    fn launch_identity_round_trips_typed_optional_account_and_credential_metadata() {
+        let expected = launch_identity();
+        let encoded = serde_json::to_value(&expected).unwrap();
+        let decoded = serde_json::from_value::<ProviderLaunchIdentity>(encoded.clone()).unwrap();
+        assert_eq!(decoded, expected);
+        let rendered = encoded.to_string().to_ascii_lowercase();
+        for forbidden in [
+            "secret",
+            "token",
+            "api_key",
+            "access_key",
+            "private_key",
+            "password",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+        assert!(encoded["account"]["credential"].is_object());
+        assert!(encoded["account"]["credential"]
+            .get("reference_id")
+            .is_some());
+        assert!(encoded["account"]["credential"].get("backend").is_some());
+        assert!(encoded["account"]["credential"].get("service").is_some());
+        assert!(encoded["account"]["credential"]
+            .get("account_label")
+            .is_some());
+    }
+
+    #[test]
+    fn launch_identity_rejects_unknown_secret_bearing_field() {
+        let mut encoded = serde_json::to_value(launch_identity()).unwrap();
+        encoded["api_key"] = serde_json::Value::String("fixture".into());
+        assert!(serde_json::from_value::<ProviderLaunchIdentity>(encoded).is_err());
     }
 }

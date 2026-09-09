@@ -29,6 +29,42 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-09 durable launch selection and process environment slice
+
+New graph attempts persist a typed launch selection before work starts (schema
+9). The account/reference locator now participates in selection-to-begin checks;
+the executor also compares the receipt, durable selection and current inputs
+immediately before dispatch. Completion uses the captured model/account metadata
+instead of re-resolving mutable catalog labels. Captured account metadata is
+explicitly **not provider-authenticated identity**. Legacy rows retain NULL and
+unknown attribution rather than being backfilled from today's catalog.
+
+Malformed selection data never authorizes successful output: the exact attempt
+becomes Uncertain with unknown cost attribution, the corrupt row is retained,
+and the executor can drain safely. Generic catalog replacement preserves all
+prior runs and their sessions, accepts only never-started placeholders as new
+runs, and validates persisted M3/graph references before committing. It cannot
+inject an unowned active worker or retarget a historical run.
+
+Every Codex/Agy adapter child launch now clears inherited environment variables
+and restores only the fixed executable/system, profile, temp and locale list.
+API keys, provider endpoint/home overrides, proxies, loader injection, arbitrary
+runtime flags and unrelated credentials are not inherited. Existing HOME/profile
+configuration remains accessible; environment filtering is not OS sandboxing.
+Installations relying on removed overrides need an explicit supported setup
+path, not silent restoration of inherited variables.
+
+Production launches with a selected Account are blocked as Unsupported until
+the credential broker can enforce its exact reference/grant; they never fall
+back to the ambient CLI login. Accountless compatibility launches remain
+unverified and their account attribution is unknown. This slice is a prerequisite,
+not completion of M2 authentication, credential storage, or sandbox gates.
+
+Tests cover schema 8-to-9 preservation, selection changes, durable attribution,
+corrupt selection drain, catalog authority, and additive wire compatibility.
+The environment test uses a real root/middle/inner child chain; temporarily
+removing `env_clear()` makes it fail. Provider canaries remain ignored.
+
 ### 2026-09-09 approval identity binding slice
 
 Approval validation now resolves the acting Agent's exact Account and requires
@@ -44,6 +80,9 @@ Clippy pass. This does not implement native credential storage, a credential
 grant lifecycle, launch-time grant consumption, or selected-account provider
 authentication. Those remain open M2 work; no credential access or provider run
 is needed for these fixture checks.
+
+CI run `34318618536` for `880b527` passed all ten jobs, including all three
+platform builds and daemon lifecycle smoke.
 
 ### 2026-09-09 authenticated local IPC slice
 

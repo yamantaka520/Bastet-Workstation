@@ -25,6 +25,16 @@ checkpoints its database. Do not run old TCP and new IPC daemons against the sam
 database. The new endpoint ownership guard coordinates new IPC builds; it cannot
 retroactively lock an older binary that does not implement that guard.
 
+## Provider authentication boundary
+
+Codex/Agy child processes inherit only a fixed system/profile/temp/locale
+environment allowlist. API keys, endpoint overrides, proxies, custom provider
+home variables and runtime injection flags are not forwarded. Existing default
+CLI profile/login files remain accessible; this is not sandbox isolation.
+Accountless launches have unknown account attribution. Explicit Account
+selections are blocked until the native credential broker can bind the exact
+account/reference/grant, rather than silently using an unrelated CLI login.
+
 ## M0 checks
 
 Run the dependency-free baseline validation:
