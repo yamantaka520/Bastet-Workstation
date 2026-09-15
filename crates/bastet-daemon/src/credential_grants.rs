@@ -178,7 +178,7 @@ pub(super) fn issue(
     Ok(())
 }
 
-fn load(
+pub(super) fn load(
     connection: &Connection,
     id: ApprovalRequestId,
 ) -> Result<CredentialGrantRecord, StoreError> {
@@ -765,7 +765,7 @@ mod tests {
             let connection = store.connection().unwrap();
             connection.execute("UPDATE approval_requests SET request_hash = ?1, request_json = ?2, decision_json = ?3 WHERE request_id = ?4",
                 params![legacy.request_hash, serde_json::to_string(&legacy).unwrap(), serde_json::to_string(&decision).unwrap(), legacy.id.value().to_string()]).unwrap();
-            connection.execute_batch("DROP TABLE staged_provider_launches; DROP TABLE provider_launch_plans; DROP TABLE credential_grants; DELETE FROM schema_migrations WHERE version >= 10;").unwrap();
+            connection.execute_batch("DROP TABLE provider_dispatch_claims; DROP TABLE staged_provider_launches; DROP TABLE provider_launch_plans; DROP TABLE credential_grants; DELETE FROM schema_migrations WHERE version >= 10;").unwrap();
         }
         drop(store);
         let upgraded = Store::open(directory.path().join("grants.db")).unwrap();

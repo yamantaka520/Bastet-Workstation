@@ -29,6 +29,40 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 native reader and durable dispatch-claim boundary
+
+Schema 13 adds one-use dispatch claims and explicit dispatching/uncertain staged
+states. The internal broker validates current authority against the saved plan,
+then commits grant consumption, claim, graph activation, Run and redacted events
+atomically **before** releasing the database lock and calling the credential
+reader. Lookup failure never refunds the grant; restart marks interrupted claims
+Uncertain without repeating lookup. Production selected-account dispatch remains
+disabled: no HTTP claim/secret endpoint, native invocation, provider credential
+injection, or authenticated canary is enabled by this change. A returned prepared
+launch must eventually be handed to a provider or explicitly resolved; process
+failure/panic is conservatively reconciled at restart, never replayed.
+
+The read-only native reader uses explicit platform types from pinned keyring
+3.6.3, not its process-global default/mock fallback. Owned secret buffers erase
+on drop and errors carry no native payload. This does not promise erasure of OS,
+library or future provider copies. Version-1 locator contract: macOS User
+Keychain service/account; Windows target `bastet-workstation.v1:` followed by
+SHA-256 of length-prefixed UTF-8 service/account (each length is u64 big-endian);
+Linux exact target `bastet-workstation.v1` plus service/user attributes, with no
+legacy default-target fallback. `account_label` is an exact locator, not display
+text. Future credential provisioning must use this mapping; this is **not** an
+importer for arbitrary provider CLI login stores. No native writes are implemented.
+
+Tests inject synthetic readers only and cover concurrent claims, lookup failure,
+event rollback, changed authority, redaction, schema-12 preservation, and restart
+before/after lookup. Local full-workspace tests pass (91 daemon tests; real
+provider canaries ignored), as do 25 frontend tests, production frontend build,
+and workspace/all-target clippy with warnings denied.
+The preceding coordinator CI `34996951630` completed successfully; current native
+cross-platform compile/runtime evidence remains pending. M2 remains open for
+provider-specific credential injection/provisioning, production sandbox, setup
+and explicitly authorized real-provider gates.
+
 ### 2026-09-16 selected-account approval coordinator
 
 The production execute-ready route now stages selected-account attempts instead

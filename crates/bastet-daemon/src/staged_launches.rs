@@ -1097,14 +1097,14 @@ mod tests {
             .connection()
             .unwrap()
             .execute_batch(
-                "DROP TABLE staged_provider_launches;
-                 DELETE FROM schema_migrations WHERE version=12;",
+                "DROP TABLE provider_dispatch_claims; DROP TABLE staged_provider_launches;
+                 DELETE FROM schema_migrations WHERE version>=12;",
             )
             .unwrap();
         drop(store);
 
         let upgraded = Store::open(directory.path().join("provider-execution.db")).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 12);
+        assert_eq!(upgraded.schema_version().unwrap(), SCHEMA_VERSION);
         assert!(provider_launch::ProviderLaunchPlan::load(
             &upgraded.connection().unwrap(),
             receipt.run_id

@@ -1,6 +1,8 @@
 //! Durable state primitives for the Bastet Workstation local daemon.
 
+mod credential_dispatch;
 mod credential_grants;
+mod native_credentials;
 mod provider_executor;
 mod provider_launch;
 pub mod sandbox;
@@ -44,7 +46,7 @@ use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 13;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -768,6 +770,7 @@ impl Store {
             insert_event(&transaction, "daemon.recovery_started", "{}")?;
             reconcile_catalog_for_recovery(&transaction)?;
             reconcile_graphs_for_recovery(&transaction)?;
+            credential_dispatch::reconcile(&transaction)?;
             staged_launches::expire(&transaction, credential_grants::now_ms()?)?;
             transaction.commit()?;
         }
@@ -3407,6 +3410,30 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StoreError> {
         )?;
         transaction.commit()?;
     }
+    if current < 13 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE staged_provider_launches_v13 (
+                run_id TEXT PRIMARY KEY NOT NULL, request_id TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL CHECK(state IN ('awaiting_approval','ready','cancelled','dispatching','uncertain')),
+                staged_at_ms INTEGER NOT NULL CHECK(staged_at_ms >= 0),
+                finished_at_ms INTEGER, cancel_reason TEXT,
+                CHECK((state='cancelled') = (finished_at_ms IS NOT NULL)),
+                CHECK((state='cancelled') = (cancel_reason IS NOT NULL)),
+                CHECK(finished_at_ms IS NULL OR finished_at_ms >= staged_at_ms));
+             INSERT INTO staged_provider_launches_v13 SELECT * FROM staged_provider_launches;
+             DROP TABLE staged_provider_launches;
+             ALTER TABLE staged_provider_launches_v13 RENAME TO staged_provider_launches;
+             CREATE TABLE provider_dispatch_claims (
+                run_id TEXT PRIMARY KEY NOT NULL, request_id TEXT NOT NULL UNIQUE,
+                claimed_at_ms INTEGER NOT NULL CHECK(claimed_at_ms >= 0));",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (13, ?1)",
+            [timestamp()],
+        )?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -5106,6 +5133,7 @@ mod tests {
         connection
             .execute_batch(
                 "ALTER TABLE graph_node_runs DROP COLUMN launch_identity_json;
+                 DROP TABLE provider_dispatch_claims;
                  DROP TABLE staged_provider_launches;
                  DROP TABLE provider_launch_plans;
                  DROP TABLE credential_grants;
@@ -5511,6 +5539,7 @@ mod tests {
         fixture
             .execute_batch(
                 "DELETE FROM schema_migrations WHERE version >= 7;
+                 DROP TABLE provider_dispatch_claims;
                  DROP TABLE staged_provider_launches;
                  DROP TABLE provider_launch_plans;
                  DROP TABLE credential_grants;
@@ -5551,6 +5580,7 @@ mod tests {
         fixture
             .execute_batch(
                 "DELETE FROM schema_migrations WHERE version >= 8;
+                 DROP TABLE provider_dispatch_claims;
                  DROP TABLE staged_provider_launches;
                  DROP TABLE provider_launch_plans;
                  DROP TABLE credential_grants;

@@ -145,7 +145,7 @@ describe("M1 shell", () => {
     }
   });
 
-  it.each(["awaiting_approval", "ready", "cancelled"] as const)("projects exact staged %s status in approval and run views", async (state) => {
+  it.each(["awaiting_approval", "ready", "cancelled", "dispatching", "uncertain"] as const)("projects exact staged %s status in approval and run views", async (state) => {
     const record = { staged_launch_state: state, decision: state === "ready" ? { kind: "approve" } : null,
       request: { id: "staged", request_hash: "hash", expires_at_ms: 1_800_000_000_000,
         action: { action_key: "credential.use", reason_key: "provider.authentication", consequence_key: "credential.single_run", risk: "high", agent_instance_id: "agent",
@@ -174,6 +174,22 @@ describe("M1 shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "辦公室" }));
     expect(screen.getAllByText(new RegExp(stagedLaunchLabel("zh-Hant", state))).length).toBeGreaterThan(0);
     expect(screen.getByText(/Staged node/).closest("li")).not.toHaveTextContent("approval_required");
+  });
+
+  it("labels an uncertain dispatch without treating approval as successful execution", async () => {
+    const record = { staged_launch_state: "uncertain" as const, decision: { kind: "approve" as const },
+      request: { id: "uncertain", request_hash: "hash", expires_at_ms: 1_800_000_000_000,
+        action: { action_key: "credential.use", reason_key: "provider.authentication", consequence_key: "credential.single_run", risk: "high", agent_instance_id: "agent",
+          scope: { project_id: "project", run_id: "run-uncertain", filesystem_roots: [], data_scopes: [], network_destinations: [], credential_reference_ids: [] } } } };
+    invokeMock.mockImplementation((command: string) => command === "approval_center_snapshot"
+      ? Promise.resolve({ protocol_version: 1, records: [record] }) : defaultInvoke(command));
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "核准中心" }));
+    expect(await screen.findByText("派送結果不確定，請確認供應商狀態")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "核准" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "拒絕" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/已成功執行/)).not.toBeInTheDocument();
   });
 
   it("does not acknowledge a credential scope for a legacy approval without a binding", async () => {

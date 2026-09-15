@@ -382,6 +382,8 @@ pub enum StagedLaunchState {
     AwaitingApproval,
     Ready,
     Cancelled,
+    Dispatching,
+    Uncertain,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

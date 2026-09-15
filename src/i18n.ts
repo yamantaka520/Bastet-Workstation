@@ -92,13 +92,13 @@ export function stagedCredentialScopeNote(locale: Locale): string {
 
 export function stagedLaunchLabel(locale: Locale, state: string): string {
   const labels = {
-    en: ["Awaiting approval", "Approved — awaiting dispatch", "Cancelled before execution"],
-    "zh-Hant": ["等待核准", "已核准，等待派送", "已於執行前取消"],
-    "zh-Hans": ["等待批准", "已批准，等待派发", "已在运行前取消"],
-    ja: ["承認待ち", "承認済み — 実行開始待ち", "実行前にキャンセル済み"],
-    ko: ["승인 대기", "승인됨 — 실행 대기", "실행 전에 취소됨"],
+    en: ["Awaiting approval", "Approved — awaiting dispatch", "Cancelled before execution", "Dispatching to provider", "Dispatch outcome uncertain — confirm provider status"],
+    "zh-Hant": ["等待核准", "已核准，等待派送", "已於執行前取消", "正在派送至供應商", "派送結果不確定，請確認供應商狀態"],
+    "zh-Hans": ["等待批准", "已批准，等待派发", "已在运行前取消", "正在派发至提供方", "派发结果不确定，请确认提供方状态"],
+    ja: ["承認待ち", "承認済み — 実行開始待ち", "実行前にキャンセル済み", "実行をプロバイダーへ送信中", "送信結果は不明です。プロバイダーの状態を確認してください"],
+    ko: ["승인 대기", "승인됨 — 실행 대기", "실행 전에 취소됨", "공급자에게 실행 요청 전송 중", "전송 결과를 알 수 없습니다. 공급자 상태를 확인하세요"],
   };
-  const index = state === "awaiting_approval" ? 0 : state === "ready" ? 1 : state === "cancelled" ? 2 : -1;
+  const index = state === "awaiting_approval" ? 0 : state === "ready" ? 1 : state === "cancelled" ? 2 : state === "dispatching" ? 3 : state === "uncertain" ? 4 : -1;
   return index < 0 ? state : labels[locale][index];
 }
 const failureKeyByIdentifier: Record<string, Extract<MessageKey, `failure${string}`>> = {

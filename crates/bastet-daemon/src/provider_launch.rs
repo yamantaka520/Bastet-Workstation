@@ -210,7 +210,7 @@ mod tests {
             .connection()
             .unwrap()
             .execute_batch(
-                "DROP TABLE staged_provider_launches; DROP TABLE provider_launch_plans; DELETE FROM schema_migrations WHERE version>=11;",
+                "DROP TABLE provider_dispatch_claims; DROP TABLE staged_provider_launches; DROP TABLE provider_launch_plans; DELETE FROM schema_migrations WHERE version>=11;",
             )
             .unwrap();
         drop(store);

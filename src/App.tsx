@@ -12,7 +12,7 @@ type ApprovalScope = { project_id: string; run_id?: string | null; filesystem_ro
 type PolicyCeiling = { filesystem?: string | null; network?: string | null; process?: string | null; device?: string | null; credential?: string | null; persistent_approval?: boolean | null };
 type ScopedPolicy = { layer?: string | null; ceiling?: PolicyCeiling | null };
 type ApprovalAction = { agent_instance_id: string; role_id?: string | null; action_key: string; reason_key: string; consequence_key: string; risk: string; requested_policy?: ScopedPolicy | null; scope: ApprovalScope };
-type ApprovalRecord = { staged_launch_state?: "awaiting_approval" | "ready" | "cancelled" | null; request: { id: string; request_hash: string; expires_at_ms: number; action: ApprovalAction }; decision: { kind: "approve" | "deny" } | null };
+type ApprovalRecord = { staged_launch_state?: "awaiting_approval" | "ready" | "cancelled" | "dispatching" | "uncertain" | null; request: { id: string; request_hash: string; expires_at_ms: number; action: ApprovalAction }; decision: { kind: "approve" | "deny" } | null };
 type ApprovalList = { protocol_version: number; records: ApprovalRecord[] };
 type AgentStatus = { adapter_kind: string; display_name: string; installed: boolean; version: string | null; authenticated: boolean | null; model_count: number | null; models: string[]; reasoning_controls: string[]; operations: string[]; error_key: string | null };
 type AgentCenterSnapshot = { agents: AgentStatus[] };
@@ -252,7 +252,7 @@ export function App() {
           <dt>{translate(locale, "expires")}</dt><dd>{new Date(record.request.expires_at_ms).toLocaleString(locale)}</dd></dl>
         <ApprovalDetails action={record.request.action} locale={locale} staged={Boolean(record.staged_launch_state)} />
         {record.staged_launch_state && <p role="status">{stagedLaunchLabel(locale, record.staged_launch_state)}</p>}
-        {record.staged_launch_state === "cancelled" ? null : record.decision ? <strong>{translate(locale, record.decision.kind === "approve" ? "approved" : "denied")}</strong> : <div className="actions">
+        {record.staged_launch_state && record.staged_launch_state !== "awaiting_approval" ? null : record.decision ? <strong>{translate(locale, record.decision.kind === "approve" ? "approved" : "denied")}</strong> : <div className="actions">
           <button type="button" disabled={actionBusy} onClick={() => void decide(record, "deny")}>{translate(locale, "deny")}</button><button type="button" className="primary" disabled={actionBusy} onClick={() => void decide(record, "approve")}>{translate(locale, "approve")}</button></div>}</article>)}</section>}
 
     {view === "diagnostics" && <section aria-labelledby="diagnostics-heading"><h2 id="diagnostics-heading">{translate(locale, "diagnostics")}</h2>
