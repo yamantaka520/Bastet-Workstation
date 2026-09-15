@@ -29,6 +29,49 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 owned subprocess cleanup and cancellable stdout
+
+Both adapter spawn paths immediately acquire `OwnedAdapterChild`, including
+fallible post-spawn initialization. Unix children enter their own process group;
+shutdown observes leader exit with `waitid(WNOWAIT)`, signals the group before
+reaping the leader, and only then consumes its wait status. This keeps the group
+id anchored against reuse. An observed `ECHILD` disarms numeric-id cleanup.
+Grace is capped at 500 ms independently of the provider inactivity timeout;
+forced shutdown and Drop use zero grace. Kernel reaping is not a hard deadline.
+
+`ProcessOutputReader` uses nonblocking Unix reads / Windows pipe availability
+polling and a cancellable thread instead of blocking `BufRead::lines` joins.
+Windows close repeatedly requests `CancelSynchronousIo` through the owned reader
+thread handle: a synchronous `PeekNamedPipe` can block, and a single cancellation
+before I/O entry leaves a race. Windows execution evidence remains CI-dependent.
+It rejects invalid UTF-8 and individual lines larger than 8 MiB with a payload-free
+error, preserves split lines and final unterminated lines, and requires a
+nonblocking sink. This does not bound downstream channel/notification queues.
+
+Synthetic tests cover an exited/live leader with a stdout-holding descendant,
+Drop cleanup, isolation from another process group, loss of wait ownership,
+reader cancellation, and both adapter close/cancel paths after a ready event.
+The macOS adapter/Seatbelt read-scope fixture also leaves a descendant holding
+stdout and checks prompt close. No real provider, login or credential is used.
+
+Coverage is explicitly `UnixProcessGroup` or `DirectChildOnly`, not adversarial
+tree containment. `setsid`/`setpgid` escape remains possible; bubblewrap normally
+creates a new session internally and needs its own native cancellation proof.
+Windows still needs atomic Job Object enrollment, not racy post-spawn assignment.
+The adapters' existing void cleanup APIs still suppress cleanup errors; a future
+authoritative lifecycle path must retain cleanup failure/uncertainty instead of
+treating close as proof that every descendant exited. Production sandbox wiring,
+persisted runtime policy, destination restriction, and M2/M3 gates remain open.
+Synchronous stdin writes and total queued output are separate liveness/resource
+gaps, not solved by cancellable stdout. OS cancellation/reaping is not guaranteed
+to finish under a hard deadline.
+
+The preceding launcher-seam commit `03fe4d4` passed CI `35001595371` (all jobs).
+Local full-workspace tests pass (core 81, Agy 21, Codex 66, daemon 99; real-provider
+canaries ignored), as do formatting and workspace/all-target clippy with warnings
+denied. Cross-platform execution of this new cleanup slice remains to be checked
+against its own CI commit, not inferred from the preceding launcher CI.
+
 ### 2026-09-16 adapter sandbox command seam
 
 Core now defines a trusted `AdapterProcessLauncher` command-construction seam.

@@ -1,10 +1,9 @@
 use std::{
     collections::VecDeque,
-    io::{BufRead, BufReader, Write},
+    io::Write,
     path::Path,
-    process::{Child, ChildStdin, Stdio},
+    process::{ChildStdin, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
-    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -13,14 +12,15 @@ use serde_json::{json, Value};
 use crate::{AppServerNotification, AppServerTransport, TransportError};
 use bastet_core::{
     configure_adapter_process_environment, AdapterProcessLauncher, DirectAdapterProcessLauncher,
+    OwnedAdapterChild, ProcessOutputReader,
 };
 
 pub struct StdioTransport {
-    child: Child,
+    child: OwnedAdapterChild,
     stdin: Option<ChildStdin>,
     responses: Receiver<Result<Value, TransportError>>,
     pending_notifications: VecDeque<AppServerNotification>,
-    reader: Option<JoinHandle<()>>,
+    reader: Option<ProcessOutputReader>,
     next_request_id: u64,
     timeout: Duration,
     notification_deadline: Option<Instant>,
@@ -44,29 +44,26 @@ impl StdioTransport {
             .command(executable)
             .map_err(|_| TransportError::Unavailable)?;
         configure_adapter_process_environment(&mut command);
-        let mut child = command
+        command
             .args(["app-server", "--listen", "stdio://"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| TransportError::Unavailable)?;
-        let stdin = child.stdin.take().ok_or(TransportError::Unavailable)?;
-        let stdout = child.stdout.take().ok_or(TransportError::Unavailable)?;
+            .stderr(Stdio::null());
+        let mut child =
+            OwnedAdapterChild::spawn(&mut command).map_err(|_| TransportError::Unavailable)?;
+        let stdin = child.take_stdin().ok_or(TransportError::Unavailable)?;
+        let stdout = child.take_stdout().ok_or(TransportError::Unavailable)?;
         let (sender, responses) = mpsc::channel();
-        let reader = thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let response = line
-                    .map_err(|_| TransportError::Unavailable)
-                    .and_then(|line| {
-                        serde_json::from_str(&line).map_err(|_| TransportError::ProtocolDrift)
-                    });
-                let failed = response.is_err();
-                if sender.send(response).is_err() || failed {
-                    break;
-                }
-            }
-        });
+        let reader = ProcessOutputReader::spawn(stdout, move |line| {
+            let response = line
+                .map_err(|_| TransportError::Unavailable)
+                .and_then(|line| {
+                    serde_json::from_str(&line).map_err(|_| TransportError::ProtocolDrift)
+                });
+            let failed = response.is_err();
+            sender.send(response).is_ok() && !failed
+        })
+        .map_err(|_| TransportError::Unavailable)?;
         Ok(Self {
             child,
             stdin: Some(stdin),
@@ -82,20 +79,9 @@ impl StdioTransport {
 
     pub fn close(&mut self) {
         self.stdin.take();
-        let deadline = Instant::now() + self.timeout;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-                Ok(None) | Err(_) => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
-                    break;
-                }
-            }
-        }
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+        let _ = self.child.shutdown(self.timeout);
+        if let Some(mut reader) = self.reader.take() {
+            reader.close();
         }
     }
 
@@ -448,11 +434,11 @@ mod tests {
         };
 
         let mut transport =
-            StdioTransport::spawn_with_launcher(&provider, Duration::from_secs(1), &launcher)
+            StdioTransport::spawn_with_launcher(&provider, Duration::from_secs(2), &launcher)
                 .unwrap();
         assert_eq!(
             transport
-                .poll_notification(Duration::from_secs(1))
+                .poll_notification(Duration::from_secs(2))
                 .unwrap()
                 .unwrap()
                 .method,
@@ -484,17 +470,39 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn close_is_bounded_when_a_descendant_keeps_stdout_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("provider");
+        for ending in ["cat >/dev/null", "exit 0"] {
+            write_executable(&provider, &format!("#!/bin/sh\nsleep 30 &\nprintf '{{\"method\":\"fixture/ready\",\"params\":{{}}}}\\n'\n{ending}\n"));
+            let mut transport = StdioTransport::spawn(&provider, Duration::from_secs(30)).unwrap();
+            assert_eq!(
+                transport
+                    .poll_notification(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap()
+                    .method,
+                "fixture/ready"
+            );
+            let started = Instant::now();
+            transport.close();
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+    }
+
+    #[cfg(unix)]
     fn clock_transport(
         timeout: Duration,
     ) -> (StdioTransport, Sender<Result<Value, TransportError>>) {
-        let mut child = Command::new("/bin/sh")
+        let mut command = Command::new("/bin/sh");
+        command
             .args(["-c", "sleep 1"])
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdin = child.stdin.take();
-        let _stdout = child.stdout.take();
+            .stdout(Stdio::piped());
+        let mut child = OwnedAdapterChild::spawn(&mut command).unwrap();
+        let stdin = child.take_stdin();
+        let _stdout = child.take_stdout();
         let (sender, responses) = mpsc::channel();
         (
             StdioTransport {

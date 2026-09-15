@@ -187,6 +187,7 @@ inside=false
 outside=false
 value=$(/bin/cat '{}') && [ "$value" = inside-fixture ] && inside=true
 value=$(/bin/cat '{}') && outside=true
+/bin/sleep 3 &
 printf '{{"method":"fixture/scope","params":{{"inside":%s,"outside":%s}}}}\n' "$inside" "$outside"
 while read -r line; do :; done
 "#,
@@ -226,7 +227,9 @@ while read -r line; do :; done
             notification.params,
             serde_json::json!({"inside":true,"outside":false})
         );
+        let closing = std::time::Instant::now();
         transport.close();
+        assert!(closing.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

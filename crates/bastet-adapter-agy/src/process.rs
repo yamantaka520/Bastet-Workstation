@@ -1,15 +1,14 @@
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::Write,
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Stdio},
+    process::{ChildStdin, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
-    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use bastet_core::{
     configure_adapter_process_environment, AdapterProcessLauncher, DirectAdapterProcessLauncher,
-    RunId, WorkspaceEvidenceError, WorkspaceSnapshot,
+    OwnedAdapterChild, ProcessOutputReader, RunId, WorkspaceEvidenceError, WorkspaceSnapshot,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -43,10 +42,10 @@ pub enum AgyProcessError {
 }
 
 pub struct AgyProcess {
-    child: Child,
+    child: OwnedAdapterChild,
     stdin: Option<ChildStdin>,
     lines: Receiver<Result<String, ()>>,
-    reader: Option<JoinHandle<()>>,
+    reader: ProcessOutputReader,
     stream: AgyRunStream,
     timeout: Duration,
     inactivity_deadline: Instant,
@@ -119,9 +118,12 @@ impl AgyProcess {
         if let Some(conversation_id) = &request.conversation_id {
             command.args(["--conversation", conversation_id]);
         }
-        let mut child = command.spawn().map_err(|_| AgyProcessError::Unavailable)?;
-        let mut stdin = child.stdin.take().ok_or(AgyProcessError::Unavailable)?;
-        let stdout = child.stdout.take().ok_or(AgyProcessError::Unavailable)?;
+        // From this point the child is exclusively owned, so every fallible
+        // initialization path below cleans it up through OwnedAdapterChild.
+        let mut child =
+            OwnedAdapterChild::spawn(&mut command).map_err(|_| AgyProcessError::Unavailable)?;
+        let mut stdin = child.take_stdin().ok_or(AgyProcessError::Unavailable)?;
+        let stdout = child.take_stdout().ok_or(AgyProcessError::Unavailable)?;
         serde_json::to_writer(
             &mut stdin,
             &json!({"event":"user","message":{"content":request.prompt}}),
@@ -133,15 +135,8 @@ impl AgyProcess {
             .map_err(|_| AgyProcessError::Unavailable)?;
 
         let (sender, lines) = mpsc::channel();
-        let reader = thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let line = line.map_err(|_| ());
-                let failed = line.is_err();
-                if sender.send(line).is_err() || failed {
-                    break;
-                }
-            }
-        });
+        let reader = ProcessOutputReader::spawn(stdout, move |line| sender.send(line).is_ok())
+            .map_err(|_| AgyProcessError::Unavailable)?;
         let mut stream = if let Some(conversation_id) = request.conversation_id {
             AgyRunStream::resuming(request.run_id, conversation_id)?
         } else {
@@ -156,7 +151,7 @@ impl AgyProcess {
             child,
             stdin: Some(stdin),
             lines,
-            reader: Some(reader),
+            reader,
             stream,
             timeout: request.timeout,
             inactivity_deadline: Instant::now() + request.timeout,
@@ -265,15 +260,14 @@ impl AgyProcess {
 
     fn terminate(&mut self) {
         self.stdin.take();
-        let _ = self.child.kill();
-        self.reap();
+        let _ = self.child.shutdown(Duration::ZERO);
+        self.reader.close();
     }
 
     fn reap(&mut self) {
-        let _ = self.child.wait();
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
+        self.stdin.take();
+        let _ = self.child.shutdown(Duration::from_millis(50));
+        self.reader.close();
     }
 
     fn order_terminal(&mut self, terminal: AgyRunUpdate) -> Result<AgyRunUpdate, AgyProcessError> {
@@ -339,7 +333,7 @@ fn is_terminal(update: &AgyRunUpdate) -> bool {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::{cell::Cell, io, process::Command};
+    use std::{cell::Cell, io, os::unix::fs::PermissionsExt, process::Command};
 
     use bastet_core::NormalizedRunState;
 
@@ -370,6 +364,25 @@ mod tests {
             },
         )
         .unwrap();
+        FixtureProcess {
+            process,
+            _root: root,
+        }
+    }
+
+    fn descendant_stdout_fixture() -> FixtureProcess {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("stdout-holding-descendant.sh");
+        // The leader exits after its running event, while its descendant keeps
+        // stdout open. Cancellation must finish the owned group before closing
+        // the output reader, so no fixture descendant is left behind.
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nread -r prompt || exit 1\nsleep 30 &\nprintf '%s\\n' '{\"event\":\"init\",\"conversation_id\":\"descendant-test\",\"init\":{}}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let process = AgyProcess::spawn(executable, fixture_request(&root, "descendant")).unwrap();
         FixtureProcess {
             process,
             _root: root,
@@ -559,5 +572,18 @@ mod tests {
         assert!(
             matches!(fixture.process.next_update("terminal").unwrap(), AgyRunUpdate::Lifecycle { event, .. } if event.state == NormalizedRunState::Cancelled)
         );
+    }
+
+    #[test]
+    fn cancelling_stdout_holding_descendant_closes_the_output_reader_promptly() {
+        let mut fixture = descendant_stdout_fixture();
+        assert!(matches!(
+            fixture.process.next_update("started").unwrap(),
+            AgyRunUpdate::Lifecycle { event, .. } if event.state == NormalizedRunState::Running
+        ));
+        let started = Instant::now();
+
+        fixture.process.request_cancellation("cancel").unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
