@@ -93,6 +93,10 @@ pub(super) enum CredentialReadError {
 }
 
 pub(super) trait CredentialReader: Send + Sync {
+    /// Reject selections that cannot be read on this host without touching the
+    /// native credential store. Dispatch calls this before consuming a grant.
+    fn validate(&self, selection: &ProviderCredentialSelection) -> Result<(), CredentialReadError>;
+
     fn read(
         &self,
         selection: &ProviderCredentialSelection,
@@ -125,16 +129,22 @@ impl NativeCredentialReader {
 }
 
 impl CredentialReader for NativeCredentialReader {
-    fn read(
-        &self,
-        selection: &ProviderCredentialSelection,
-    ) -> Result<SecretBytes, CredentialReadError> {
+    fn validate(&self, selection: &ProviderCredentialSelection) -> Result<(), CredentialReadError> {
         validate_locator(&selection.service, CredentialReadError::InvalidService)?;
         validate_locator(
             &selection.account_label,
             CredentialReadError::InvalidAccount,
         )?;
-        validate_host_backend(&selection.backend)?;
+        validate_host_backend(&selection.backend)
+    }
+
+    fn read(
+        &self,
+        selection: &ProviderCredentialSelection,
+    ) -> Result<SecretBytes, CredentialReadError> {
+        // Retain this check at the native read boundary as well, so callers
+        // cannot bypass broker preflight.
+        self.validate(selection)?;
 
         let bytes = self
             .lookup
@@ -395,6 +405,19 @@ mod tests {
             reader.read(&selection(mismatched)).unwrap_err(),
             CredentialReadError::UnsupportedBackend
         );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn validation_of_a_supported_selection_does_not_touch_the_platform_boundary() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reader = NativeCredentialReader::with_lookup(FakeLookup {
+            calls: Arc::clone(&calls),
+            response: FakeResponse::Secret(b"unused"),
+        });
+
+        assert!(reader.validate(&selection(host_backend())).is_ok());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 

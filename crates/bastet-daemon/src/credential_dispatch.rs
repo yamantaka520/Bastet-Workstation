@@ -36,7 +36,7 @@ impl Store {
         reader: &dyn CredentialReader,
     ) -> Result<PreparedLaunch, BrokerError> {
         let claim = self
-            .claim_staged_dispatch(request_id)
+            .claim_staged_dispatch(request_id, reader)
             .map_err(|_| BrokerError::Authorization)?;
         // The database mutex is released and consumption is durable before an
         // OS keychain prompt or lookup is possible. Never refund on error.
@@ -56,6 +56,7 @@ impl Store {
     fn claim_staged_dispatch(
         &self,
         request_id: ApprovalRequestId,
+        reader: &dyn CredentialReader,
     ) -> Result<DispatchClaim, StoreError> {
         let mut connection = self.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -112,6 +113,11 @@ impl Store {
             .as_ref()
             .and_then(|account| account.credential.clone())
             .ok_or(StoreError::CredentialGrantRejected)?;
+        // Validate the exact immutable plan selection under the claim
+        // transaction, before any irreversible mutation or native-store read.
+        reader
+            .validate(&selection)
+            .map_err(|_| StoreError::CredentialGrantRejected)?;
         let mut graph: GraphExecution = serde_json::from_str(&tx.query_row::<String, _, _>(
             "SELECT execution_json FROM graph_executions WHERE execution_id=?1",
             [plan.execution_id.value().to_string()],
@@ -360,7 +366,13 @@ mod tests {
     #[test]
     fn restart_after_claim_before_lookup_never_replays_or_refunds() {
         let (directory, _workspace, store, id) = fixture();
-        let claim = store.claim_staged_dispatch(id).unwrap();
+        let reader = Reader {
+            store: store.clone(),
+            id,
+            calls: AtomicUsize::new(0),
+            fail: false,
+        };
+        let claim = store.claim_staged_dispatch(id, &reader).unwrap();
         let run_id = claim.receipt.run_id;
         drop(claim);
         drop(store);
@@ -392,6 +404,13 @@ mod tests {
         );
     }
     impl CredentialReader for Reader {
+        fn validate(
+            &self,
+            _selection: &bastet_protocol::ProviderCredentialSelection,
+        ) -> Result<(), CredentialReadError> {
+            Ok(())
+        }
+
         fn read(
             &self,
             selection: &bastet_protocol::ProviderCredentialSelection,
@@ -429,6 +448,62 @@ mod tests {
                 SecretBytes::new(b"synthetic-credential-never-native".to_vec())
             }
         }
+    }
+
+    struct RejectingReader {
+        validate_calls: AtomicUsize,
+        read_calls: AtomicUsize,
+    }
+
+    impl CredentialReader for RejectingReader {
+        fn validate(
+            &self,
+            _selection: &bastet_protocol::ProviderCredentialSelection,
+        ) -> Result<(), CredentialReadError> {
+            self.validate_calls.fetch_add(1, Ordering::SeqCst);
+            Err(CredentialReadError::UnsupportedBackend)
+        }
+
+        fn read(
+            &self,
+            _selection: &bastet_protocol::ProviderCredentialSelection,
+        ) -> Result<SecretBytes, CredentialReadError> {
+            self.read_calls.fetch_add(1, Ordering::SeqCst);
+            Err(CredentialReadError::UnsupportedBackend)
+        }
+    }
+
+    #[test]
+    fn reader_preflight_rejection_leaves_ready_grant_unspent_without_claim_or_lookup() {
+        let (_directory, _workspace, store, id) = fixture();
+        let catalog_before = store.catalog().unwrap();
+        let events_before = store.events_after(0).unwrap();
+        let reader = RejectingReader {
+            validate_calls: AtomicUsize::new(0),
+            read_calls: AtomicUsize::new(0),
+        };
+
+        assert!(matches!(
+            store.prepare_staged_credentials(id, &reader),
+            Err(BrokerError::Authorization)
+        ));
+        assert_eq!(reader.validate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(reader.read_calls.load(Ordering::SeqCst), 0);
+        assert!(store.credential_grant(id).unwrap().consumed_at_ms.is_none());
+        assert_eq!(store.catalog().unwrap(), catalog_before);
+        assert_eq!(store.events_after(0).unwrap(), events_before);
+        assert_eq!(
+            store.approval(id).unwrap().staged_launch_state,
+            Some(bastet_protocol::StagedLaunchState::Ready)
+        );
+        let claims: u64 = store
+            .connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM provider_dispatch_claims", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(claims, 0);
     }
 
     #[test]

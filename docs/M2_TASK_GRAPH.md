@@ -29,6 +29,28 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 provider authentication contract investigation
+
+[Credential integration evidence](CREDENTIAL_AUTH_INTEGRATION.md) records why
+the generic native reader cannot yet be connected directly to Codex login:
+provider-managed and host-managed auth have different locator, refresh and
+identity contracts. Login-mode priority has been requested from the user; real
+authentication remains separately gated. Do not infer API-key authorization or
+external ChatGPT token lifecycle ownership from the current opaque reference.
+
+The internal reader now exposes a side-effect-free capability/locator validation.
+The broker runs it against the immutable plan inside the claim transaction before
+any mutation. Unsupported local selection leaves the grant ready and unspent,
+with no claim, native read, catalog change or journal event. The native read also
+revalidates defensively. This is not a check that a credential exists or is valid
+at the provider; those checks require separately authorized access.
+
+Full local workspace tests pass (93 daemon tests; real-provider canaries ignored),
+as does workspace/all-target clippy with warnings denied. The preceding native
+reader checkpoint `2e1d03d` CI run `34998749681` passed all ten jobs, including
+Linux/macOS/Windows builds and synthetic tests. This is not native-store runtime
+or real-provider authentication evidence.
+
 ### 2026-09-16 native reader and durable dispatch-claim boundary
 
 Schema 13 adds one-use dispatch claims and explicit dispatching/uncertain staged
