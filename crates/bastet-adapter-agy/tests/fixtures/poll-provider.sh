@@ -8,6 +8,10 @@ while [ "$#" -gt 0 ]; do
 done
 IFS= read -r request
 case "$mode" in
+    done)
+        printf '%s\n' '{"event":"init","conversation_id":"poll-test","init":{}}'
+        printf '%s\n' '{"event":"result","result":{"conversation_id":"poll-test","status":"SUCCESS"}}'
+        ;;
     delayed-init)
         IFS= read -r trigger
         printf '%s\n' '{"event":"init","conversation_id":"poll-test","init":{}}'

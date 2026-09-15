@@ -221,7 +221,7 @@ fn prepare_stdout(_stdout: &ChildStdout) -> io::Result<()> {
 
 #[cfg(windows)]
 fn available_bytes(stdout: &ChildStdout) -> io::Result<Option<usize>> {
-    use std::{ffi::c_void, os::windows::io::AsRawHandle};
+    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE;
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
@@ -230,7 +230,7 @@ fn available_bytes(stdout: &ChildStdout) -> io::Result<Option<usize>> {
     // the byte-count is requested, and `available` is valid writable storage.
     let result = unsafe {
         PeekNamedPipe(
-            stdout.as_raw_handle() as *mut c_void,
+            stdout.as_raw_handle(),
             std::ptr::null_mut(),
             0,
             std::ptr::null_mut(),

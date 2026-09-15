@@ -35,6 +35,8 @@ pub enum AgyProcessError {
     Unavailable,
     #[error("Agy CLI process timed out")]
     TimedOut,
+    #[error("Agy CLI process cleanup could not be confirmed")]
+    CleanupUncertain,
     #[error(transparent)]
     Stream(#[from] AgyStreamError),
     #[error(transparent)]
@@ -207,7 +209,7 @@ impl AgyProcess {
         loop {
             let now = Instant::now();
             if now >= self.inactivity_deadline {
-                self.terminate();
+                self.terminate()?;
                 let terminal = self.stream.timed_out(occurred_at)?;
                 return self.order_terminal(terminal).map(Some);
             }
@@ -226,14 +228,14 @@ impl AgyProcess {
                     if let Some(update) = self.stream.consume_line(&line, occurred_at)? {
                         if is_terminal(&update) {
                             self.stdin.take();
-                            self.reap();
+                            self.reap()?;
                             return self.order_terminal(update).map(Some);
                         }
                         return Ok(Some(update));
                     }
                 }
                 Ok(Err(())) | Err(RecvTimeoutError::Disconnected) => {
-                    self.reap();
+                    self.reap()?;
                     let terminal = if self.cancellation_requested {
                         self.stream.cancelled(occurred_at)?
                     } else {
@@ -254,20 +256,22 @@ impl AgyProcess {
     ) -> Result<AgyRunUpdate, AgyProcessError> {
         let update = self.stream.cancellation_started(occurred_at)?;
         self.cancellation_requested = true;
-        self.terminate();
+        self.terminate()?;
         Ok(update)
     }
 
-    fn terminate(&mut self) {
+    fn terminate(&mut self) -> Result<(), AgyProcessError> {
         self.stdin.take();
-        let _ = self.child.shutdown(Duration::ZERO);
+        let result = self.child.shutdown(Duration::ZERO);
         self.reader.close();
+        result.map_err(|_| AgyProcessError::CleanupUncertain)
     }
 
-    fn reap(&mut self) {
+    fn reap(&mut self) -> Result<(), AgyProcessError> {
         self.stdin.take();
-        let _ = self.child.shutdown(Duration::from_millis(50));
+        let result = self.child.shutdown(Duration::from_millis(50));
         self.reader.close();
+        result.map_err(|_| AgyProcessError::CleanupUncertain)
     }
 
     fn order_terminal(&mut self, terminal: AgyRunUpdate) -> Result<AgyRunUpdate, AgyProcessError> {
@@ -285,7 +289,7 @@ impl AgyProcess {
 
 impl Drop for AgyProcess {
     fn drop(&mut self) {
-        self.terminate();
+        let _ = self.terminate();
     }
 }
 
@@ -572,6 +576,36 @@ mod tests {
         assert!(
             matches!(fixture.process.next_update("terminal").unwrap(), AgyRunUpdate::Lifecycle { event, .. } if event.state == NormalizedRunState::Cancelled)
         );
+    }
+
+    #[test]
+    fn cleanup_failure_withholds_success_and_remains_failed() {
+        const MARKER: &str = "BASTET_TEST_AGY_FOREIGN_REAPER";
+        if std::env::var_os(MARKER).is_none() {
+            assert!(Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::tests::cleanup_failure_withholds_success_and_remains_failed"
+                ])
+                .env(MARKER, "1")
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        let mut fixture = fixture_process("done", Duration::from_secs(2));
+        // SAFETY: this dedicated subprocess has exactly one child, the finite
+        // synthetic fixture. Deliberately violate exclusive wait ownership.
+        assert!(unsafe { libc::waitpid(-1, std::ptr::null_mut(), 0) } > 0);
+        assert!(
+            matches!(fixture.process.next_update("started").unwrap(), AgyRunUpdate::Lifecycle { event, .. } if event.state == NormalizedRunState::Running)
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                fixture.process.next_update("terminal"),
+                Err(AgyProcessError::CleanupUncertain)
+            ));
+        }
     }
 
     #[test]

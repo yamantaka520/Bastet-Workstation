@@ -29,6 +29,34 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 cleanup failure propagation
+
+Cleanup errors are now sticky in the owned-child boundary. Agy returns a
+payload-free `CleanupUncertain` error on terminal, timeout, or cancellation
+cleanup failure instead of publishing an authoritative terminal event. Codex
+offers `close_checked`, and the production daemon invokes it before returning
+the provider outcome. Its existing error path records `Uncertain` and withholds
+output. Compatibility `close`/Drop still cannot return errors; they are not
+evidence that all descendants exited.
+
+Exposing the previously suppressed errors revealed macOS `killpg1` returning
+`EPERM` for a group consisting only of its already-exited leader. The exception
+is accepted only after non-reaping exit observation and a complete, bounded
+native group-membership query proving that exact leader is the sole member.
+Other members, truncated/failed inspection, and non-EPERM failures do not receive
+this exception. The leader is still held until after inspection and signaling.
+This follows [Apple's kernel implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c)
+and is covered by positive natural-exit and negative remaining-descendant tests.
+Separate subprocess fixtures deliberately steal wait ownership to verify that
+both adapters retain failure and Agy withholds success. No real providers run.
+
+CI `35003522299` for `0d782de` failed Windows clippy on an unnecessary raw-handle
+cast, before Windows runtime tests; that cast is removed in this patch. Do not
+claim that earlier run verified the Windows reader. Process-tree enforcement,
+synchronous stdin, queued-output limits, and the remaining M2 gates stay open.
+Local full-workspace tests pass (core 83, Agy 22, Codex 67, daemon 99; real
+canaries ignored), along with formatting and workspace/all-target clippy.
+
 ### 2026-09-16 owned subprocess cleanup and cancellable stdout
 
 Both adapter spawn paths immediately acquire `OwnedAdapterChild`, including

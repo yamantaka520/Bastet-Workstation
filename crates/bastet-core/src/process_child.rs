@@ -26,6 +26,7 @@ pub struct OwnedAdapterChild {
     // Never expose mutable Child: group signaling must precede reaping, while
     // the unreaped leader still reserves its PID/PGID against reuse.
     child: Option<Child>,
+    cleanup_failed: bool,
 }
 
 impl OwnedAdapterChild {
@@ -45,6 +46,7 @@ impl OwnedAdapterChild {
         }
         Ok(Self {
             child: Some(command.spawn()?),
+            cleanup_failed: false,
         })
     }
 
@@ -59,7 +61,18 @@ impl OwnedAdapterChild {
     /// Bounded grace, followed by force termination and direct-child reaping.
     /// The OS may still delay reaping an uninterruptible kernel task. This is
     /// not a guarantee that descendants which escaped their group have exited.
+    /// Failure is sticky: repeated shutdown cannot turn lost cleanup evidence
+    /// into success merely because the local Child handle has been discarded.
     pub fn shutdown(&mut self, grace: Duration) -> io::Result<()> {
+        if self.cleanup_failed {
+            return Err(io::Error::other("owned child cleanup previously failed"));
+        }
+        let result = self.shutdown_inner(grace);
+        self.cleanup_failed = result.is_err();
+        result
+    }
+
+    fn shutdown_inner(&mut self, grace: Duration) -> io::Result<()> {
         let Some(child) = self.child.as_mut() else {
             return Ok(());
         };
@@ -93,6 +106,12 @@ impl OwnedAdapterChild {
             // wait/try_wait has reaped the leader, so its id cannot be reused.
             let group_result = unsafe { libc::kill(-pid, libc::SIGKILL) };
             let group_error = (group_result != 0).then(io::Error::last_os_error);
+            #[cfg(target_os = "macos")]
+            let group_error = group_error.filter(|error| {
+                !(error.raw_os_error() == Some(libc::EPERM)
+                    && exited_without_reaping(pid as u32).unwrap_or(false)
+                    && macos_group_contains_only_leader(pid))
+            });
             // Also terminate our direct child if it changed its own group.
             let _ = child.kill();
             let wait_result = child.wait().map(|_| ());
@@ -130,6 +149,32 @@ impl Drop for OwnedAdapterChild {
     fn drop(&mut self) {
         let _ = self.shutdown(Duration::ZERO);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_group_contains_only_leader(pid: i32) -> bool {
+    // XNU killpg1 returns EPERM when its group iteration finds no signalable
+    // member, including an already-exited leader. Never waive EPERM merely
+    // because the leader exited: another live member may be permission-denied.
+    // Verify the complete bounded membership list while the leader is unreaped.
+    const PROC_PGRP_ONLY: u32 = 2; // Darwin sys/proc_info.h
+    let mut members = [0_i32; 1024];
+    let capacity = std::mem::size_of_val(&members) as i32;
+    // SAFETY: writable aligned buffer and exact byte capacity. This read-only
+    // query is restricted to the owned group; no returned PID is signaled.
+    let bytes = unsafe {
+        libc::proc_listpids(
+            PROC_PGRP_ONLY,
+            pid as u32,
+            members.as_mut_ptr().cast(),
+            capacity,
+        )
+    };
+    if bytes <= 0 || bytes >= capacity || bytes % 4 != 0 {
+        return false;
+    }
+    let members = &members[..bytes as usize / 4];
+    members.contains(&pid) && members.iter().all(|member| *member == pid)
 }
 
 #[cfg(unix)]
@@ -200,6 +245,24 @@ mod tests {
     }
 
     #[test]
+    fn natural_leader_exit_is_successful_cleanup() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let mut child = OwnedAdapterChild::spawn(&mut command).unwrap();
+        child.shutdown(Duration::from_millis(100)).unwrap();
+        child.shutdown(Duration::ZERO).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_empty_group_exception_rejects_a_remaining_descendant() {
+        let (mut child, _stdout) = descendant_fixture(true);
+        let pid = child.child.as_ref().unwrap().id() as i32;
+        assert!(!macos_group_contains_only_leader(pid));
+        child.shutdown(Duration::ZERO).unwrap();
+    }
+
+    #[test]
     fn dropping_owned_child_cleans_up_its_group() {
         let (child, mut stdout) = descendant_fixture(false);
         let (sender, receiver) = mpsc::channel();
@@ -252,6 +315,6 @@ mod tests {
         let result = child.shutdown(Duration::from_millis(500));
         assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ECHILD));
         assert!(child.child.is_none());
-        child.shutdown(Duration::ZERO).unwrap();
+        assert!(child.shutdown(Duration::ZERO).is_err());
     }
 }

@@ -305,6 +305,13 @@ fn run_codex(
             bastet_adapter_codex::CodexRunUpdate::Lifecycle(event)
                 if is_terminal(event.event.state) =>
             {
+                // Final provider output does not prove host cleanup succeeded.
+                // Preserve cleanup failure as Uncertain through the runner's
+                // existing sanitized error mapping before publishing output.
+                server
+                    .into_transport()
+                    .close_checked()
+                    .map_err(|_| "provider cleanup could not be confirmed".to_string())?;
                 return Ok(outcome(
                     event.event.state,
                     provider_session_id,

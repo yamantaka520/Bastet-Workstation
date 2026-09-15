@@ -314,6 +314,7 @@ version = "0.1.0"
 dependencies = [
  "bastet-adapter-conformance",
  "bastet-core",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -326,6 +327,7 @@ version = "0.1.0"
 dependencies = [
  "bastet-adapter-conformance",
  "bastet-core",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

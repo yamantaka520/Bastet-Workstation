@@ -78,11 +78,20 @@ impl StdioTransport {
     }
 
     pub fn close(&mut self) {
+        let _ = self.close_checked();
+    }
+
+    /// Reports failures while signaling the owned scope and reaping its leader;
+    /// success is not proof that every descendant exited. Callers publishing a
+    /// terminal outcome must inspect this result.
+    /// A prior failure remains an error on repeated close calls.
+    pub fn close_checked(&mut self) -> std::io::Result<()> {
         self.stdin.take();
-        let _ = self.child.shutdown(self.timeout);
+        let result = self.child.shutdown(self.timeout);
         if let Some(mut reader) = self.reader.take() {
             reader.close();
         }
+        result
     }
 
     fn write_message(&mut self, message: &Value) -> Result<(), TransportError> {
@@ -467,6 +476,33 @@ mod tests {
                 "stdio://",
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_close_retains_a_cleanup_failure() {
+        const MARKER: &str = "BASTET_TEST_CODEX_FOREIGN_REAPER";
+        if std::env::var_os(MARKER).is_none() {
+            assert!(Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "stdio::tests::checked_close_retains_a_cleanup_failure"
+                ])
+                .env(MARKER, "1")
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("provider");
+        write_executable(&provider, "#!/bin/sh\nexit 0\n");
+        let mut transport = StdioTransport::spawn(&provider, Duration::from_secs(2)).unwrap();
+        // SAFETY: only the one finite synthetic provider exists in this
+        // dedicated test subprocess. This deliberately steals its wait status.
+        assert!(unsafe { libc::waitpid(-1, std::ptr::null_mut(), 0) } > 0);
+        assert!(transport.close_checked().is_err());
+        assert!(transport.close_checked().is_err());
     }
 
     #[cfg(unix)]
