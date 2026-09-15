@@ -8,7 +8,7 @@ use std::{
         Arc,
     },
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bastet_core::{
@@ -20,7 +20,6 @@ use thiserror::Error;
 use crate::{RunControlError, RunController, RunControllerRegistry, Store, StoreError};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-const CANCEL_REQUEST_LIFETIME: Duration = Duration::from_millis(1_500);
 const CANCEL_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -42,6 +41,29 @@ pub(crate) struct ProviderOutcome {
 }
 
 impl ProviderOutcome {
+    fn cancelled() -> Self {
+        Self {
+            terminal_state: NormalizedRunState::Cancelled,
+            provider_session_id: None,
+            cost: unknown_cost(),
+            output_markdown: None,
+            failure: Some(AdapterFailure {
+                kind: AdapterFailureKind::Cancelled,
+                message_key: "adapter.failure.cancelled".into(),
+                retryable: false,
+                provider_code: None,
+                redacted_detail: None,
+            }),
+        }
+    }
+
+    fn cancelled_with_evidence(provider_session_id: Option<String>, cost: CostEvidence) -> Self {
+        Self {
+            provider_session_id,
+            cost,
+            ..Self::cancelled()
+        }
+    }
     fn unavailable() -> Self {
         Self {
             terminal_state: NormalizedRunState::Uncertain,
@@ -61,7 +83,6 @@ impl ProviderOutcome {
 
 pub(crate) struct CancelRequest {
     run_id: RunId,
-    expires_at: Instant,
     acknowledgement: SyncSender<Result<(), RunControlError>>,
 }
 
@@ -84,6 +105,7 @@ impl CancelRequest {
 struct ChannelRunController {
     run_id: RunId,
     sender: SyncSender<CancelRequest>,
+    cancellation: bastet_core::CancellationToken,
 }
 
 impl RunController for ChannelRunController {
@@ -95,22 +117,33 @@ impl RunController for ChannelRunController {
         self.sender
             .try_send(CancelRequest {
                 run_id,
-                expires_at: Instant::now() + CANCEL_REQUEST_LIFETIME,
                 acknowledgement,
             })
             .map_err(|_| RunControlError)?;
+        // Intent remains sticky if the HTTP acknowledgement wait times out.
+        // Only the worker can acknowledge successful checked cleanup.
+        self.cancellation.cancel();
         receiver
             .recv_timeout(CANCEL_ACK_TIMEOUT)
             .map_err(|_| RunControlError)?
     }
 }
 
+pub(crate) struct ProviderControl {
+    receiver: Receiver<CancelRequest>,
+    cancellation: bastet_core::CancellationToken,
+}
+
+impl std::ops::Deref for ProviderControl {
+    type Target = Receiver<CancelRequest>;
+    fn deref(&self) -> &Self::Target {
+        &self.receiver
+    }
+}
+
 pub(crate) trait ProviderRunner: Send + Sync + 'static {
-    fn run(
-        &self,
-        receipt: &BeginGraphNodeRunReceipt,
-        control: Receiver<CancelRequest>,
-    ) -> ProviderOutcome;
+    fn run(&self, receipt: &BeginGraphNodeRunReceipt, control: &ProviderControl)
+        -> ProviderOutcome;
 }
 
 #[derive(Clone)]
@@ -152,9 +185,21 @@ impl ProviderExecutor {
         receipt: BeginGraphNodeRunReceipt,
     ) -> Result<(), ProviderExecutorError> {
         let run_id = receipt.run_id;
-        let (sender, control) = mpsc::sync_channel(1);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let cancellation = bastet_core::CancellationToken::default();
+        let control = ProviderControl {
+            receiver,
+            cancellation: cancellation.clone(),
+        };
         self.registry
-            .register(run_id, Arc::new(ChannelRunController { run_id, sender }))
+            .register(
+                run_id,
+                Arc::new(ChannelRunController {
+                    run_id,
+                    sender,
+                    cancellation,
+                }),
+            )
             .map_err(|_| ProviderExecutorError::Controller)?;
 
         let store = self.store.clone();
@@ -171,12 +216,28 @@ impl ProviderExecutor {
                     active,
                 };
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
-                    if store.preflight_provider_launch(&receipt).is_err() {
-                        return ProviderOutcome::unavailable();
+                    if control.cancellation.is_cancelled() {
+                        return ProviderOutcome::cancelled();
                     }
-                    runner.run(&receipt, control)
+                    if store.preflight_provider_launch(&receipt).is_err() {
+                        return if control.cancellation.is_cancelled() {
+                            ProviderOutcome::cancelled()
+                        } else {
+                            ProviderOutcome::unavailable()
+                        };
+                    }
+                    runner.run(&receipt, &control)
                 }))
                 .unwrap_or_else(|_| ProviderOutcome::unavailable());
+                while let Ok(request) = control.try_recv() {
+                    let accepted = request.run_id == run_id
+                        && outcome.terminal_state == NormalizedRunState::Cancelled;
+                    let _ = request.acknowledgement.try_send(if accepted {
+                        Ok(())
+                    } else {
+                        Err(RunControlError)
+                    });
+                }
                 if persist_outcome(&store, &receipt, outcome).is_err() {
                     eprintln!("provider terminal outcome could not be persisted safely");
                 }
@@ -217,7 +278,7 @@ impl ProviderRunner for SystemProviderRunner {
     fn run(
         &self,
         receipt: &BeginGraphNodeRunReceipt,
-        control: Receiver<CancelRequest>,
+        control: &ProviderControl,
     ) -> ProviderOutcome {
         // A metadata selection must never silently use a different ambient
         // CLI login. Enable selected accounts only when a credential broker
@@ -282,48 +343,88 @@ impl Store {
 
 fn run_codex(
     receipt: &BeginGraphNodeRunReceipt,
-    control: Receiver<CancelRequest>,
+    control: &ProviderControl,
     store: &Store,
 ) -> Result<ProviderOutcome, String> {
     let executable = configured_executable("BASTET_CODEX_BIN", "codex")
         .ok_or_else(|| "Codex CLI is unavailable".to_string())?;
+    run_codex_with_launcher(
+        receipt,
+        control,
+        store,
+        executable,
+        &bastet_core::DirectAdapterProcessLauncher,
+    )
+}
+
+fn run_codex_with_launcher(
+    receipt: &BeginGraphNodeRunReceipt,
+    control: &ProviderControl,
+    store: &Store,
+    executable: PathBuf,
+    launcher: &dyn bastet_core::AdapterProcessLauncher,
+) -> Result<ProviderOutcome, String> {
     let adapter = bastet_adapter_codex::CodexAdapter::new(executable);
-    let mut server = adapter
-        .connect_app_server(PROVIDER_TIMEOUT)
-        .map_err(|error| error.to_string())?;
-    let mut started = server
-        .start_tracked_run(bastet_adapter_codex::CodexRunRequest {
-            run_id: receipt.run_id,
-            model: receipt.model.clone(),
-            prompt: receipt.prompt.clone(),
-            cwd: PathBuf::from(&receipt.workspace_root),
-            approval_policy: bastet_adapter_codex::ApprovalPolicy::Never,
-            sandbox_policy: bastet_adapter_codex::TurnSandboxPolicy::ReadOnly,
-            effort: Some("medium".into()),
-        })
-        .map_err(|error| error.to_string())?;
+    let mut server = match adapter.connect_app_server_with_launcher_and_cancel(
+        PROVIDER_TIMEOUT,
+        launcher,
+        control.cancellation.clone(),
+    ) {
+        Ok(server) => server,
+        Err(bastet_adapter_codex::AppServerError::Transport(
+            bastet_adapter_codex::TransportError::Cancelled,
+        )) => return Ok(ProviderOutcome::cancelled()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut started = match server.start_tracked_run(bastet_adapter_codex::CodexRunRequest {
+        run_id: receipt.run_id,
+        model: receipt.model.clone(),
+        prompt: receipt.prompt.clone(),
+        cwd: PathBuf::from(&receipt.workspace_root),
+        approval_policy: bastet_adapter_codex::ApprovalPolicy::Never,
+        sandbox_policy: bastet_adapter_codex::TurnSandboxPolicy::ReadOnly,
+        effort: Some("medium".into()),
+    }) {
+        Ok(started) => started,
+        Err(bastet_adapter_codex::RunTrackerError::AppServer(
+            bastet_adapter_codex::AppServerError::Transport(
+                bastet_adapter_codex::TransportError::Cancelled,
+            ),
+        )) => return Ok(ProviderOutcome::cancelled()),
+        Err(error) => return Err(error.to_string()),
+    };
     let provider_session_id = Some(started.thread.thread_id.clone());
     let mut cost = unknown_cost();
     let mut saw_running = false;
     loop {
-        if saw_running {
-            service_cancel(&control, receipt.run_id, || {
-                started
-                    .tracker
-                    .request_cancellation_with_timeout(
-                        &mut server,
-                        &timestamp_ms(),
-                        Duration::from_secs(1),
-                    )
-                    .map(|_| ())
-                    .map_err(|_| RunControlError)
-            });
+        if control.cancellation.is_cancelled() {
+            server
+                .into_transport()
+                .close_checked()
+                .map_err(|_| "provider cleanup could not be confirmed".to_string())?;
+            return Ok(ProviderOutcome::cancelled_with_evidence(
+                provider_session_id,
+                cost,
+            ));
         }
-        let Some(update) = started
+        let update = match started
             .tracker
             .poll_update(&mut server, &timestamp_ms(), POLL_INTERVAL)
-            .map_err(|error| error.to_string())?
-        else {
+        {
+            Ok(update) => update,
+            Err(bastet_adapter_codex::RunTrackerError::AppServer(
+                bastet_adapter_codex::AppServerError::Transport(
+                    bastet_adapter_codex::TransportError::Cancelled,
+                ),
+            )) => {
+                return Ok(ProviderOutcome::cancelled_with_evidence(
+                    provider_session_id,
+                    cost,
+                ))
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let Some(update) = update else {
             continue;
         };
         match update {
@@ -363,12 +464,28 @@ fn run_codex(
 
 fn run_agy(
     receipt: &BeginGraphNodeRunReceipt,
-    control: Receiver<CancelRequest>,
+    control: &ProviderControl,
     store: &Store,
 ) -> Result<ProviderOutcome, String> {
     let executable = configured_executable("BASTET_AGY_BIN", "agy")
         .ok_or_else(|| "Agy CLI is unavailable".to_string())?;
-    let mut process = bastet_adapter_agy::AgyProcess::spawn(
+    run_agy_with_launcher(
+        receipt,
+        control,
+        store,
+        executable,
+        &bastet_core::DirectAdapterProcessLauncher,
+    )
+}
+
+fn run_agy_with_launcher(
+    receipt: &BeginGraphNodeRunReceipt,
+    control: &ProviderControl,
+    store: &Store,
+    executable: PathBuf,
+    launcher: &dyn bastet_core::AdapterProcessLauncher,
+) -> Result<ProviderOutcome, String> {
+    let mut process = match bastet_adapter_agy::AgyProcess::spawn_with_launcher_and_cancel(
         executable,
         bastet_adapter_agy::AgyRunRequest {
             run_id: receipt.run_id,
@@ -380,18 +497,26 @@ fn run_agy(
             timeout: PROVIDER_TIMEOUT,
             conversation_id: None,
         },
-    )
-    .map_err(|error| error.to_string())?;
+        launcher,
+        &control.cancellation,
+    ) {
+        Ok(process) => process,
+        Err(bastet_adapter_agy::AgyProcessError::Cancelled) => {
+            return Ok(ProviderOutcome::cancelled())
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let mut cost = unknown_cost();
     let mut saw_running = false;
     loop {
-        if saw_running {
-            service_cancel(&control, receipt.run_id, || {
-                process
-                    .request_cancellation(&timestamp_ms())
-                    .map(|_| ())
-                    .map_err(|_| RunControlError)
-            });
+        if control.cancellation.is_cancelled() {
+            process
+                .cancel_and_close()
+                .map_err(|error| error.to_string())?;
+            return Ok(ProviderOutcome::cancelled_with_evidence(
+                process.conversation_id().map(str::to_owned),
+                cost,
+            ));
         }
         let Some(update) = process
             .poll_update(&timestamp_ms(), POLL_INTERVAL)
@@ -425,22 +550,6 @@ fn run_agy(
             }
         }
     }
-}
-
-fn service_cancel(
-    control: &Receiver<CancelRequest>,
-    run_id: RunId,
-    cancel: impl FnOnce() -> Result<(), RunControlError>,
-) {
-    let Ok(request) = control.try_recv() else {
-        return;
-    };
-    let result = if request.run_id != run_id || Instant::now() > request.expires_at {
-        Err(RunControlError)
-    } else {
-        cancel()
-    };
-    let _ = request.acknowledgement.try_send(result);
 }
 
 fn outcome(
@@ -600,6 +709,178 @@ fn configured_executable(variable: &str, name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn controller_keeps_intent_after_ack_timeout_and_rejects_wrong_run() {
+        let run_id = RunId::new();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let cancellation = bastet_core::CancellationToken::default();
+        let controller = ChannelRunController {
+            run_id,
+            sender,
+            cancellation: cancellation.clone(),
+        };
+        assert!(controller.cancel(RunId::new()).is_err());
+        assert!(!cancellation.is_cancelled());
+        assert!(receiver.try_recv().is_err());
+        assert!(controller.cancel(run_id).is_err());
+        assert!(
+            cancellation.is_cancelled(),
+            "HTTP timeout must not withdraw intent"
+        );
+        let request = receiver.try_recv().unwrap();
+        assert_eq!(request.run_id, run_id);
+        // Late cleanup acknowledgement cannot fabricate a successful HTTP response.
+        assert!(request.acknowledgement.try_send(Ok(())).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn starting_adapter_cancel_is_acknowledged_only_after_checked_cleanup() {
+        use std::sync::Mutex;
+        struct SilentLauncher(PathBuf);
+        impl bastet_core::AdapterProcessLauncher for SilentLauncher {
+            fn command(&self, _: &std::path::Path) -> std::io::Result<std::process::Command> {
+                let mut command = std::process::Command::new("/bin/sh");
+                command.current_dir(&self.0).args([
+                    "-c",
+                    "IFS= read -r request; printf ready > startup-ready; exec /bin/sleep 30",
+                ]);
+                Ok(command)
+            }
+        }
+        struct StartupRunner {
+            store: Store,
+            launcher: SilentLauncher,
+            codex: bool,
+            cleaned: SyncSender<()>,
+            release: Mutex<Receiver<()>>,
+            cleanup_failure: bool,
+        }
+        impl ProviderRunner for StartupRunner {
+            fn run(
+                &self,
+                receipt: &BeginGraphNodeRunReceipt,
+                control: &ProviderControl,
+            ) -> ProviderOutcome {
+                // Agy validates the executable exists even with an injected
+                // launcher. Only the synthetic shell command is ever executed.
+                let executable = PathBuf::from("/bin/sh");
+                let outcome = if self.codex {
+                    run_codex_with_launcher(
+                        receipt,
+                        control,
+                        &self.store,
+                        executable,
+                        &self.launcher,
+                    )
+                } else {
+                    run_agy_with_launcher(receipt, control, &self.store, executable, &self.launcher)
+                }
+                .unwrap();
+                assert_eq!(outcome.terminal_state, NormalizedRunState::Cancelled);
+                self.cleaned.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                // Conservative worker boundary when a runner cannot certify cleanup.
+                if self.cleanup_failure {
+                    ProviderOutcome::unavailable()
+                } else {
+                    outcome
+                }
+            }
+        }
+        for (codex, cleanup_failure) in [(true, false), (false, false), (true, true)] {
+            let (_directory, workspace, store, id) = crate::tests::provider_execution_fixture();
+            let receipt = crate::tests::begin_fixture_node(&store, id);
+            let registry = RunControllerRegistry::default();
+            let (cleaned, cleanup) = mpsc::sync_channel(1);
+            let (release, gate) = mpsc::sync_channel(1);
+            let executor = ProviderExecutor::with_runner(
+                store.clone(),
+                registry.clone(),
+                Arc::new(StartupRunner {
+                    store: store.clone(),
+                    launcher: SilentLauncher(workspace.path().into()),
+                    codex,
+                    cleaned,
+                    release: Mutex::new(gate),
+                    cleanup_failure,
+                }),
+            );
+            executor.start(receipt.clone()).unwrap();
+            let marker = workspace.path().join("startup-ready");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !marker.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(marker.exists());
+            store
+                .preflight_provider_cancel(receipt.run_id, store.catalog().unwrap().revision)
+                .unwrap();
+            let run_id = receipt.run_id;
+            let (ack, response) = mpsc::sync_channel(1);
+            let controller = thread::spawn(move || {
+                ack.send(registry.cancel(run_id)).unwrap();
+            });
+            cleanup.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(matches!(
+                response.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            assert_eq!(
+                store
+                    .catalog()
+                    .unwrap()
+                    .catalog
+                    .runs
+                    .iter()
+                    .find(|run| run.metadata.id == run_id)
+                    .unwrap()
+                    .state,
+                NormalizedRunState::Starting
+            );
+            assert!(!store
+                .events_after(0)
+                .unwrap()
+                .iter()
+                .any(|event| event.event_type.starts_with("run.cancel_accepted")));
+            release.send(()).unwrap();
+            assert_eq!(
+                response
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .is_ok(),
+                !cleanup_failure
+            );
+            controller.join().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while executor.has_active() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!executor.has_active());
+            assert_eq!(
+                store
+                    .catalog()
+                    .unwrap()
+                    .catalog
+                    .runs
+                    .iter()
+                    .find(|run| run.metadata.id == run_id)
+                    .unwrap()
+                    .state,
+                if cleanup_failure {
+                    NormalizedRunState::Uncertain
+                } else {
+                    NormalizedRunState::Cancelled
+                }
+            );
+        }
+    }
 
     #[test]
     fn system_runner_rejects_denied_prerequisites_before_adapter_selection() {
@@ -623,7 +904,13 @@ mod tests {
             store: store.clone(),
         };
         let (_sender, control) = mpsc::sync_channel(1);
-        let result = runner.run(&receipt, control);
+        let result = runner.run(
+            &receipt,
+            &ProviderControl {
+                receiver: control,
+                cancellation: Default::default(),
+            },
+        );
         assert_eq!(result.terminal_state, NormalizedRunState::Blocked);
         assert_eq!(
             result.failure.unwrap().kind,
@@ -700,7 +987,13 @@ mod tests {
             event_sequence: 0,
         };
         let (_sender, control) = mpsc::sync_channel(1);
-        let result = runner.run(&receipt, control);
+        let result = runner.run(
+            &receipt,
+            &ProviderControl {
+                receiver: control,
+                cancellation: Default::default(),
+            },
+        );
         assert_eq!(result.terminal_state, NormalizedRunState::Blocked);
         assert_eq!(
             result.failure.unwrap().kind,

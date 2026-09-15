@@ -36,6 +36,8 @@ pub enum AgyProcessError {
     Unavailable,
     #[error("Agy CLI process timed out")]
     TimedOut,
+    #[error("Agy startup was cancelled after local cleanup")]
+    Cancelled,
     #[error("Agy CLI process cleanup could not be confirmed")]
     CleanupUncertain,
     #[error(transparent)]
@@ -72,7 +74,26 @@ impl AgyProcess {
         request: AgyRunRequest,
         launcher: &dyn AdapterProcessLauncher,
     ) -> Result<Self, AgyProcessError> {
+        Self::spawn_with_launcher_and_cancel(
+            executable,
+            request,
+            launcher,
+            &bastet_core::CancellationToken::default(),
+        )
+    }
+
+    /// A cancellation result is returned only after any acquired child has
+    /// been locally cleaned up. A token is intent, never an approval grant.
+    pub fn spawn_with_launcher_and_cancel(
+        executable: PathBuf,
+        request: AgyRunRequest,
+        launcher: &dyn AdapterProcessLauncher,
+        cancellation: &bastet_core::CancellationToken,
+    ) -> Result<Self, AgyProcessError> {
         validate_request(&executable, &request)?;
+        if cancellation.is_cancelled() {
+            return Err(AgyProcessError::Cancelled);
+        }
         // Encode and bound the entire frame before a child exists. This keeps
         // oversized or invalid requests from launching a provider at all.
         let input_frame = encode_json_line(&json!({
@@ -130,6 +151,9 @@ impl AgyProcess {
         }
         // From this point the child is exclusively owned, so every fallible
         // initialization path below cleans it up through OwnedAdapterChild.
+        if cancellation.is_cancelled() {
+            return Err(AgyProcessError::Cancelled);
+        }
         let mut child =
             OwnedAdapterChild::spawn(&mut command).map_err(|_| AgyProcessError::Unavailable)?;
         let raw_stdin = match child.take_stdin() {
@@ -175,12 +199,22 @@ impl AgyProcess {
                 AgyProcessError::InvalidRequest,
             );
         };
-        if let Err(error) = stdin.write_frame(input_frame, write_deadline) {
+        if let Err(error) = stdin.write_frame_cancellable(input_frame, write_deadline, cancellation)
+        {
+            let error = if error.kind() == io::ErrorKind::Interrupted && cancellation.is_cancelled()
+            {
+                AgyProcessError::Cancelled
+            } else {
+                map_input_error(error)
+            };
+            return startup_failure(&mut child, Some(&mut stdin), Some(&mut reader), error);
+        }
+        if cancellation.is_cancelled() {
             return startup_failure(
                 &mut child,
                 Some(&mut stdin),
                 Some(&mut reader),
-                map_input_error(error),
+                AgyProcessError::Cancelled,
             );
         }
         let mut stream = if let Some(conversation_id) = request.conversation_id {
@@ -238,6 +272,13 @@ impl AgyProcess {
 
     pub fn conversation_id(&self) -> Option<&str> {
         self.stream.conversation_id()
+    }
+
+    /// Host-owned stop, also valid before a provider init event. The caller
+    /// owns lifecycle projection and must inspect cleanup before acknowledging.
+    pub fn cancel_and_close(&mut self) -> Result<(), AgyProcessError> {
+        self.cancellation_requested = true;
+        self.terminate()
     }
 
     /// Returns the bounded final assistant Markdown retained outside the
@@ -598,6 +639,36 @@ mod tests {
             Err(AgyProcessError::Unavailable)
         ));
         assert_eq!(launcher.calls.get(), 1);
+    }
+
+    #[test]
+    fn cancellation_stops_ready_provider_during_initial_prompt_write() {
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("cancel-ready");
+        let cancellation = bastet_core::CancellationToken::default();
+        let signal = cancellation.clone();
+        let canceller = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ready.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(ready.exists(), "fixture must bootstrap before cancellation");
+            signal.cancel();
+        });
+        let request = AgyRunRequest {
+            prompt: "x".repeat(512 * 1024),
+            ..fixture_request(&root, "cancel-never-read")
+        };
+        let started = Instant::now();
+        let result = AgyProcess::spawn_with_launcher_and_cancel(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/poll-provider.sh"),
+            request,
+            &DirectAdapterProcessLauncher,
+            &cancellation,
+        );
+        canceller.join().unwrap();
+        assert!(matches!(result, Err(AgyProcessError::Cancelled)));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]

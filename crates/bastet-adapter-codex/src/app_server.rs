@@ -115,6 +115,8 @@ impl CodexFinalOutput {
 
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum TransportError {
+    #[error("Codex transport was cancelled after local cleanup")]
+    Cancelled,
     #[error("Codex app-server transport is unavailable")]
     Unavailable,
     #[error("Codex app-server transport timed out")]

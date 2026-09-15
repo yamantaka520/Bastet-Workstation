@@ -29,6 +29,35 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 cooperative startup cancellation
+
+Supersedes the pre-Running limitation recorded below. The daemon now permits
+revision-guarded cancellation of Starting runs and binds one sticky cancellation
+token to each owned worker. Both adapter constructors accept it; bounded stdin
+writes and Codex handshake/RPC/notification waits observe cancellation. Agy can
+close its owned process before the provider emits initialization. A token is
+intent only: the worker acknowledges only after a Cancelled outcome with checked
+local cleanup; cleanup uncertainty rejects acceptance and remains Uncertain.
+The route still persists acceptance only after the controller accepts. A two-second
+HTTP acknowledgement timeout does not withdraw the cancellation intent, and a
+natural terminal result winning the race is not fabricated into cancellation.
+Already-observed session/cost evidence is preserved; partial output is not published.
+
+Synthetic tests cover blocked stdin, pre-cancelled launch, Codex initialization
+and reply waits, both adapter-to-worker startup paths, delayed acknowledgement,
+cleanup-error rejection, wrong-run isolation, sticky timeout intent, and Starting
+and Running HTTP terminal races. Core cancellation fixtures are native Rust and
+cross-platform; adapter/worker subprocess probes currently run on Unix. No real
+provider, credential, or external service is used. Local process cleanup is not
+proof of remote provider cancellation or adversarial descendant containment;
+Windows Job containment, native Windows adapter fixtures, bounded stdout queues,
+production sandbox binding, network destinations, and authentication gates remain.
+M2 stays open.
+
+The preceding Windows correction `2a12845` is now verified by CI `35011183014`:
+macOS, Ubuntu (including all three explicit native sandbox probes), and Windows
+passed. This closes that specific overlapped-stdin regression, not all M2 gates.
+
 ### 2026-09-16 Windows overlapped stdin correction
 
 CI `35010313693` passed Ubuntu but Windows job `104520323208` failed the native

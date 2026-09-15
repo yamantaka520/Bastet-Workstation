@@ -141,8 +141,26 @@ impl CodexAdapter<SystemCommandRunner> {
         timeout: Duration,
         launcher: &dyn AdapterProcessLauncher,
     ) -> Result<CodexAppServer<StdioTransport>, AppServerError> {
-        let transport = StdioTransport::spawn_with_launcher(&self.executable, timeout, launcher)
-            .map_err(AppServerError::Transport)?;
+        self.connect_app_server_with_launcher_and_cancel(
+            timeout,
+            launcher,
+            bastet_core::CancellationToken::default(),
+        )
+    }
+
+    pub fn connect_app_server_with_launcher_and_cancel(
+        &self,
+        timeout: Duration,
+        launcher: &dyn bastet_core::AdapterProcessLauncher,
+        cancellation: bastet_core::CancellationToken,
+    ) -> Result<CodexAppServer<StdioTransport>, AppServerError> {
+        let transport = StdioTransport::spawn_with_launcher_and_cancel(
+            &self.executable,
+            timeout,
+            launcher,
+            cancellation,
+        )
+        .map_err(AppServerError::Transport)?;
         let mut server = CodexAppServer::new(transport);
         server.initialize()?;
         Ok(server)

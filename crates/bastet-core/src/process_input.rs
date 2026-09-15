@@ -21,6 +21,20 @@ use serde::Serialize;
 pub const MAX_INPUT_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Cooperative cancellation intent, not proof of process cleanup or authority.
+/// The coordinator must bind each token to exactly one owned run.
+#[derive(Clone, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 struct WriteRequest {
     frame: Vec<u8>,
     deadline: Instant,
@@ -69,11 +83,29 @@ impl ProcessInputWriter {
     /// A timeout is terminal because the pipe may contain an indeterminate
     /// prefix of the frame.
     pub fn write_frame(&mut self, frame: Vec<u8>, deadline: Instant) -> io::Result<()> {
+        self.write_frame_cancellable(frame, deadline, &CancellationToken::default())
+    }
+
+    /// Cancellation closes and poisons the pipe, returning Interrupted. The
+    /// caller still must terminate/reap its owned child before acknowledging.
+    pub fn write_frame_cancellable(
+        &mut self,
+        frame: Vec<u8>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> io::Result<()> {
         if self.poisoned || self.sender.is_none() {
             return Err(unusable_error());
         }
         if frame.len() > MAX_INPUT_FRAME_BYTES {
             return Err(oversized_error());
+        }
+        if cancellation.is_cancelled() {
+            self.poison_and_close();
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "stdin cancelled",
+            ));
         }
         if Instant::now() >= deadline {
             self.poison_and_close();
@@ -88,6 +120,13 @@ impl ProcessInputWriter {
         };
         let sender = self.sender.as_ref().expect("checked above");
         loop {
+            if cancellation.is_cancelled() {
+                self.poison_and_close();
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "stdin cancelled",
+                ));
+            }
             if Instant::now() >= deadline {
                 self.poison_and_close();
                 return Err(timed_out_error());
@@ -109,19 +148,32 @@ impl ProcessInputWriter {
             }
         }
 
-        match result_receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => {
+        loop {
+            if cancellation.is_cancelled() {
                 self.poison_and_close();
-                Err(error)
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "stdin cancelled",
+                ));
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.poison_and_close();
-                Err(timed_out_error())
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                self.poison_and_close();
-                Err(unusable_error())
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match result_receiver.recv_timeout(remaining.min(POLL_INTERVAL)) {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error)) => {
+                    self.poison_and_close();
+                    return Err(error);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if Instant::now() < deadline {
+                        continue;
+                    }
+                    self.poison_and_close();
+                    return Err(timed_out_error());
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.poison_and_close();
+                    return Err(unusable_error());
+                }
             }
         }
     }
@@ -458,6 +510,63 @@ mod tests {
         // Wait for its explicit bounded fixture completion before reading.
         wait_for(&receiver, COMPLETE);
         assert_eq!(fs::read(output.path()).unwrap(), b"hello bounded stdin\n");
+        reader.close();
+        child.shutdown(Duration::ZERO).unwrap();
+    }
+
+    #[test]
+    fn cancellation_interrupts_a_blocked_write_before_its_deadline() {
+        let (mut child, mut writer, mut reader, receiver) = spawn_fixture("never-read", None);
+        wait_for(&receiver, READY);
+        let cancellation = CancellationToken::default();
+        let signal = cancellation.clone();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            signal.cancel();
+        });
+        let start = Instant::now();
+        let result = writer.write_frame_cancellable(
+            vec![b'x'; MAX_INPUT_FRAME_BYTES],
+            start + Duration::from_secs(10),
+            &cancellation,
+        );
+        canceller.join().unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert_eq!(
+            writer
+                .write_frame(vec![b'x'], Instant::now() + Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        reader.close();
+        child.shutdown(Duration::ZERO).unwrap();
+    }
+
+    #[test]
+    fn pre_cancelled_token_delivers_no_input_and_does_not_cancel_another_token() {
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let (mut child, mut writer, mut reader, receiver) =
+            spawn_fixture("read", Some(output.path()));
+        wait_for(&receiver, READY);
+        let cancellation = CancellationToken::default();
+        let independent = CancellationToken::default();
+        cancellation.cancel();
+        assert!(!independent.is_cancelled());
+        assert_eq!(
+            writer
+                .write_frame_cancellable(
+                    b"forbidden".to_vec(),
+                    Instant::now() + Duration::from_secs(10),
+                    &cancellation
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        wait_for(&receiver, COMPLETE);
+        assert!(fs::read(output.path()).unwrap().is_empty());
         reader.close();
         child.shutdown(Duration::ZERO).unwrap();
     }

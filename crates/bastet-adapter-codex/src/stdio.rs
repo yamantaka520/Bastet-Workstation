@@ -16,6 +16,7 @@ use bastet_core::{
 };
 
 pub struct StdioTransport {
+    cancellation: bastet_core::CancellationToken,
     child: OwnedAdapterChild,
     stdin: Option<ProcessInputWriter>,
     responses: Receiver<Result<Value, TransportError>>,
@@ -37,10 +38,27 @@ impl StdioTransport {
         timeout: Duration,
         launcher: &dyn AdapterProcessLauncher,
     ) -> Result<Self, TransportError> {
+        Self::spawn_with_launcher_and_cancel(
+            executable,
+            timeout,
+            launcher,
+            bastet_core::CancellationToken::default(),
+        )
+    }
+
+    pub fn spawn_with_launcher_and_cancel(
+        executable: &Path,
+        timeout: Duration,
+        launcher: &dyn AdapterProcessLauncher,
+        cancellation: bastet_core::CancellationToken,
+    ) -> Result<Self, TransportError> {
         if timeout.is_zero() {
             return Err(TransportError::ProtocolDrift);
         }
         deadline_after(timeout)?;
+        if cancellation.is_cancelled() {
+            return Err(TransportError::Cancelled);
+        }
         let mut command = launcher
             .command(executable)
             .map_err(|_| TransportError::Unavailable)?;
@@ -68,6 +86,7 @@ impl StdioTransport {
         })
         .map_err(|_| TransportError::Unavailable)?;
         Ok(Self {
+            cancellation,
             child,
             stdin: Some(stdin),
             responses,
@@ -102,38 +121,58 @@ impl StdioTransport {
     }
 
     fn write_message(&mut self, message: &Value, deadline: Instant) -> Result<(), TransportError> {
+        self.check_cancelled()?;
         let frame = encode_json_line(message).map_err(|_| TransportError::ProtocolDrift)?;
         let stdin = self.stdin.as_mut().ok_or(TransportError::Unavailable)?;
-        if let Err(error) = stdin.write_frame(frame, deadline) {
+        if let Err(error) = stdin.write_frame_cancellable(frame, deadline, &self.cancellation) {
             // A partially delivered JSON frame cannot be retried on this pipe.
             // Force cleanup before returning; uncertainty overrides timeout.
             self.close_with_grace(Duration::ZERO)
                 .map_err(|_| TransportError::Unavailable)?;
-            return Err(if error.kind() == io::ErrorKind::TimedOut {
-                TransportError::TimedOut
-            } else {
-                TransportError::Unavailable
-            });
+            return Err(
+                if error.kind() == io::ErrorKind::Interrupted && self.cancellation.is_cancelled() {
+                    TransportError::Cancelled
+                } else if error.kind() == io::ErrorKind::TimedOut {
+                    TransportError::TimedOut
+                } else {
+                    TransportError::Unavailable
+                },
+            );
         }
         Ok(())
     }
 
     fn receive_message(&mut self, deadline: Instant) -> Result<Value, TransportError> {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(TransportError::TimedOut)?;
-        match self.responses.recv_timeout(remaining) {
-            Ok(message) => {
-                let message = message?;
-                // Activity observed while an RPC is in flight is still
-                // provider transport activity. Preserve it for subsequent
-                // bounded run polling rather than carrying a stale deadline.
-                self.notification_deadline = Some(deadline_after(self.timeout)?);
-                Ok(message)
+        loop {
+            self.check_cancelled()?;
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(TransportError::TimedOut)?;
+            match self
+                .responses
+                .recv_timeout(remaining.min(Duration::from_millis(50)))
+            {
+                Ok(message) => {
+                    let message = message?;
+                    // Activity observed while an RPC is in flight is still
+                    // provider transport activity. Preserve it for subsequent
+                    // bounded run polling rather than carrying a stale deadline.
+                    self.notification_deadline = Some(deadline_after(self.timeout)?);
+                    return Ok(message);
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return Err(TransportError::Unavailable),
             }
-            Err(RecvTimeoutError::Timeout) => Err(TransportError::TimedOut),
-            Err(RecvTimeoutError::Disconnected) => Err(TransportError::Unavailable),
         }
+    }
+
+    fn check_cancelled(&mut self) -> Result<(), TransportError> {
+        if self.cancellation.is_cancelled() {
+            self.close_with_grace(Duration::ZERO)
+                .map_err(|_| TransportError::Unavailable)?;
+            return Err(TransportError::Cancelled);
+        }
+        Ok(())
     }
 }
 
@@ -168,6 +207,7 @@ impl AppServerTransport for StdioTransport {
         max_wait: Duration,
     ) -> Result<Option<AppServerNotification>, TransportError> {
         let observation_deadline = deadline_after(max_wait)?;
+        self.check_cancelled()?;
         if let Some(notification) = self.pending_notifications.pop_front() {
             self.notification_deadline = Some(deadline_after(self.timeout)?);
             return Ok(Some(notification));
@@ -185,11 +225,15 @@ impl AppServerTransport for StdioTransport {
             return Err(TransportError::TimedOut);
         }
         loop {
+            self.check_cancelled()?;
             let now = Instant::now();
             let wait = observation_deadline
                 .min(inactivity_deadline)
                 .saturating_duration_since(now);
-            match self.responses.recv_timeout(wait) {
+            match self
+                .responses
+                .recv_timeout(wait.min(Duration::from_millis(50)))
+            {
                 Ok(Ok(message)) if self.discard_abandoned_response(&message) => {
                     // Quarantined RPC replies are not new run activity, and
                     // must not restart this observation's bounded wait.
@@ -210,7 +254,10 @@ impl AppServerTransport for StdioTransport {
                 Err(RecvTimeoutError::Timeout) if Instant::now() >= inactivity_deadline => {
                     return Err(TransportError::TimedOut);
                 }
-                Err(RecvTimeoutError::Timeout) => return Ok(None),
+                Err(RecvTimeoutError::Timeout) if Instant::now() >= observation_deadline => {
+                    return Ok(None)
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
             }
         }
     }
@@ -585,6 +632,98 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cancellation_closes_handshake_response_wait_and_blocked_write() {
+        struct SilentProvider {
+            directory: std::path::PathBuf,
+            read_request: bool,
+        }
+        impl AdapterProcessLauncher for SilentProvider {
+            fn command(&self, _: &Path) -> io::Result<Command> {
+                let mut command = Command::new("/bin/sh");
+                command.current_dir(&self.directory).args([
+                    "-c",
+                    if self.read_request {
+                        "IFS= read -r request; printf ready > cancel-ready; exec /bin/sleep 30"
+                    } else {
+                        "printf ready > cancel-ready; exec /bin/sleep 30"
+                    },
+                ]);
+                Ok(command)
+            }
+        }
+        for mode in 0..3 {
+            let directory = tempfile::tempdir().unwrap();
+            let token = bastet_core::CancellationToken::default();
+            let cancel = token.clone();
+            let marker = directory.path().join("cancel-ready");
+            let mut transport = StdioTransport::spawn_with_launcher_and_cancel(
+                Path::new("/synthetic/not-a-provider"),
+                Duration::from_secs(10),
+                &SilentProvider {
+                    directory: directory.path().into(),
+                    read_request: mode != 2,
+                },
+                token,
+            )
+            .unwrap();
+            let trigger = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !marker.exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(
+                    marker.exists(),
+                    "synthetic provider never reached request wait"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+                cancel.cancel();
+            });
+            let started = Instant::now();
+            if mode == 0 {
+                let mut server = crate::CodexAppServer::new(transport);
+                assert!(matches!(
+                    server.initialize(),
+                    Err(crate::AppServerError::Transport(TransportError::Cancelled))
+                ));
+                transport = server.into_transport();
+            } else {
+                let params = if mode == 2 {
+                    json!({"prompt": "x".repeat(2 * 1024 * 1024)})
+                } else {
+                    json!({})
+                };
+                assert_eq!(
+                    transport.request("fixture/request", params),
+                    Err(TransportError::Cancelled)
+                );
+            }
+            trigger.join().unwrap();
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert!(transport.stdin.is_none());
+            transport.close_checked().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_cancelled_transport_never_invokes_the_launcher() {
+        let token = bastet_core::CancellationToken::default();
+        token.cancel();
+        let launcher = RejectingLauncher(AtomicUsize::new(0));
+        assert!(matches!(
+            StdioTransport::spawn_with_launcher_and_cancel(
+                Path::new("/synthetic/not-a-provider"),
+                Duration::from_secs(10),
+                &launcher,
+                token,
+            ),
+            Err(TransportError::Cancelled)
+        ));
+        assert_eq!(launcher.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn checked_close_retains_a_cleanup_failure() {
         const MARKER: &str = "BASTET_TEST_CODEX_FOREIGN_REAPER";
         if std::env::var_os(MARKER).is_none() {
@@ -606,6 +745,11 @@ mod tests {
         // SAFETY: only the one finite synthetic provider exists in this
         // dedicated test subprocess. This deliberately steals its wait status.
         assert!(unsafe { libc::waitpid(-1, std::ptr::null_mut(), 0) } > 0);
+        transport.cancellation.cancel();
+        assert_eq!(
+            transport.notify("after-cancel", json!({})),
+            Err(TransportError::Unavailable)
+        );
         assert!(transport.close_checked().is_err());
         assert!(transport.close_checked().is_err());
     }
@@ -665,6 +809,7 @@ mod tests {
         let (sender, responses) = mpsc::channel();
         (
             StdioTransport {
+                cancellation: bastet_core::CancellationToken::default(),
                 child,
                 stdin,
                 responses,

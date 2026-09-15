@@ -1531,7 +1531,8 @@ impl Store {
         })
     }
 
-    /// Persists cancellation only after the daemon-owned provider controller accepted interrupt.
+    /// Validates cancellation intent without persisting acceptance. The route
+    /// records acceptance only after the daemon-owned controller confirms it.
     pub fn preflight_provider_cancel(
         &self,
         run_id: RunId,
@@ -1557,7 +1558,9 @@ impl Store {
             .ok_or(StoreError::RunNotFound)?;
         if !matches!(
             run.state,
-            bastet_core::NormalizedRunState::Running | bastet_core::NormalizedRunState::Recovering
+            bastet_core::NormalizedRunState::Starting
+                | bastet_core::NormalizedRunState::Running
+                | bastet_core::NormalizedRunState::Recovering
         ) {
             return Err(StoreError::InvalidRunState(
                 format!("{:?}", run.state).to_lowercase(),
@@ -4005,7 +4008,7 @@ mod tests {
         fn run(
             &self,
             receipt: &BeginGraphNodeRunReceipt,
-            control: std::sync::mpsc::Receiver<provider_executor::CancelRequest>,
+            control: &provider_executor::ProviderControl,
         ) -> provider_executor::ProviderOutcome {
             let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
             self.max_active.fetch_max(active, Ordering::AcqRel);
@@ -4088,7 +4091,7 @@ mod tests {
         fn run(
             &self,
             _receipt: &BeginGraphNodeRunReceipt,
-            _control: std::sync::mpsc::Receiver<provider_executor::CancelRequest>,
+            _control: &provider_executor::ProviderControl,
         ) -> provider_executor::ProviderOutcome {
             panic!("fixture provider crash")
         }
@@ -4247,6 +4250,11 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_provider_cancel_survives_immediate_terminal_race() {
+        assert_accepted_cancel_terminal_race(false).await;
+        assert_accepted_cancel_terminal_race(true).await;
+    }
+
+    async fn assert_accepted_cancel_terminal_race(starting: bool) {
         let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
         let runner = Arc::new(FixtureProviderRunner::new(
             Some(true),
@@ -4286,9 +4294,11 @@ mod tests {
                 .iter()
                 .any(|node| node.state == bastet_core::GraphNodeState::Succeeded)
         });
-        store
-            .record_provider_running(codex_run, Some("fixture-codex-session"))
-            .unwrap();
+        if !starting {
+            store
+                .record_provider_running(codex_run, Some("fixture-codex-session"))
+                .unwrap();
+        }
         let response = router
             .clone()
             .oneshot(
@@ -4471,13 +4481,23 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(matches!(
-            store.preflight_provider_cancel(
-                receipt.run_id,
-                store.catalog().unwrap().revision
-            ),
-            Err(StoreError::InvalidRunState(state)) if state == "starting"
-        ));
+        // Starting work is cancellable before a provider emits Running, but
+        // preflight alone must never project cancellation acceptance.
+        store
+            .preflight_provider_cancel(receipt.run_id, store.catalog().unwrap().revision)
+            .unwrap();
+        assert_eq!(
+            store
+                .catalog()
+                .unwrap()
+                .catalog
+                .runs
+                .iter()
+                .find(|run| run.metadata.id == receipt.run_id)
+                .unwrap()
+                .state,
+            bastet_core::NormalizedRunState::Starting
+        );
         let revision = store
             .record_provider_running(receipt.run_id, Some("provider-session"))
             .unwrap();
