@@ -12,6 +12,7 @@ pub mod mvp;
 pub mod office;
 pub mod policy;
 pub mod process_environment;
+pub mod process_launcher;
 pub mod workspace;
 
 pub use adapter::*;
@@ -26,4 +27,5 @@ pub use mvp::*;
 pub use office::*;
 pub use policy::*;
 pub use process_environment::*;
+pub use process_launcher::*;
 pub use workspace::*;

@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     io::{BufRead, BufReader, Write},
     path::Path,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -11,7 +11,9 @@ use std::{
 use serde_json::{json, Value};
 
 use crate::{AppServerNotification, AppServerTransport, TransportError};
-use bastet_core::configure_adapter_process_environment;
+use bastet_core::{
+    configure_adapter_process_environment, AdapterProcessLauncher, DirectAdapterProcessLauncher,
+};
 
 pub struct StdioTransport {
     child: Child,
@@ -27,10 +29,20 @@ pub struct StdioTransport {
 
 impl StdioTransport {
     pub fn spawn(executable: &Path, timeout: Duration) -> Result<Self, TransportError> {
+        Self::spawn_with_launcher(executable, timeout, &DirectAdapterProcessLauncher)
+    }
+
+    pub fn spawn_with_launcher(
+        executable: &Path,
+        timeout: Duration,
+        launcher: &dyn AdapterProcessLauncher,
+    ) -> Result<Self, TransportError> {
         if timeout.is_zero() {
             return Err(TransportError::ProtocolDrift);
         }
-        let mut command = Command::new(executable);
+        let mut command = launcher
+            .command(executable)
+            .map_err(|_| TransportError::Unavailable)?;
         configure_adapter_process_environment(&mut command);
         let mut child = command
             .args(["app-server", "--listen", "stdio://"])
@@ -336,9 +348,140 @@ mod tests {
 
     #[cfg(unix)]
     use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
         process::{Command, Stdio},
-        sync::mpsc::{self, Sender},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc::{self, Sender},
+        },
     };
+
+    #[cfg(unix)]
+    struct RejectingLauncher(AtomicUsize);
+
+    #[cfg(unix)]
+    impl AdapterProcessLauncher for RejectingLauncher {
+        fn command(&self, _executable: &Path) -> std::io::Result<Command> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("fixture launcher rejected command"))
+        }
+    }
+
+    #[cfg(unix)]
+    struct WrapperLauncher {
+        wrapper: std::path::PathBuf,
+        working_directory: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl AdapterProcessLauncher for WrapperLauncher {
+        fn command(&self, executable: &Path) -> std::io::Result<Command> {
+            let mut command = Command::new(&self.wrapper);
+            command.arg(executable).current_dir(&self.working_directory);
+            Ok(command)
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        fs::write(path, contents).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_rejection_has_no_direct_command_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("provider");
+        let direct_launch_marker = directory.path().join("direct-launch-marker");
+        write_executable(
+            &provider,
+            &format!(
+                "#!/bin/sh\nprintf direct > '{}'\n",
+                direct_launch_marker.display()
+            ),
+        );
+        let launcher = RejectingLauncher(AtomicUsize::new(0));
+        assert!(matches!(
+            StdioTransport::spawn_with_launcher(&provider, Duration::from_secs(1), &launcher,),
+            Err(TransportError::Unavailable)
+        ));
+        assert_eq!(launcher.0.load(Ordering::SeqCst), 1);
+        assert!(!direct_launch_marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_timeout_is_rejected_before_the_launcher_is_called() {
+        let launcher = RejectingLauncher(AtomicUsize::new(0));
+        assert!(matches!(
+            StdioTransport::spawn_with_launcher(
+                Path::new("provider-fixture"),
+                Duration::ZERO,
+                &launcher,
+            ),
+            Err(TransportError::ProtocolDrift)
+        ));
+        assert_eq!(launcher.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_launcher_receives_provider_arguments_and_transport_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("provider");
+        let wrapper = directory.path().join("wrapper");
+        write_executable(
+            &provider,
+            "#!/bin/sh\nprintf '{\"method\":\"fixture/started\",\"params\":{}}\\n'\ncat >/dev/null\n",
+        );
+        write_executable(
+            &wrapper,
+            "#!/bin/sh\nprintf '%s\\n' \"$PWD\" > observed-cwd\nprintf '%s\\n' \"$@\" > observed-args\nexec \"$@\"\n",
+        );
+        let launcher = WrapperLauncher {
+            wrapper,
+            working_directory: directory.path().to_path_buf(),
+        };
+
+        let mut transport =
+            StdioTransport::spawn_with_launcher(&provider, Duration::from_secs(1), &launcher)
+                .unwrap();
+        assert_eq!(
+            transport
+                .poll_notification(Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+                .method,
+            "fixture/started"
+        );
+        transport.close();
+
+        assert_eq!(
+            fs::read_to_string(directory.path().join("observed-cwd"))
+                .unwrap()
+                .trim(),
+            fs::canonicalize(directory.path())
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("observed-args"))
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            vec![
+                provider.to_str().unwrap(),
+                "app-server",
+                "--listen",
+                "stdio://",
+            ]
+        );
+    }
 
     #[cfg(unix)]
     fn clock_transport(

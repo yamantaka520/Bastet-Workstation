@@ -1,14 +1,15 @@
 use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use bastet_core::{
-    configure_adapter_process_environment, RunId, WorkspaceEvidenceError, WorkspaceSnapshot,
+    configure_adapter_process_environment, AdapterProcessLauncher, DirectAdapterProcessLauncher,
+    RunId, WorkspaceEvidenceError, WorkspaceSnapshot,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -57,6 +58,18 @@ pub struct AgyProcess {
 
 impl AgyProcess {
     pub fn spawn(executable: PathBuf, request: AgyRunRequest) -> Result<Self, AgyProcessError> {
+        let launcher = DirectAdapterProcessLauncher;
+        Self::spawn_with_launcher(executable, request, &launcher)
+    }
+
+    /// Starts Agy through the supplied launcher. Its environment is cleared and
+    /// replaced with the adapter allowlist below, so launcher-provided
+    /// environment values are deliberately overridden.
+    pub fn spawn_with_launcher(
+        executable: PathBuf,
+        request: AgyRunRequest,
+        launcher: &dyn AdapterProcessLauncher,
+    ) -> Result<Self, AgyProcessError> {
         validate_request(&executable, &request)?;
         let before = if request.read_only {
             None
@@ -70,7 +83,11 @@ impl AgyProcess {
             .cwd
             .to_str()
             .ok_or(AgyProcessError::InvalidRequest)?;
-        let mut command = Command::new(&executable);
+        // Invoke the launcher once only after all request checks have passed.
+        // A launcher rejection is unavailable; never fall back to direct spawn.
+        let mut command = launcher
+            .command(&executable)
+            .map_err(|_| AgyProcessError::Unavailable)?;
         configure_adapter_process_environment(&mut command);
         command
             .args([
@@ -322,6 +339,8 @@ fn is_terminal(update: &AgyRunUpdate) -> bool {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::{cell::Cell, io, process::Command};
+
     use bastet_core::NormalizedRunState;
 
     use super::*;
@@ -355,6 +374,109 @@ mod tests {
             process,
             _root: root,
         }
+    }
+
+    struct RejectingLauncher {
+        calls: Cell<usize>,
+    }
+
+    impl AdapterProcessLauncher for RejectingLauncher {
+        fn command(&self, _executable: &Path) -> io::Result<Command> {
+            self.calls.set(self.calls.get() + 1);
+            Err(io::Error::other("synthetic launcher rejection"))
+        }
+    }
+
+    struct ShellWrapperLauncher {
+        calls: Cell<usize>,
+    }
+
+    impl AdapterProcessLauncher for ShellWrapperLauncher {
+        fn command(&self, executable: &Path) -> io::Result<Command> {
+            self.calls.set(self.calls.get() + 1);
+            let mut command = Command::new("sh");
+            command.arg(executable);
+            Ok(command)
+        }
+    }
+
+    fn fixture_request(root: &tempfile::TempDir, model: &str) -> AgyRunRequest {
+        AgyRunRequest {
+            run_id: RunId::from_bytes([62; 16]),
+            model: model.into(),
+            effort: None,
+            prompt: "test".into(),
+            cwd: root.path().to_path_buf(),
+            read_only: true,
+            timeout: Duration::from_secs(10),
+            conversation_id: None,
+        }
+    }
+
+    #[test]
+    fn rejected_request_does_not_invoke_the_launcher() {
+        let root = tempfile::tempdir().unwrap();
+        let launcher = RejectingLauncher {
+            calls: Cell::new(0),
+        };
+        let request = AgyRunRequest {
+            prompt: "   ".into(),
+            ..fixture_request(&root, "delayed-init")
+        };
+
+        assert!(matches!(
+            AgyProcess::spawn_with_launcher(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/poll-provider.sh"),
+                request,
+                &launcher,
+            ),
+            Err(AgyProcessError::InvalidRequest)
+        ));
+        assert_eq!(launcher.calls.get(), 0);
+    }
+
+    #[test]
+    fn launcher_rejection_is_unavailable_without_a_direct_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let launcher = RejectingLauncher {
+            calls: Cell::new(0),
+        };
+
+        assert!(matches!(
+            AgyProcess::spawn_with_launcher(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/poll-provider.sh"),
+                fixture_request(&root, "delayed-init"),
+                &launcher,
+            ),
+            Err(AgyProcessError::Unavailable)
+        ));
+        assert_eq!(launcher.calls.get(), 1);
+    }
+
+    #[test]
+    fn wrapper_launcher_receives_the_command_before_agy_arguments_are_applied() {
+        let root = tempfile::tempdir().unwrap();
+        let launcher = ShellWrapperLauncher {
+            calls: Cell::new(0),
+        };
+        let executable =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/poll-provider.sh");
+        let mut process = AgyProcess::spawn_with_launcher(
+            executable,
+            fixture_request(&root, "delayed-init"),
+            &launcher,
+        )
+        .unwrap();
+
+        // The shell wrapper receives the fixture first; the post-launcher
+        // `--model` argument makes that fixture emit this synthetic event.
+        process.stdin.as_mut().unwrap().write_all(b"go\n").unwrap();
+        process.stdin.as_mut().unwrap().flush().unwrap();
+        assert!(matches!(
+            process.next_update("now").unwrap(),
+            AgyRunUpdate::Lifecycle { event, .. } if event.state == NormalizedRunState::Running
+        ));
+        assert_eq!(launcher.calls.get(), 1);
     }
 
     #[test]

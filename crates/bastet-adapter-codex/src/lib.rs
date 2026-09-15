@@ -28,7 +28,8 @@ use std::{
 };
 
 use bastet_core::{
-    configure_adapter_process_environment, AdapterCapabilities, AdapterOperation, EvidenceClass,
+    configure_adapter_process_environment, AdapterCapabilities, AdapterOperation,
+    AdapterProcessLauncher, EvidenceClass,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -132,8 +133,16 @@ impl CodexAdapter<SystemCommandRunner> {
         &self,
         timeout: Duration,
     ) -> Result<CodexAppServer<StdioTransport>, AppServerError> {
-        let transport =
-            StdioTransport::spawn(&self.executable, timeout).map_err(AppServerError::Transport)?;
+        self.connect_app_server_with_launcher(timeout, &bastet_core::DirectAdapterProcessLauncher)
+    }
+
+    pub fn connect_app_server_with_launcher(
+        &self,
+        timeout: Duration,
+        launcher: &dyn AdapterProcessLauncher,
+    ) -> Result<CodexAppServer<StdioTransport>, AppServerError> {
+        let transport = StdioTransport::spawn_with_launcher(&self.executable, timeout, launcher)
+            .map_err(AppServerError::Transport)?;
         let mut server = CodexAppServer::new(transport);
         server.initialize()?;
         Ok(server)

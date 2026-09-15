@@ -29,6 +29,34 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 adapter sandbox command seam
+
+Core now defines a trusted `AdapterProcessLauncher` command-construction seam.
+Both Agy process spawning and Codex stdio transport can accept a launcher;
+their existing direct entry points explicitly delegate the compatibility
+launcher. The daemon's `SandboxLauncher` bridges a selected OS profile into that
+interface. Launcher rejection never falls back to direct execution. Request
+validation precedes launcher invocation; adapters retain provider arguments,
+stdio, and environment allowlisting. Launcher-provided environment overrides
+are intentionally discarded, so this is not a credential-injection channel.
+
+Synthetic wrapper fixtures prove exact argument flow, actual child startup and
+stdio close; a real macOS Seatbelt fixture runs through the adapter transport
+and proves allowed workspace reads and denied outside reads. No installed CLI,
+provider request, credential or external network access is involved. These
+tests do not establish descendant-process cleanup across all OS wrappers.
+
+Production graph execution still selects the direct compatibility entry points.
+Before switching them, persist exact runtime/sandbox policy with the launch
+intent, derive network destinations and other permissions rather than enabling
+a broad network boolean, and verify wrapper cancellation/process-tree cleanup.
+Linux native and Windows enforcement remain open. This interface removes the
+adapter construction obstacle; it is not production sandbox gate completion.
+
+Local full-workspace tests pass (core 71, Agy 20, Codex 65, daemon 99; real
+provider canaries ignored), as does workspace/all-target clippy with warnings
+denied. The preceding sandbox-scope CI `35000746889` passed all ten jobs.
+
 ### 2026-09-16 sandbox read-scope enforcement
 
 The previous profiles constrained writes but granted host-wide reads (Seatbelt

@@ -33,6 +33,22 @@ pub enum SandboxError {
     EnforcerUnavailable(&'static str),
 }
 
+/// Bridges an already selected scope to adapter process construction. Policy
+/// derivation and approval remain the daemon coordinator's responsibility.
+pub struct SandboxLauncher {
+    pub platform: SandboxPlatform,
+    pub profile: SandboxProfile,
+}
+
+impl bastet_core::AdapterProcessLauncher for SandboxLauncher {
+    fn command(&self, executable: &Path) -> std::io::Result<Command> {
+        self.profile
+            .launch_command(self.platform, executable, &[])
+            // Never expose native paths or fall back to an unsandboxed child.
+            .map_err(|_| std::io::Error::other("sandbox command rejected"))
+    }
+}
+
 impl SandboxProfile {
     pub fn launch_command(
         &self,
@@ -148,6 +164,70 @@ mod tests {
     use super::*;
     #[cfg(target_os = "macos")]
     use tempfile::tempdir;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn adapter_transport_uses_native_wrapper_without_scope_bypass() {
+        use bastet_adapter_codex::{AppServerTransport, StdioTransport};
+        use std::{os::unix::fs::PermissionsExt, time::Duration};
+
+        let directory = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let inside = root.join("inside");
+        let outside_file = outside.path().canonicalize().unwrap().join("outside");
+        std::fs::write(&inside, b"inside-fixture").unwrap();
+        std::fs::write(&outside_file, b"outside-fixture").unwrap();
+        let executable = root.join("fake-stdio.sh");
+        // Only generated temporary paths and fixture bytes enter this script.
+        // No installed provider, credential, network, or model request is used.
+        let script = format!(
+            r#"#!/bin/sh
+inside=false
+outside=false
+value=$(/bin/cat '{}') && [ "$value" = inside-fixture ] && inside=true
+value=$(/bin/cat '{}') && outside=true
+printf '{{"method":"fixture/scope","params":{{"inside":%s,"outside":%s}}}}\n' "$inside" "$outside"
+while read -r line; do :; done
+"#,
+            inside.display(),
+            outside_file.display()
+        );
+        std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let launcher = SandboxLauncher {
+            platform: SandboxPlatform::MacosSeatbelt,
+            profile: SandboxProfile {
+                workspace_root: root,
+                read_only_roots: [
+                    "/bin",
+                    "/usr/bin",
+                    "/usr/lib",
+                    "/System/Library",
+                    "/System/Volumes/Preboot/Cryptexes/OS",
+                    "/System/Cryptexes/OS",
+                ]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+                allow_workspace_write: false,
+                allow_network: false,
+            },
+        };
+        let mut transport =
+            StdioTransport::spawn_with_launcher(&executable, Duration::from_secs(2), &launcher)
+                .unwrap();
+        let notification = transport
+            .poll_notification(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(notification.method, "fixture/scope");
+        assert_eq!(
+            notification.params,
+            serde_json::json!({"inside":true,"outside":false})
+        );
+        transport.close();
+    }
 
     #[test]
     fn platform_plans_fail_closed_and_never_use_prompt_level_controls() {
