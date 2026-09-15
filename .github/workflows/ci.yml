@@ -57,7 +57,19 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev bubblewrap
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev bubblewrap apparmor-profiles
+      - name: Load distro bwrap namespace profile on the disposable Linux runner
+        if: runner.os == 'Linux'
+        # Ubuntu ships this optional profile in apparmor-profiles. It permits
+        # bwrap setup capabilities and strips them from executed children.
+        # Never disable the global restriction or execute test binaries as root.
+        run: |
+          test "$(id -u)" -ne 0
+          test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = 1
+          dpkg-query -S /usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          sha256sum /usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          sudo apparmor_parser -r /usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = 1
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: rustfmt, clippy
@@ -92,7 +104,7 @@ jobs:
           id
           cat /proc/self/attr/current
           sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces || true
-          for profile in /etc/apparmor.d/bwrap /etc/apparmor.d/bwrap-userns-restrict; do
+          for profile in /etc/apparmor.d/bwrap /etc/apparmor.d/bwrap-userns-restrict /usr/share/apparmor/extra-profiles/bwrap-userns-restrict; do
             if test -f "$profile"; then
               printf '%s\n' "$profile"
               cat "$profile"

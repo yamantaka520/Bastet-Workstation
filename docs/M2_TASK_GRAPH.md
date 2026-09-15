@@ -31,6 +31,18 @@ verification status; it does not add scope.
 
 ### 2026-09-16 explicit native Linux evidence gate
 
+Diagnostic CI `35008473857`, Ubuntu job `104514119797`, confirmed the cause:
+normal uid 1001 with global AppArmor user-namespace restrictions enabled and no
+bwrap-specific profile transitioned to `unprivileged_userns`; kernel audit then
+denied bwrap `setpcap` and `net_admin`. CI now installs `apparmor-profiles` and
+loads only its distro-shipped `bwrap-userns-restrict` profile on the disposable
+runner. Tests remain non-root and the global restriction must remain enabled.
+This profile permits wrapper initialization while denying child capabilities;
+native results with this prerequisite remain pending, not assumed successful.
+This is CI setup only, not an automatic change to users' host security policy.
+References: [Ubuntu package file list](https://packages.ubuntu.com/noble-updates/all/apparmor-profiles/filelist)
+and [AppArmor 4.0 profile](https://gitlab.com/apparmor/apparmor/-/blob/apparmor-4.0/profiles/apparmor/profiles/extras/bwrap-userns-restrict).
+
 CI `35007990375` executed all three native tests and failed before fixture
 bootstrap: Bubblewrap reported `loopback: Failed RTM_NEWADDR: Operation not
 permitted`. No Linux deny or cleanup claim is established. A failure-only CI
