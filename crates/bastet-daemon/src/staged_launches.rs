@@ -613,6 +613,7 @@ fn current_role_policy(
     plan: &provider_launch::ProviderLaunchPlan,
 ) -> Result<ScopedPolicy, StoreError> {
     plan.validate_current_policy(catalog)?;
+    plan.validate_online_cli_requirements()?;
     let role = catalog
         .roles
         .iter()

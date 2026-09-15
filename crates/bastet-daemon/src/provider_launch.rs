@@ -79,6 +79,35 @@ impl LaunchPolicySnapshot {
 }
 
 impl ProviderLaunchPlan {
+    /// Necessary operations of the current online CLI compatibility runner.
+    /// Passing this ceiling check is NOT sandbox enforcement or a credential
+    /// grant; it only prevents starting work with known-forbidden prerequisites.
+    pub(super) fn validate_online_cli_requirements(&self) -> Result<(), StoreError> {
+        use bastet_core::{PermissionLevel, PolicyCeiling, PolicyLayer, ScopedPolicy};
+        let saved = self
+            .policy
+            .as_ref()
+            .ok_or_else(|| StoreError::InvalidRunState("launch policy unavailable".into()))?;
+        saved.validate()?;
+        saved
+            .role
+            .restrict(ScopedPolicy {
+                layer: PolicyLayer::SingleRun,
+                ceiling: PolicyCeiling {
+                    filesystem: PermissionLevel::Observe,
+                    network: PermissionLevel::Use,
+                    process: PermissionLevel::Use,
+                    device: PermissionLevel::Deny,
+                    // The compatibility CLI can read its own ambient login. That
+                    // is still credential use, not an exemption from the ceiling.
+                    credential: PermissionLevel::Use,
+                    persistent_approval: false,
+                },
+            })
+            .map_err(|_| StoreError::InvalidRunState("online CLI exceeds launch policy".into()))?;
+        Ok(())
+    }
+
     pub(super) fn validate_current_policy(
         &self,
         catalog: &IdentityCatalog,
@@ -173,6 +202,43 @@ impl ProviderLaunchPlan {
 mod tests {
     use super::*;
     use crate::tests::{begin_fixture_node, provider_execution_fixture};
+
+    #[test]
+    fn online_cli_requires_each_known_operation_without_granting_others() {
+        use bastet_core::{PermissionLevel, PolicyCeiling};
+        let (_directory, _workspace, store, id) = provider_execution_fixture();
+        let receipt = begin_fixture_node(&store, id);
+        let mut plan =
+            ProviderLaunchPlan::load(&store.connection().unwrap(), receipt.run_id).unwrap();
+        let permitted = PolicyCeiling {
+            filesystem: PermissionLevel::Observe,
+            network: PermissionLevel::Use,
+            process: PermissionLevel::Use,
+            device: PermissionLevel::Deny,
+            credential: PermissionLevel::Use,
+            persistent_approval: false,
+        };
+        plan.policy.as_mut().unwrap().project.ceiling = permitted.clone();
+        plan.policy.as_mut().unwrap().role.ceiling = permitted.clone();
+        plan.validate_online_cli_requirements().unwrap();
+        for field in ["filesystem", "network", "process", "credential"] {
+            for level in [PermissionLevel::Deny, PermissionLevel::Observe] {
+                let mut changed = plan.clone();
+                let ceiling = &mut changed.policy.as_mut().unwrap().role.ceiling;
+                match field {
+                    "filesystem" => ceiling.filesystem = level,
+                    "network" => ceiling.network = level,
+                    "process" => ceiling.process = level,
+                    _ => ceiling.credential = level,
+                }
+                assert_eq!(
+                    changed.validate_online_cli_requirements().is_ok(),
+                    field == "filesystem" && level == PermissionLevel::Observe
+                );
+            }
+        }
+        assert_eq!(plan.policy.unwrap().role.ceiling, permitted);
+    }
 
     #[test]
     fn saved_policy_is_hashed_and_current_policy_drift_blocks_dispatch() {

@@ -241,6 +241,23 @@ impl ProviderRunner for SystemProviderRunner {
                 }),
             };
         }
+        // Check before binary discovery, spawning, or ambient provider login.
+        // Frozen policy is intent, not a substitute for this operation check.
+        if self.store.validate_online_cli_launch(receipt).is_err() {
+            return ProviderOutcome {
+                terminal_state: NormalizedRunState::Blocked,
+                provider_session_id: None,
+                cost: unknown_cost(),
+                output_markdown: None,
+                failure: Some(AdapterFailure {
+                    kind: AdapterFailureKind::PermissionDenied,
+                    message_key: "adapter.failure.permission_denied".into(),
+                    retryable: false,
+                    provider_code: None,
+                    redacted_detail: None,
+                }),
+            };
+        }
         match receipt.adapter_kind.as_str() {
             "codex_cli" => run_codex(receipt, control, &self.store)
                 .unwrap_or_else(|_| ProviderOutcome::unavailable()),
@@ -248,6 +265,18 @@ impl ProviderRunner for SystemProviderRunner {
                 .unwrap_or_else(|_| ProviderOutcome::unavailable()),
             _ => ProviderOutcome::unavailable(),
         }
+    }
+}
+
+impl Store {
+    fn validate_online_cli_launch(
+        &self,
+        receipt: &BeginGraphNodeRunReceipt,
+    ) -> Result<(), StoreError> {
+        self.preflight_provider_launch(receipt)?;
+        let connection = self.connection()?;
+        let plan = crate::provider_launch::ProviderLaunchPlan::load(&connection, receipt.run_id)?;
+        plan.validate_online_cli_requirements()
     }
 }
 
@@ -571,6 +600,70 @@ fn configured_executable(variable: &str, name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_runner_rejects_denied_prerequisites_before_adapter_selection() {
+        let (_directory, _workspace, store, id) = crate::tests::provider_execution_fixture();
+        let mut catalog = store.catalog().unwrap();
+        // Unknown synthetic adapter guarantees no real provider can be reached
+        // even if this regression test's permission guard is accidentally lost.
+        for provider in &mut catalog.catalog.agent_providers {
+            provider.adapter_kind = "fixture-no-executable".into();
+        }
+        store
+            .replace_catalog(bastet_protocol::ReplaceCatalogCommand {
+                expected_revision: catalog.revision,
+                catalog: catalog.catalog,
+            })
+            .unwrap();
+        let receipt = crate::tests::begin_fixture_node(&store, id);
+        assert!(receipt.launch_identity.as_ref().unwrap().account.is_none());
+        let before = store.events_after(0).unwrap();
+        let runner = SystemProviderRunner {
+            store: store.clone(),
+        };
+        let (_sender, control) = mpsc::sync_channel(1);
+        let result = runner.run(&receipt, control);
+        assert_eq!(result.terminal_state, NormalizedRunState::Blocked);
+        assert_eq!(
+            result.failure.unwrap().kind,
+            AdapterFailureKind::PermissionDenied
+        );
+        assert!(result.output_markdown.is_none());
+        assert!(result.provider_session_id.is_none());
+        assert_eq!(store.events_after(0).unwrap(), before);
+        // Exercise the actual worker/persistence boundary too, not only the
+        // returned value. The synthetic adapter cannot execute external code.
+        let executor =
+            ProviderExecutor::production(store.clone(), RunControllerRegistry::default());
+        executor.start(receipt.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while executor.has_active() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!executor.has_active());
+        let catalog = store.catalog().unwrap().catalog;
+        assert_eq!(
+            catalog
+                .runs
+                .iter()
+                .find(|run| run.metadata.id == receipt.run_id)
+                .unwrap()
+                .state,
+            NormalizedRunState::Blocked
+        );
+        let graph = store.graph_execution(id).unwrap();
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.node_id == receipt.node_id)
+                .unwrap()
+                .state,
+            bastet_core::GraphNodeState::Blocked
+        );
+        assert!(graph.outputs.is_empty());
+    }
 
     #[test]
     fn selected_account_cannot_fall_back_to_ambient_authentication() {

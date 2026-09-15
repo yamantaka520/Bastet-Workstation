@@ -107,6 +107,7 @@ impl Store {
         staged_launches::validate_staged_run(&tx, run)?;
         credential_grants::validate_current_catalog(&tx, &record.request)?;
         let plan = provider_launch::ProviderLaunchPlan::load(&tx, run_id)?;
+        plan.validate_online_cli_requirements()?;
         let selection = plan
             .identity
             .account

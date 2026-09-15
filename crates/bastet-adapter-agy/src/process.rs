@@ -184,11 +184,7 @@ impl AgyProcess {
         // Preserve the historical API: a caller which is willing to wait for
         // the configured inactivity interval still receives its terminal
         // timeout as an update rather than an observation timeout.
-        loop {
-            if let Some(update) = self.poll_update(occurred_at, self.timeout)? {
-                return Ok(update);
-            }
-        }
+        wait_for_update(|| self.poll_update(occurred_at, self.timeout))
     }
 
     /// Waits at most `max_wait` for the next observable update. `None` means
@@ -290,6 +286,14 @@ impl AgyProcess {
 impl Drop for AgyProcess {
     fn drop(&mut self) {
         let _ = self.terminate();
+    }
+}
+
+fn wait_for_update<T, E>(mut poll: impl FnMut() -> Result<Option<T>, E>) -> Result<T, E> {
+    loop {
+        if let Some(update) = poll()? {
+            return Ok(update);
+        }
     }
 }
 
@@ -518,23 +522,45 @@ mod tests {
     }
 
     #[test]
-    fn legacy_wait_survives_activity_beyond_its_first_observation_window() {
+    fn legacy_wait_retries_observation_timeouts_and_preserves_errors() {
+        let mut polls = 0;
+        let update: Result<u8, &str> = wait_for_update(|| {
+            polls += 1;
+            Ok((polls == 3).then_some(7))
+        });
+        assert_eq!(update, Ok(7));
+        assert_eq!(polls, 3);
+        let mut polls = 0;
+        let failed: Result<u8, &str> = wait_for_update(|| {
+            polls += 1;
+            if polls == 2 {
+                Err("synthetic-error")
+            } else {
+                Ok(None)
+            }
+        });
+        assert_eq!(failed, Err("synthetic-error"));
+        assert_eq!(polls, 2);
+    }
+
+    #[test]
+    fn activity_text_is_retained_before_success() {
         let mut fixture = fixture_process("activity", Duration::from_secs(10));
         assert!(
             matches!(fixture.process.next_update("started").unwrap(), AgyRunUpdate::Lifecycle { event, .. } if event.state == NormalizedRunState::Running)
         );
-        fixture.process.timeout = Duration::from_millis(350);
-        fixture.process.inactivity_deadline = Instant::now() + fixture.process.timeout;
+        let first_deadline = fixture.process.inactivity_deadline;
         let stdin = fixture.process.stdin.as_mut().unwrap();
         stdin.write_all(b"go\n").unwrap();
         stdin.flush().unwrap();
-        // The response arrives after 400ms, but the intermediate text renews
-        // the 350ms inactivity limit. The first observation window may expire
-        // without a public update; the legacy API must keep waiting, not panic.
+        // Test the real pipe with generous inactivity headroom. Observation
+        // retry semantics are tested deterministically above, not by assuming
+        // the CI scheduler services two 200ms sleeps within a 350ms deadline.
         assert!(
             matches!(fixture.process.next_update("finished").unwrap(), AgyRunUpdate::Lifecycle { event, .. } if event.state == NormalizedRunState::Succeeded)
         );
         assert_eq!(fixture.process.final_output(), Some("# Answer"));
+        assert!(fixture.process.inactivity_deadline > first_deadline);
     }
 
     #[test]

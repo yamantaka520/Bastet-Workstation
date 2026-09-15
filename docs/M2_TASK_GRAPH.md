@@ -29,6 +29,33 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 online CLI prerequisite denial
+
+The production runner now rejects known-forbidden prerequisites before adapter
+selection or binary discovery: filesystem `Observe`, network/process/credential
+`Use`, no device access and no persistent approval are the required SingleRun
+request checked against saved Role/Project ceilings. Ambient provider login is
+credential use, not a policy exemption. Staging/approval and the broker's claim
+transaction perform the same check before credential lookup or consumption.
+Configurations retaining credential `Deny` now return `Blocked`; no defaults or
+catalog permissions are silently elevated to restore compatibility.
+
+This necessary-operation check does not enforce every denied capability inside
+the child and is not a credential grant. The compatibility launch still needs
+exact runtime/profile binding and OS sandbox selection; M2 remains open.
+Synthetic tests cover each required field and the production worker/persistence
+path: rejection reaches both run and graph `Blocked` with no output. The test
+adapter kind cannot resolve to a real provider even if the guard regresses.
+
+Prior CI `35005797457` passed Ubuntu and Windows but failed the macOS Agy
+350-ms activity-window assertion. Observation retry/error semantics are now
+tested deterministically through the same helper used by `next_update`; the
+real pipe still checks intermediate text, success and deadline renewal with a
+10-second inactivity budget, not a 150-ms scheduler margin. This does not change
+the production inactivity timeout. New CI must verify the whole patch.
+Local full-workspace tests pass (core 83, Agy 23, Codex 67, daemon 106;
+real-provider canaries ignored), along with formatting and all-target clippy.
+
 ### 2026-09-16 immutable Project/Role policy snapshot
 
 New launch-plan format v2 includes exact Project and Role `ScopedPolicy` values
