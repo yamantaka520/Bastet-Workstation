@@ -107,6 +107,18 @@ pub(super) fn validate_current_catalog(
         {
             return Err(StoreError::CredentialGrantRejected);
         }
+        // Current catalog consent must not authorize a different identity from
+        // the one durably selected for this exact attempt (including legacy NULL).
+        let selected = load_launch_identity(transaction, run.metadata.id)?
+            .ok_or(StoreError::CredentialGrantRejected)?;
+        let current_binding = resolve_provider_run_binding(&catalog, &m3, &graph, definition.id)?;
+        if selected != current_binding.launch_identity
+            || selected.agent_instance_id != request.action.agent_instance_id
+            || selected.project_id != request.action.scope.project_id
+            || selected.model_id != run.model_id
+        {
+            return Err(StoreError::CredentialGrantRejected);
+        }
     } else if assignments.len() != 1 {
         // A non-graph run has no persisted role slot. Until it gains one,
         // multiple available roles are ambiguous rather than caller-selectable.
@@ -960,7 +972,7 @@ mod tests {
 
     #[test]
     fn graph_grant_requires_the_current_attempt_and_exact_node_role() {
-        for corrupt_attempt in [false, true] {
+        for failure_case in 0..6 {
             let (_directory, _workspace, store, execution_id) =
                 crate::tests::provider_execution_fixture();
             let graph = store.graph_execution(execution_id).unwrap();
@@ -1043,7 +1055,7 @@ mod tests {
                 })
                 .unwrap();
             decide(&store, &request, ApprovalDecisionKind::Approve).unwrap();
-            if corrupt_attempt {
+            if failure_case == 1 {
                 // A historical/misdirected ledger row must not authorize the current slot.
                 store
                     .connection()
@@ -1064,6 +1076,70 @@ mod tests {
                     .unwrap()
                     .consumed_at_ms
                     .is_none());
+            } else if failure_case == 5 {
+                let mut changed = store.catalog().unwrap();
+                changed.catalog.accounts[0].provider_identity = "new-catalog-account".into();
+                store
+                    .replace_catalog(ReplaceCatalogCommand {
+                        expected_revision: changed.revision,
+                        catalog: changed.catalog,
+                    })
+                    .unwrap();
+                let mut action = request.action.clone();
+                action
+                    .scope
+                    .credential_binding
+                    .as_mut()
+                    .unwrap()
+                    .provider_identity = "new-catalog-account".into();
+                let replacement = ApprovalRequest::create(
+                    ApprovalRequestId::new(),
+                    request.created_at_ms,
+                    request.expires_at_ms,
+                    action,
+                    &role.policy,
+                )
+                .unwrap();
+                let before = store.events_after(0).unwrap();
+                assert!(store
+                    .create_approval(CreateApprovalCommand {
+                        request: replacement.clone()
+                    })
+                    .is_err());
+                assert!(matches!(
+                    store.approval(replacement.id),
+                    Err(StoreError::ApprovalNotFound)
+                ));
+                assert_eq!(store.events_after(0).unwrap(), before);
+            } else if failure_case >= 2 {
+                let snapshot_json = match failure_case {
+                    2 => None,
+                    3 => Some("not-json".to_string()),
+                    _ => {
+                        let mut changed = identity.clone();
+                        changed.account.as_mut().unwrap().provider_identity =
+                            "another-account".into();
+                        Some(serde_json::to_string(&changed).unwrap())
+                    }
+                };
+                store
+                    .connection()
+                    .unwrap()
+                    .execute(
+                        "UPDATE graph_node_runs SET launch_identity_json = ?1 WHERE run_id = ?2",
+                        params![snapshot_json, receipt.run_id.value().to_string()],
+                    )
+                    .unwrap();
+                let before = store.events_after(0).unwrap();
+                assert!(store
+                    .consume_credential_grant(request.id, &request.action)
+                    .is_err());
+                assert!(store
+                    .credential_grant(request.id)
+                    .unwrap()
+                    .consumed_at_ms
+                    .is_none());
+                assert_eq!(store.events_after(0).unwrap(), before);
             } else {
                 store
                     .consume_credential_grant(request.id, &request.action)

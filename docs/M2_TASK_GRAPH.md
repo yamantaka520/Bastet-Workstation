@@ -29,6 +29,20 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 persisted launch identity at credential authorization
+
+Graph credential authorization now compares the exact attempt's saved launch
+identity with the resolved current launch binding, request Agent/Project and
+Run model. A missing legacy snapshot, malformed snapshot, changed saved account,
+or a new approval for a catalog account changed after begin fails before issuing
+or consuming a grant. A current catalog match alone is not sufficient authority
+for an attempt that selected a different identity. This does not enable native
+credential access or selected-account execution.
+
+CI run `34323149294` for `3765be3` completed successfully in all ten jobs,
+including all three platform builds. This establishes CI evidence for the
+September 9 grant ledger slice, not the later launch-binding check above.
+
 ### 2026-09-09 single-use credential authorization ledger
 
 Credential approvals can now carry an optional hash-bound provider/account,
