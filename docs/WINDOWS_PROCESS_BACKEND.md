@@ -50,6 +50,12 @@ necessary; Job completion alone must not close M2.
 
 ## Current encoding step and native gates
 
+The Windows Job owner and creation attribute-list primitives are now implemented
+in `windows_job`. The standalone native fixture uses them with `CreateProcessW`
+to test descendant accounting/termination and kill-on-close. This is component
+integration only: `OwnedAdapterChild` has not switched backends, and native CI
+must verify Windows-only code before any containment gate can be credited.
+
 `windows_launch_encoding` supplies bounded CRT-style argv quoting and a sorted,
 explicit environment block. It rejects embedded NUL, ambiguous executable quotes,
 case-insensitive duplicate environment names, and hidden drive-directory variables.

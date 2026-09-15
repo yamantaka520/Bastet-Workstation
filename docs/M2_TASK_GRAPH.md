@@ -29,6 +29,30 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 Windows Job owner and creation attributes
+
+The new Windows-only `WindowsJob` owns an unnamed, non-inheritable kill-on-close
+Job with breakaway disabled. `JobAttributes` keeps the Job, explicit child-handle
+borrows, backing arrays, and aligned native allocation alive through process
+creation; partial construction deletes/frees only initialized owned resources.
+Handle-list validation rejects non-inheritable, duplicate, and excess handles.
+Checked termination observes zero active Job processes with a bounded deadline;
+failure remains sticky. These primitives are not yet the production adapter
+process backend, and do not provide filesystem/network/credential isolation.
+
+Windows-native controls use `CreateProcessW` with JOB_LIST at creation, not a
+post-spawn assignment. They verify a leader and descendant are both accounted
+in the owned Job, clean up the descendant after leader exit, preserve an unrelated
+child, and verify kill-on-close through the surviving owned process handle.
+Native attribute tests exercise borrowed-handle lifetime and invalid lists.
+Local non-Windows tests cannot prove these controls; Windows CI is required.
+Overlapped-pipe construction, explicit launch-spec integration, negative setup
+injection, parent-crash/breakaway probes, and production binding remain open.
+
+The preceding launch-encoding change `4d1d81d` passed CI `35015745067` on all
+three platforms, including the Windows-native argv round-trip. It does not
+exercise the new Job primitives introduced in this batch.
+
 ### 2026-09-16 Windows atomic launch prerequisites
 
 The [Windows backend contract](WINDOWS_PROCESS_BACKEND.md) records the concrete

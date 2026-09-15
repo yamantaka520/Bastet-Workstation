@@ -29,10 +29,34 @@ fn main() {
     positive_controls();
     #[cfg(windows)]
     windows_argument_roundtrip();
+    #[cfg(windows)]
+    windows_job_controls();
     println!("native provider I/O: all four adapter controls passed");
 }
 
+// The Windows tree fixture deliberately leaves a live descendant for its Job
+// owner to terminate after the leader exits; waiting here would defeat the test.
+#[cfg_attr(windows, allow(clippy::zombie_processes))]
 fn fixture(mode: &str) {
+    #[cfg(windows)]
+    if mode == "job-leaf" {
+        std::fs::write("leaf-ready", b"ready").unwrap();
+        thread::sleep(Duration::from_secs(30));
+        return;
+    }
+    #[cfg(windows)]
+    if mode == "job-tree" {
+        let mut descendant = Command::new(std::env::current_exe().unwrap())
+            .args([CHILD_FLAG, "job-leaf"])
+            .spawn()
+            .unwrap();
+        wait_marker(Path::new("leaf-ready"));
+        assert!(descendant.try_wait().unwrap().is_none());
+        std::fs::write("tree-ready", b"ready").unwrap();
+        wait_marker(Path::new("release-leader"));
+        // Child deliberately outlives the leader. Job cleanup owns it.
+        return;
+    }
     #[cfg(windows)]
     if mode == "echo-args" {
         use std::os::windows::ffi::OsStrExt;
@@ -83,6 +107,114 @@ fn fixture(mode: &str) {
         }
         _ => panic!("unknown native fixture mode"),
     }
+}
+
+#[cfg(windows)]
+fn windows_job_controls() {
+    use bastet_core::windows_job::WindowsJob;
+    use std::os::windows::{
+        ffi::OsStrExt,
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    };
+    use windows_sys::Win32::{Foundation::WAIT_OBJECT_0, System::Threading::*};
+
+    fn launch(job: &WindowsJob, root: &Path, mode: &str) -> OwnedHandle {
+        let executable: Vec<u16> = std::env::current_exe()
+            .unwrap()
+            .as_os_str()
+            .encode_wide()
+            .collect();
+        let mut app = executable.clone();
+        app.push(0);
+        let args = [CHILD_FLAG, mode].map(|arg| arg.encode_utf16().collect());
+        let mut command =
+            bastet_core::windows_launch_encoding::windows_command_line(&executable, &args).unwrap();
+        let cwd: Vec<_> = root
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let environment =
+            bastet_core::windows_launch_encoding::windows_environment_block(&[]).unwrap();
+        let attributes = job.attributes(&[]).unwrap();
+        let mut startup = STARTUPINFOEXW::default();
+        startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        startup.lpAttributeList = attributes.as_ptr();
+        let mut process = PROCESS_INFORMATION::default();
+        // SAFETY: non-null explicit app/cwd/environment, writable command,
+        // initialized extended startup and all attribute backing storage live.
+        // No handles are inherited, and assignment is part of CreateProcessW.
+        assert_ne!(
+            unsafe {
+                CreateProcessW(
+                    app.as_ptr(),
+                    command.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                    environment.as_ptr().cast(),
+                    cwd.as_ptr(),
+                    &startup.StartupInfo,
+                    &mut process,
+                )
+            },
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: successful process creation transfers exactly these handles.
+        let thread = unsafe { OwnedHandle::from_raw_handle(process.hThread) };
+        drop(thread);
+        unsafe { OwnedHandle::from_raw_handle(process.hProcess) }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let unrelated_root = tempfile::tempdir().unwrap();
+    let mut unrelated_command = Command::new(std::env::current_exe().unwrap());
+    unrelated_command
+        .args([CHILD_FLAG, "job-leaf"])
+        .current_dir(unrelated_root.path());
+    let mut unrelated = unrelated_command.spawn().unwrap();
+    wait_marker(&unrelated_root.path().join("leaf-ready"));
+    let mut job = WindowsJob::new().unwrap();
+    assert_eq!(job.active_processes().unwrap(), 0);
+    let leader = launch(&job, root.path(), "job-tree");
+    wait_marker(&root.path().join("tree-ready"));
+    assert_eq!(job.active_processes().unwrap(), 2);
+    std::fs::write(root.path().join("release-leader"), b"release").unwrap();
+    // SAFETY: owned leader process handle; bounded wait, no PID-based signaling.
+    assert_eq!(
+        unsafe { WaitForSingleObject(leader.as_raw_handle(), 3000) },
+        WAIT_OBJECT_0
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while job.active_processes().unwrap() != 1 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(job.active_processes().unwrap(), 1);
+    job.terminate_and_wait(Duration::from_secs(3)).unwrap();
+    assert_eq!(job.active_processes().unwrap(), 0);
+    job.terminate_and_wait(Duration::ZERO).unwrap();
+    assert!(
+        unrelated.try_wait().unwrap().is_none(),
+        "other Job must not be signaled"
+    );
+    unrelated.kill().unwrap();
+    unrelated.wait().unwrap();
+
+    let drop_root = tempfile::tempdir().unwrap();
+    let job = WindowsJob::new().unwrap();
+    let child = launch(&job, drop_root.path(), "job-leaf");
+    wait_marker(&drop_root.path().join("leaf-ready"));
+    assert_eq!(job.active_processes().unwrap(), 1);
+    drop(job);
+    // SAFETY: owned process handle survives closing our last Job handle.
+    assert_eq!(
+        unsafe { WaitForSingleObject(child.as_raw_handle(), 3000) },
+        WAIT_OBJECT_0
+    );
+    println!("native Windows Job: creation-time tree, unrelated child, and kill-on-close passed");
 }
 
 #[cfg(windows)]

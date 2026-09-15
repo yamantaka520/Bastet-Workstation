@@ -17,6 +17,8 @@ pub mod process_input;
 pub mod process_launcher;
 pub mod process_output;
 pub mod process_queue;
+#[cfg(windows)]
+pub mod windows_job;
 pub mod windows_launch_encoding;
 pub mod workspace;
 
