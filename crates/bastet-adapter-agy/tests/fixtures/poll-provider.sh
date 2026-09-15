@@ -13,6 +13,14 @@ case "$mode" in
 esac
 IFS= read -r request
 case "$mode" in
+    flood)
+        i=0
+        while [ "$i" -lt 256 ]; do
+            printf '%s\n' '{"event":"init","conversation_id":"flood","init":{}}'
+            i=$((i + 1))
+        done
+        exec sleep 30
+        ;;
     done)
         printf '%s\n' '{"event":"init","conversation_id":"poll-test","init":{}}'
         printf '%s\n' '{"event":"result","result":{"conversation_id":"poll-test","status":"SUCCESS"}}'

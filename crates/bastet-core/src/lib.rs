@@ -16,6 +16,7 @@ pub mod process_environment;
 pub mod process_input;
 pub mod process_launcher;
 pub mod process_output;
+pub mod process_queue;
 pub mod workspace;
 
 pub use adapter::*;
@@ -34,4 +35,5 @@ pub use process_environment::*;
 pub use process_input::*;
 pub use process_launcher::*;
 pub use process_output::*;
+pub use process_queue::*;
 pub use workspace::*;

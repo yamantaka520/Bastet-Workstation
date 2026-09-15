@@ -2,7 +2,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::mpsc::{self, Receiver, RecvTimeoutError},
+    sync::mpsc::RecvTimeoutError,
     time::{Duration, Instant},
 };
 
@@ -49,7 +49,7 @@ pub enum AgyProcessError {
 pub struct AgyProcess {
     child: OwnedAdapterChild,
     stdin: Option<ProcessInputWriter>,
-    lines: Receiver<Result<String, ()>>,
+    lines: bastet_core::OutputReceiver<Result<String, ()>>,
     reader: ProcessOutputReader,
     stream: AgyRunStream,
     timeout: Duration,
@@ -176,21 +176,23 @@ impl AgyProcess {
             }
         };
 
-        let (sender, lines) = mpsc::channel();
+        let (sender, lines) = bastet_core::output_queue();
         // Begin draining stdout before feeding stdin. Otherwise a provider
         // which writes while receiving a large prompt can deadlock both pipes.
-        let mut reader =
-            match ProcessOutputReader::spawn(stdout, move |line| sender.send(line).is_ok()) {
-                Ok(reader) => reader,
-                Err(_) => {
-                    return startup_failure(
-                        &mut child,
-                        Some(&mut stdin),
-                        None,
-                        AgyProcessError::Unavailable,
-                    )
-                }
-            };
+        let mut reader = match ProcessOutputReader::spawn(stdout, move |line| {
+            let bytes = line.as_ref().map_or(0, String::len);
+            sender.send(line, bytes)
+        }) {
+            Ok(reader) => reader,
+            Err(_) => {
+                return startup_failure(
+                    &mut child,
+                    Some(&mut stdin),
+                    None,
+                    AgyProcessError::Unavailable,
+                )
+            }
+        };
         let Some(write_deadline) = Instant::now().checked_add(request.timeout) else {
             return startup_failure(
                 &mut child,
@@ -308,6 +310,10 @@ impl AgyProcess {
         occurred_at: &str,
         max_wait: Duration,
     ) -> Result<Option<AgyRunUpdate>, AgyProcessError> {
+        if self.lines.is_failed() {
+            self.terminate()?;
+            return Err(AgyProcessError::Unavailable);
+        }
         if let Some(update) = self.pending.take() {
             return Ok(Some(update));
         }
@@ -348,6 +354,10 @@ impl AgyProcess {
                     }
                 }
                 Ok(Err(())) | Err(RecvTimeoutError::Disconnected) => {
+                    if self.lines.is_failed() {
+                        self.terminate()?;
+                        return Err(AgyProcessError::Unavailable);
+                    }
                     self.reap()?;
                     let terminal = if self.cancellation_requested {
                         self.stream.cancelled(occurred_at)?
@@ -599,6 +609,30 @@ mod tests {
             Err(AgyProcessError::InvalidRequest)
         ));
         assert_eq!(launcher.calls.get(), 0);
+    }
+
+    #[test]
+    fn flooded_stdout_fails_before_returning_queued_lifecycle_events() {
+        let root = tempfile::tempdir().unwrap();
+        let mut process = AgyProcess::spawn_with_launcher(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/poll-provider.sh"),
+            fixture_request(&root, "flood"),
+            &ShellWrapperLauncher {
+                calls: Cell::new(0),
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !process.lines.is_failed() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(process.lines.is_failed());
+        assert!(matches!(
+            process.poll_update("fixture", Duration::ZERO),
+            Err(AgyProcessError::Unavailable)
+        ));
+        assert!(process.stdin.is_none());
+        process.cancel_and_close().unwrap();
     }
 
     #[test]

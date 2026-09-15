@@ -3,7 +3,7 @@ use std::{
     io,
     path::Path,
     process::Stdio,
-    sync::mpsc::{self, Receiver, RecvTimeoutError},
+    sync::mpsc::RecvTimeoutError,
     time::{Duration, Instant},
 };
 
@@ -16,11 +16,12 @@ use bastet_core::{
 };
 
 pub struct StdioTransport {
+    output_failed: bool,
     cancellation: bastet_core::CancellationToken,
     child: OwnedAdapterChild,
     stdin: Option<ProcessInputWriter>,
-    responses: Receiver<Result<Value, TransportError>>,
-    pending_notifications: VecDeque<AppServerNotification>,
+    responses: bastet_core::OutputReceiver<Result<Value, TransportError>>,
+    pending_notifications: PendingNotifications,
     reader: Option<ProcessOutputReader>,
     next_request_id: u64,
     timeout: Duration,
@@ -74,23 +75,25 @@ impl StdioTransport {
             ProcessInputWriter::spawn(child.take_stdin().ok_or(TransportError::Unavailable)?)
                 .map_err(|_| TransportError::Unavailable)?;
         let stdout = child.take_stdout().ok_or(TransportError::Unavailable)?;
-        let (sender, responses) = mpsc::channel();
+        let (sender, responses) = bastet_core::output_queue();
         let reader = ProcessOutputReader::spawn(stdout, move |line| {
+            let bytes = line.as_ref().map_or(0, String::len);
             let response = line
                 .map_err(|_| TransportError::Unavailable)
                 .and_then(|line| {
                     serde_json::from_str(&line).map_err(|_| TransportError::ProtocolDrift)
                 });
             let failed = response.is_err();
-            sender.send(response).is_ok() && !failed
+            sender.send(response, bytes) && !failed
         })
         .map_err(|_| TransportError::Unavailable)?;
         Ok(Self {
+            output_failed: false,
             cancellation,
             child,
             stdin: Some(stdin),
             responses,
-            pending_notifications: VecDeque::new(),
+            pending_notifications: PendingNotifications::default(),
             reader: Some(reader),
             next_request_id: 0,
             timeout,
@@ -161,12 +164,20 @@ impl StdioTransport {
                     return Ok(message);
                 }
                 Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => return Err(TransportError::Unavailable),
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.check_cancelled()?;
+                    return Err(TransportError::Unavailable);
+                }
             }
         }
     }
 
     fn check_cancelled(&mut self) -> Result<(), TransportError> {
+        if self.output_failed || self.responses.is_failed() {
+            self.close_with_grace(Duration::ZERO)
+                .map_err(|_| TransportError::Unavailable)?;
+            return Err(TransportError::Unavailable);
+        }
         if self.cancellation.is_cancelled() {
             self.close_with_grace(Duration::ZERO)
                 .map_err(|_| TransportError::Unavailable)?;
@@ -250,7 +261,10 @@ impl AppServerTransport for StdioTransport {
                     return decode_notification(message).map(Some);
                 }
                 Ok(Err(error)) => return Err(error),
-                Err(RecvTimeoutError::Disconnected) => return Err(TransportError::Unavailable),
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.check_cancelled()?;
+                    return Err(TransportError::Unavailable);
+                }
                 Err(RecvTimeoutError::Timeout) if Instant::now() >= inactivity_deadline => {
                     return Err(TransportError::TimedOut);
                 }
@@ -297,9 +311,14 @@ impl StdioTransport {
             if self.discard_abandoned_response(&message) {
                 continue;
             }
-            if let Some(result) =
-                route_request_message(message, request_id, &mut self.pending_notifications)?
-            {
+            let routed =
+                route_request_message(message, request_id, &mut self.pending_notifications);
+            if routed.is_err() {
+                self.output_failed = true;
+                self.close_with_grace(Duration::ZERO)
+                    .map_err(|_| TransportError::Unavailable)?;
+            }
+            if let Some(result) = routed? {
                 return Ok(result);
             }
         }
@@ -335,14 +354,40 @@ fn deadline_after(duration: Duration) -> Result<Instant, TransportError> {
         .ok_or(TransportError::ProtocolDrift)
 }
 
+#[derive(Default)]
+struct PendingNotifications {
+    items: VecDeque<(AppServerNotification, usize)>,
+    bytes: usize,
+}
+
+impl PendingNotifications {
+    fn pop_front(&mut self) -> Option<AppServerNotification> {
+        let (notification, bytes) = self.items.pop_front()?;
+        self.bytes -= bytes;
+        Some(notification)
+    }
+}
+
 fn route_request_message(
     message: Value,
     expected_id: u64,
-    pending_notifications: &mut VecDeque<AppServerNotification>,
+    pending_notifications: &mut PendingNotifications,
 ) -> Result<Option<Value>, TransportError> {
+    // Bound the secondary queue too: a peer can emit notifications while the
+    // request loop continuously drains the primary stdout handoff.
+    let bytes = encode_json_line(&message)
+        .map_err(|_| TransportError::ProtocolDrift)?
+        .len();
     match decode_response(message, expected_id)? {
         ResponseDisposition::Notification(notification) => {
-            pending_notifications.push_back(notification);
+            if pending_notifications.items.len() >= bastet_core::OUTPUT_QUEUE_ITEMS
+                || bytes
+                    > bastet_core::OUTPUT_QUEUE_BYTES.saturating_sub(pending_notifications.bytes)
+            {
+                return Err(TransportError::ProtocolDrift);
+            }
+            pending_notifications.bytes += bytes;
+            pending_notifications.items.push_back((notification, bytes));
             Ok(None)
         }
         ResponseDisposition::Result(result) => Ok(Some(result)),
@@ -423,10 +468,7 @@ mod tests {
         fs,
         os::unix::fs::PermissionsExt,
         process::{Command, Stdio},
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            mpsc::{self, Sender},
-        },
+        sync::atomic::{AtomicUsize, Ordering},
     };
 
     #[cfg(unix)]
@@ -793,9 +835,20 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn clock_transport(
-        timeout: Duration,
-    ) -> (StdioTransport, Sender<Result<Value, TransportError>>) {
+    struct ClockSender(bastet_core::OutputSender<Result<Value, TransportError>>);
+
+    #[cfg(unix)]
+    impl ClockSender {
+        fn send(&self, message: Result<Value, TransportError>) -> Result<(), ()> {
+            let bytes = message
+                .as_ref()
+                .map_or(0, |value| serde_json::to_vec(value).unwrap().len());
+            self.0.send(message, bytes).then_some(()).ok_or(())
+        }
+    }
+
+    #[cfg(unix)]
+    fn clock_transport(timeout: Duration) -> (StdioTransport, ClockSender) {
         let mut command = Command::new("/bin/sh");
         command
             .args(["-c", "exec /bin/sleep 30"])
@@ -806,21 +859,22 @@ mod tests {
             .take_stdin()
             .map(|stdin| ProcessInputWriter::spawn(stdin).unwrap());
         let _stdout = child.take_stdout();
-        let (sender, responses) = mpsc::channel();
+        let (sender, responses) = bastet_core::output_queue();
         (
             StdioTransport {
+                output_failed: false,
                 cancellation: bastet_core::CancellationToken::default(),
                 child,
                 stdin,
                 responses,
-                pending_notifications: VecDeque::new(),
+                pending_notifications: PendingNotifications::default(),
                 reader: None,
                 next_request_id: 0,
                 timeout,
                 notification_deadline: None,
                 abandoned_request_ids: VecDeque::new(),
             },
-            sender,
+            ClockSender(sender),
         )
     }
 
@@ -946,7 +1000,7 @@ mod tests {
 
     #[test]
     fn notifications_seen_before_a_response_are_preserved_in_order() {
-        let mut pending = VecDeque::new();
+        let mut pending = PendingNotifications::default();
         assert_eq!(
             route_request_message(
                 json!({"method": "turn/started", "params": {"turn": {"id": "turn_1"}}}),
@@ -962,6 +1016,68 @@ mod tests {
             Some(json!({"ok": true}))
         );
         assert_eq!(pending.pop_front().unwrap().method, "turn/started");
+        assert_eq!(pending.bytes, 0);
+    }
+
+    #[test]
+    fn deferred_notifications_have_both_count_and_byte_limits() {
+        let mut pending = PendingNotifications::default();
+        for _ in 0..bastet_core::OUTPUT_QUEUE_ITEMS {
+            route_request_message(json!({"method":"fixture", "params":{}}), 0, &mut pending)
+                .unwrap();
+        }
+        assert_eq!(
+            route_request_message(json!({"method":"fixture", "params":{}}), 0, &mut pending),
+            Err(TransportError::ProtocolDrift)
+        );
+        let mut pending = PendingNotifications::default();
+        let notification =
+            json!({"method":"fixture", "params":{"text":"x".repeat(6 * 1024 * 1024)}});
+        for _ in 0..2 {
+            route_request_message(notification.clone(), 0, &mut pending).unwrap();
+        }
+        assert_eq!(
+            route_request_message(notification, 0, &mut pending),
+            Err(TransportError::ProtocolDrift)
+        );
+        assert!(pending.bytes <= bastet_core::OUTPUT_QUEUE_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_rpc_routing_never_releases_previously_deferred_notifications() {
+        let (mut transport, sender) = clock_transport(Duration::from_secs(10));
+        sender
+            .send(Ok(json!({"method":"turn/completed", "params":{}})))
+            .unwrap();
+        sender.send(Ok(json!({"id":99, "result":{}}))).unwrap();
+        assert_eq!(
+            transport.request("fixture", json!({})),
+            Err(TransportError::ProtocolDrift)
+        );
+        assert_eq!(
+            transport.poll_notification(Duration::ZERO),
+            Err(TransportError::Unavailable)
+        );
+        assert!(transport.stdin.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn flooded_handoff_closes_transport_before_returning_queued_events() {
+        let (mut transport, sender) = clock_transport(Duration::from_secs(10));
+        for _ in 0..bastet_core::OUTPUT_QUEUE_ITEMS {
+            sender
+                .send(Ok(json!({"method":"turn/completed", "params":{}})))
+                .unwrap();
+        }
+        assert!(sender.send(Ok(json!({}))).is_err());
+        assert_eq!(
+            transport.poll_notification(Duration::ZERO),
+            Err(TransportError::Unavailable)
+        );
+        assert!(transport.stdin.is_none());
+        transport.close_checked().unwrap();
     }
 
     #[test]

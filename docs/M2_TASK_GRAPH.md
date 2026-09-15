@@ -29,6 +29,30 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 bounded stdout handoff and deferred notifications
+
+Both adapter stdout handoffs now enforce 128 queued items and 16 MiB of retained
+wire bytes. A nonblocking producer latches failure on either limit and stops;
+consumers reject already-queued events once failure is observed, then perform
+checked local cleanup. This avoids blocking the reader's cancellation join and
+does not silently drop events to keep a run looking healthy. Codex's secondary
+notification queue while awaiting RPC replies has the same count/byte bounds,
+so continuously draining the first queue cannot bypass the limit. Byte credits
+are released on consumption or drop, including failed sends.
+
+Core tests cover byte and count saturation, credit release, disconnected consumers,
+and sticky failure. Adapter tests cover Agy synthetic flood cleanup, Codex queued
+terminal rejection, and deferred notification count/byte saturation. These are
+wire-retention budgets, not an exact process RSS cap: parsed JSON overhead, a
+currently decoded line, and separately retained run output must not be conflated
+with queued bytes. Native Windows adapter subprocess fixtures remain outstanding.
+M2 sandbox binding, network destinations, authentication, and Windows containment
+gates remain open.
+
+Startup cancellation `2187137` now passes all CI `35013360412` jobs, including
+Windows core cancellation and the explicit Linux native sandbox probes. This
+supersedes that batch's previously pending CI state, not the remaining M2 gates.
+
 ### 2026-09-16 cooperative startup cancellation
 
 Supersedes the pre-Running limitation recorded below. The daemon now permits
