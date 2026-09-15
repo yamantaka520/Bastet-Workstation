@@ -29,6 +29,22 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 Windows atomic launch prerequisites
+
+The [Windows backend contract](WINDOWS_PROCESS_BACKEND.md) records the concrete
+creation-time Job/handle-list path required on Rust 1.88. Suspended-then-assigned
+children are not substituted for creation-time assignment because host failure
+between those operations can leave an unowned suspended child. Stable Rust's
+private process representation and synchronous handles cannot be used as shortcuts.
+Bounded UTF-16 argv and explicit environment encoders are implemented and tested,
+including a Windows-native argv round-trip in the synthetic integration binary.
+They are prerequisites, not a wired process backend: Windows direct-child-only
+cleanup and the broader production sandbox/auth/network gaps remain open.
+
+The preceding native adapter controls `78aa5e0` passed all jobs in CI
+`35014891864`, including Windows job `104535724612`; this supplies native Windows
+evidence for that I/O subset, not the still-unimplemented Job backend.
+
 ### 2026-09-16 native adapter pipe controls
 
 `bastet-daemon/tests/native_provider_io.rs` is a harness-free Rust executable

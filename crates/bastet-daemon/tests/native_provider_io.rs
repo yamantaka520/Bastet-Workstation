@@ -18,19 +18,33 @@ use serde_json::{json, Value};
 const CHILD_FLAG: &str = "--bastet-native-provider-fixture";
 
 fn main() {
-    let args: Vec<_> = std::env::args().collect();
+    let args: Vec<_> = std::env::args_os().collect();
     if args.get(1).is_some_and(|arg| arg == CHILD_FLAG) {
-        fixture(&args[2]);
+        fixture(args[2].to_str().expect("ASCII fixture mode"));
         return;
     }
     codex_blocked_write();
     codex_handshake_cancel();
     agy_blocked_startup();
     positive_controls();
+    #[cfg(windows)]
+    windows_argument_roundtrip();
     println!("native provider I/O: all four adapter controls passed");
 }
 
 fn fixture(mode: &str) {
+    #[cfg(windows)]
+    if mode == "echo-args" {
+        use std::os::windows::ffi::OsStrExt;
+        let arguments: Vec<Vec<u16>> = std::env::args_os()
+            .skip(3)
+            .map(|arg| arg.encode_wide().collect())
+            .collect();
+        std::fs::write("arguments.json", serde_json::to_vec(&arguments).unwrap()).unwrap();
+        // Marker after closing the file, never merely after process startup.
+        std::fs::write("arguments-ready", b"ready").unwrap();
+        return;
+    }
     if mode == "never-read" {
         std::fs::write("ready", b"ready").unwrap();
         thread::sleep(Duration::from_secs(30));
@@ -69,6 +83,46 @@ fn fixture(mode: &str) {
         }
         _ => panic!("unknown native fixture mode"),
     }
+}
+
+#[cfg(windows)]
+fn windows_argument_roundtrip() {
+    use std::os::windows::{
+        ffi::{OsStrExt, OsStringExt},
+        process::CommandExt,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let executable = std::env::current_exe().unwrap();
+    let executable_wide: Vec<_> = executable.as_os_str().encode_wide().collect();
+    let wide = |value: &str| value.encode_utf16().collect::<Vec<_>>();
+    let expected = vec![
+        wide(""),
+        wide("a b"),
+        wide("a\"b"),
+        wide("ends\\"),
+        wide("\\\""),
+        vec![0xd83d, 0xde00, 0xd800],
+    ];
+    let mut arguments = vec![wide(CHILD_FLAG), wide("echo-args")];
+    arguments.extend(expected.clone());
+    let encoded =
+        bastet_core::windows_launch_encoding::windows_command_line(&executable_wide, &arguments)
+            .unwrap();
+    let mut command = Command::new(&executable);
+    // Command supplies argv[0]; pass our remaining encoded command line
+    // verbatim so this test exercises Windows argument parsing, not Rust's encoder.
+    command.raw_arg(std::ffi::OsString::from_wide(
+        &encoded[executable_wide.len() + 3..encoded.len() - 1],
+    ));
+    command.current_dir(root.path());
+    bastet_core::configure_adapter_process_environment(&mut command);
+    let mut child = bastet_core::OwnedAdapterChild::spawn(&mut command).unwrap();
+    wait_marker(&root.path().join("arguments-ready"));
+    let observed: Vec<Vec<u16>> =
+        serde_json::from_slice(&std::fs::read(root.path().join("arguments.json")).unwrap())
+            .unwrap();
+    assert_eq!(observed, expected);
+    child.shutdown(Duration::ZERO).unwrap();
 }
 
 struct NativeLauncher {
