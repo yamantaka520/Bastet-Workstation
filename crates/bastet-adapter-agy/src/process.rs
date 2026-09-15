@@ -167,7 +167,14 @@ impl AgyProcess {
                     )
                 }
             };
-        let write_deadline = Instant::now() + request.timeout;
+        let Some(write_deadline) = Instant::now().checked_add(request.timeout) else {
+            return startup_failure(
+                &mut child,
+                Some(&mut stdin),
+                Some(&mut reader),
+                AgyProcessError::InvalidRequest,
+            );
+        };
         if let Err(error) = stdin.write_frame(input_frame, write_deadline) {
             return startup_failure(
                 &mut child,
@@ -206,6 +213,14 @@ impl AgyProcess {
         } else {
             None
         };
+        let Some(inactivity_deadline) = Instant::now().checked_add(request.timeout) else {
+            return startup_failure(
+                &mut child,
+                Some(&mut stdin),
+                Some(&mut reader),
+                AgyProcessError::InvalidRequest,
+            );
+        };
         Ok(Self {
             child,
             stdin: Some(stdin),
@@ -213,7 +228,7 @@ impl AgyProcess {
             reader,
             stream,
             timeout: request.timeout,
-            inactivity_deadline: Instant::now() + request.timeout,
+            inactivity_deadline,
             cancellation_requested: false,
             pending,
             pending_terminal: None,
@@ -277,7 +292,11 @@ impl AgyProcess {
                 Ok(Ok(line)) => {
                     // Any provider output is activity, even when it does not
                     // normalize to a public update.
-                    self.inactivity_deadline = Instant::now() + self.timeout;
+                    let Some(deadline) = Instant::now().checked_add(self.timeout) else {
+                        self.terminate()?;
+                        return Err(AgyProcessError::InvalidRequest);
+                    };
+                    self.inactivity_deadline = deadline;
                     if let Some(update) = self.stream.consume_line(&line, occurred_at)? {
                         if is_terminal(&update) {
                             self.stdin.take();
@@ -360,6 +379,7 @@ fn validate_request(executable: &Path, request: &AgyRunRequest) -> Result<(), Ag
         || !request.cwd.is_dir()
         || request.prompt.trim().is_empty()
         || request.timeout.is_zero()
+        || Instant::now().checked_add(request.timeout).is_none()
         || request.timeout.as_secs() == 0
         || request
             .effort
@@ -517,6 +537,27 @@ mod tests {
             timeout: Duration::from_secs(10),
             conversation_id: None,
         }
+    }
+
+    #[test]
+    fn overflowed_timeout_is_rejected_before_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let launcher = RejectingLauncher {
+            calls: Cell::new(0),
+        };
+        let request = AgyRunRequest {
+            timeout: Duration::MAX,
+            ..fixture_request(&root, "delayed-init")
+        };
+        assert!(matches!(
+            AgyProcess::spawn_with_launcher(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/poll-provider.sh"),
+                request,
+                &launcher
+            ),
+            Err(AgyProcessError::InvalidRequest)
+        ));
+        assert_eq!(launcher.calls.get(), 0);
     }
 
     #[test]

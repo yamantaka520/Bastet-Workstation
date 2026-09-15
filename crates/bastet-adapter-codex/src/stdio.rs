@@ -40,6 +40,7 @@ impl StdioTransport {
         if timeout.is_zero() {
             return Err(TransportError::ProtocolDrift);
         }
+        deadline_after(timeout)?;
         let mut command = launcher
             .command(executable)
             .map_err(|_| TransportError::Unavailable)?;
@@ -127,7 +128,7 @@ impl StdioTransport {
                 // Activity observed while an RPC is in flight is still
                 // provider transport activity. Preserve it for subsequent
                 // bounded run polling rather than carrying a stale deadline.
-                self.notification_deadline = Some(Instant::now() + self.timeout);
+                self.notification_deadline = Some(deadline_after(self.timeout)?);
                 Ok(message)
             }
             Err(RecvTimeoutError::Timeout) => Err(TransportError::TimedOut),
@@ -153,7 +154,7 @@ impl AppServerTransport for StdioTransport {
     fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
         self.write_message(
             &json!({"method": method, "params": params}),
-            Instant::now() + self.timeout,
+            deadline_after(self.timeout)?,
         )
     }
 
@@ -166,20 +167,23 @@ impl AppServerTransport for StdioTransport {
         &mut self,
         max_wait: Duration,
     ) -> Result<Option<AppServerNotification>, TransportError> {
+        let observation_deadline = deadline_after(max_wait)?;
         if let Some(notification) = self.pending_notifications.pop_front() {
-            self.notification_deadline = Some(Instant::now() + self.timeout);
+            self.notification_deadline = Some(deadline_after(self.timeout)?);
             return Ok(Some(notification));
         }
         let now = Instant::now();
-        let inactivity_deadline = self.notification_deadline.unwrap_or_else(|| {
-            let deadline = now + self.timeout;
-            self.notification_deadline = Some(deadline);
-            deadline
-        });
+        let inactivity_deadline = match self.notification_deadline {
+            Some(deadline) => deadline,
+            None => {
+                let deadline = deadline_after(self.timeout)?;
+                self.notification_deadline = Some(deadline);
+                deadline
+            }
+        };
         if now >= inactivity_deadline {
             return Err(TransportError::TimedOut);
         }
-        let observation_deadline = now + max_wait;
         loop {
             let now = Instant::now();
             let wait = observation_deadline
@@ -198,7 +202,7 @@ impl AppServerTransport for StdioTransport {
                     }
                 }
                 Ok(Ok(message)) => {
-                    self.notification_deadline = Some(Instant::now() + self.timeout);
+                    self.notification_deadline = Some(deadline_after(self.timeout)?);
                     return decode_notification(message).map(Some);
                 }
                 Ok(Err(error)) => return Err(error),
@@ -220,12 +224,12 @@ impl StdioTransport {
         max_wait: Duration,
         abandon_on_timeout: bool,
     ) -> Result<Value, TransportError> {
+        let deadline = deadline_after(max_wait)?;
         let request_id = self.next_request_id;
         self.next_request_id = self
             .next_request_id
             .checked_add(1)
             .ok_or(TransportError::ProtocolDrift)?;
-        let deadline = Instant::now() + max_wait;
         self.write_message(
             &json!({
                 "method": method,
@@ -276,6 +280,12 @@ impl StdioTransport {
         self.abandoned_request_ids.remove(position);
         true
     }
+}
+
+fn deadline_after(duration: Duration) -> Result<Instant, TransportError> {
+    Instant::now()
+        .checked_add(duration)
+        .ok_or(TransportError::ProtocolDrift)
 }
 
 fn route_request_message(
@@ -432,15 +442,41 @@ mod tests {
     #[test]
     fn invalid_timeout_is_rejected_before_the_launcher_is_called() {
         let launcher = RejectingLauncher(AtomicUsize::new(0));
-        assert!(matches!(
-            StdioTransport::spawn_with_launcher(
-                Path::new("provider-fixture"),
-                Duration::ZERO,
-                &launcher,
-            ),
-            Err(TransportError::ProtocolDrift)
-        ));
+        for timeout in [Duration::ZERO, Duration::MAX] {
+            assert!(matches!(
+                StdioTransport::spawn_with_launcher(
+                    Path::new("provider-fixture"),
+                    timeout,
+                    &launcher,
+                ),
+                Err(TransportError::ProtocolDrift)
+            ));
+        }
         assert_eq!(launcher.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn unrepresentable_deadline_is_a_typed_error() {
+        assert_eq!(
+            deadline_after(Duration::MAX),
+            Err(TransportError::ProtocolDrift)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overflowed_request_budget_does_not_consume_an_id_or_close_transport() {
+        let (mut transport, _sender) = clock_transport(Duration::from_secs(10));
+        assert_eq!(
+            transport.request_with_timeout("fixture", json!({}), Duration::MAX),
+            Err(TransportError::ProtocolDrift)
+        );
+        assert_eq!(transport.next_request_id, 0);
+        assert!(transport.stdin.is_some());
+        assert_eq!(
+            transport.poll_notification(Duration::MAX),
+            Err(TransportError::ProtocolDrift)
+        );
     }
 
     #[cfg(unix)]

@@ -29,6 +29,27 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 Windows overlapped stdin correction
+
+CI `35010313693` passed Ubuntu but Windows job `104520323208` failed the native
+blocked-pipe test: a 200-ms write deadline returned only when the 30-second child
+exited. This disproves the previous Windows bounded-close assumption, despite
+local tests and review. Rust 1.88 process pipes use overlapped `WriteFileEx`;
+`CancelSynchronousIo` alone does not cancel that operation. The writer now keeps
+the exact stdin handle alive with shared ownership and repeatedly calls
+`CancelIoEx` on that handle as well as thread cancellation until the worker
+finishes. Only then does it join and release the pipe; neither buffer nor handle
+is freed while an I/O completion can still use it. The original native timeout
+assertion remains unchanged; corrected Windows runtime evidence is pending.
+
+Adapter deadline construction also uses checked arithmetic: unrepresentable
+timeouts fail before launch/request-id consumption instead of panicking. Tests
+cover `Duration::MAX`, including observation budgets. Immediate pre-Running
+cancellation remains a separate lifecycle task, not supplied by this correction.
+
+Sources: [Rust 1.88 Windows process pipes](https://github.com/rust-lang/rust/blob/1.88.0/library/std/src/sys/pal/windows/pipe.rs)
+and [CancelIoEx contract](https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-cancelioex).
+
 ### 2026-09-16 bounded provider stdin
 
 Both adapters now use a shared single-flight stdin writer, with an absolute

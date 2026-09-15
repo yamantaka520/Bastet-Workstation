@@ -33,6 +33,9 @@ struct WriteRequest {
 /// accumulates an unbounded queue of frames. A timeout or I/O failure poisons
 /// the writer, closes stdin, and makes all later writes fail.
 pub struct ProcessInputWriter {
+    // Retain the exact pipe handle through cancellation and worker join. An
+    // unowned raw handle could be closed/reused as the worker exits.
+    stdin: Option<Arc<ChildStdin>>,
     sender: Option<SyncSender<WriteRequest>>,
     stopped: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -43,13 +46,16 @@ impl ProcessInputWriter {
     /// Starts the dedicated stdin writer thread.
     pub fn spawn(stdin: ChildStdin) -> io::Result<Self> {
         prepare_stdin(&stdin)?;
+        let stdin = Arc::new(stdin);
+        let worker_stdin = Arc::clone(&stdin);
         let (sender, receiver) = mpsc::sync_channel(0);
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_stopped = Arc::clone(&stopped);
         let thread = thread::Builder::new()
             .name("bastet-process-input".into())
-            .spawn(move || write_stdin(stdin, receiver, worker_stopped))?;
+            .spawn(move || write_stdin(worker_stdin, receiver, worker_stopped))?;
         Ok(Self {
+            stdin: Some(stdin),
             sender: Some(sender),
             stopped,
             thread: Some(thread),
@@ -128,11 +134,22 @@ impl ProcessInputWriter {
             #[cfg(windows)]
             {
                 use std::os::windows::io::AsRawHandle;
-                // A synchronous pipe write may be blocked. Repeating this
-                // closes the stop-check / I/O-entry race without terminating
-                // the worker thread or touching another thread's I/O.
+                // Rust 1.88 process pipes use overlapped WriteFileEx even
+                // though ChildStdin::write looks synchronous. CancelIoEx is
+                // required for that I/O; thread-only cancellation is not enough.
+                // Repeat both forms to cover the stop-check / I/O-entry race
+                // and callers supplying synchronous ChildStdin handles.
                 while !thread.is_finished() {
+                    // SAFETY: Arc keeps this exact, privately owned stdin
+                    // handle alive until the worker has joined. No other writer
+                    // uses it. std retains its OVERLAPPED/buffer until completion.
                     unsafe {
+                        if let Some(stdin) = &self.stdin {
+                            windows_sys::Win32::System::IO::CancelIoEx(
+                                stdin.as_raw_handle(),
+                                std::ptr::null(),
+                            );
+                        }
                         windows_sys::Win32::System::IO::CancelSynchronousIo(thread.as_raw_handle());
                     }
                     thread::sleep(POLL_INTERVAL);
@@ -140,6 +157,7 @@ impl ProcessInputWriter {
             }
             let _ = thread.join();
         }
+        self.stdin.take();
     }
 
     fn poison_and_close(&mut self) {
@@ -238,9 +256,9 @@ fn unusable_error() -> io::Error {
     )
 }
 
-fn write_stdin(mut stdin: ChildStdin, receiver: Receiver<WriteRequest>, stopped: Arc<AtomicBool>) {
+fn write_stdin(stdin: Arc<ChildStdin>, receiver: Receiver<WriteRequest>, stopped: Arc<AtomicBool>) {
     while let Ok(request) = receiver.recv() {
-        let result = write_one(&mut stdin, &request.frame, request.deadline, &stopped);
+        let result = write_one(&stdin, &request.frame, request.deadline, &stopped);
         let terminal = result.is_err();
         let _ = request.result.send(result);
         if terminal || stopped.load(Ordering::Acquire) {
@@ -250,7 +268,7 @@ fn write_stdin(mut stdin: ChildStdin, receiver: Receiver<WriteRequest>, stopped:
 }
 
 fn write_one(
-    stdin: &mut ChildStdin,
+    mut stdin: &ChildStdin,
     frame: &[u8],
     deadline: Instant,
     stopped: &AtomicBool,
