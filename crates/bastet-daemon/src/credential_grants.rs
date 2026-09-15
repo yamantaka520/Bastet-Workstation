@@ -112,7 +112,16 @@ pub(super) fn validate_current_catalog(
         let selected = load_launch_identity(transaction, run.metadata.id)?
             .ok_or(StoreError::CredentialGrantRejected)?;
         let current_binding = resolve_provider_run_binding(&catalog, &m3, &graph, definition.id)?;
+        let plan = provider_launch::ProviderLaunchPlan::load(transaction, run.metadata.id)?;
         if selected != current_binding.launch_identity
+            || plan.identity != selected
+            || plan.execution_id != graph.id
+            || plan.node_id != definition.id
+            || plan.role_id != role_id
+            || plan.session_id != run.session_id
+            || current.owner.as_deref() != Some(plan.owner.as_str())
+            || plan.workspace_root != current_binding.workspace_root
+            || plan.prompt != current_binding.prompt
             || selected.agent_instance_id != request.action.agent_instance_id
             || selected.project_id != request.action.scope.project_id
             || selected.model_id != run.model_id
@@ -721,11 +730,11 @@ mod tests {
             let connection = store.connection().unwrap();
             connection.execute("UPDATE approval_requests SET request_hash = ?1, request_json = ?2, decision_json = ?3 WHERE request_id = ?4",
                 params![legacy.request_hash, serde_json::to_string(&legacy).unwrap(), serde_json::to_string(&decision).unwrap(), legacy.id.value().to_string()]).unwrap();
-            connection.execute_batch("DROP TABLE credential_grants; DELETE FROM schema_migrations WHERE version = 10;").unwrap();
+            connection.execute_batch("DROP TABLE provider_launch_plans; DROP TABLE credential_grants; DELETE FROM schema_migrations WHERE version >= 10;").unwrap();
         }
         drop(store);
         let upgraded = Store::open(directory.path().join("grants.db")).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 10);
+        assert_eq!(upgraded.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(upgraded.approval(legacy.id).unwrap().request, legacy);
         assert_eq!(
             upgraded.approval(legacy.id).unwrap().decision,

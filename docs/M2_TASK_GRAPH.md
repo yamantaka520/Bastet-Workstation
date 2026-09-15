@@ -29,6 +29,34 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 exact launch plans and prelaunch graph primitives
+
+Schema 11 saves an append-only, versioned full launch plan in the same transaction
+as each graph attempt: execution/node/session/run IDs, attempt, role, owner,
+selected identity, workspace and prompt. Preflight compares the receipt against
+this saved plan as well as current catalog and graph state; changing both the
+current workspace and receipt cannot replace the original intent. Credential
+authorization likewise checks the saved plan. The SHA-256 checksum detects
+corruption; it is not authentication against someone who can replace the database.
+Events contain no plan content. Old attempts are not backfilled from current data.
+
+Core graph APIs now support explicit `AwaitingApproval` staging, exact-owner/run
+activation and never-launched cancellation. Restart preserves staged identity
+while interrupted Running nodes still become Uncertain. Desktop projects staged
+nodes as approval-required. These primitives are not yet used by the production coordinator:
+server-derived approval creation, durable dispatch state, expiry/deny/revoke
+coordination and native credential brokerage remain open. No provider login or
+M2 gate completion is claimed by this change.
+
+Tests cover atomic plan-write rollback, immutable storage, checksum corruption,
+legacy migration without inferred plans, restart preservation without replay,
+workspace substitution, and legal/illegal staged graph transitions.
+Local full-workspace tests pass with real-provider canaries ignored. Focused graph
+tests also reject reuse of a historical output's RunId after retry; blocked
+terminal runs retain their existing run/failure evidence. Warnings-denied
+workspace Clippy passes. These are local fixture/integration results, not M2's
+real-provider or five-locale human acceptance evidence.
+
 ### 2026-09-16 persisted launch identity at credential authorization
 
 Graph credential authorization now compares the exact attempt's saved launch

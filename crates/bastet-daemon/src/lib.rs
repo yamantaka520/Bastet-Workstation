@@ -2,6 +2,7 @@
 
 mod credential_grants;
 mod provider_executor;
+mod provider_launch;
 pub mod sandbox;
 
 use std::collections::HashMap;
@@ -42,7 +43,7 @@ use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 10;
+const SCHEMA_VERSION: u32 = 11;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -2030,6 +2031,12 @@ impl Store {
         receipt: &BeginGraphNodeRunReceipt,
     ) -> Result<(), StoreError> {
         let connection = self.connection()?;
+        let plan = provider_launch::ProviderLaunchPlan::load(&connection, receipt.run_id)?;
+        if !plan.matches_receipt(receipt) {
+            return Err(StoreError::InvalidRunState(
+                "launch receipt differs from durable plan".into(),
+            ));
+        }
         let selected = load_launch_identity(&connection, receipt.run_id)?
             .ok_or_else(|| StoreError::InvalidRunState("launch selection unavailable".into()))?;
         if receipt.launch_identity.as_ref() != Some(&selected)
@@ -2040,13 +2047,15 @@ impl Store {
                 "launch receipt differs from durable selection".into(),
             ));
         }
-        let (execution_id, node_id): (String, String) = connection.query_row(
-            "SELECT execution_id, node_id FROM graph_node_runs WHERE run_id=?1",
+        let (execution_id, node_id, attempt, finished_at): (String, String, u64, Option<String>) = connection.query_row(
+            "SELECT execution_id, node_id, attempt, finished_at FROM graph_node_runs WHERE run_id=?1",
             [receipt.run_id.value().to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         if execution_id != receipt.execution_id.value().to_string()
             || node_id != receipt.node_id.value().to_string()
+            || attempt != plan.attempt
+            || finished_at.is_some()
         {
             return Err(StoreError::InvalidRunState(
                 "launch receipt belongs to another node".into(),
@@ -2090,7 +2099,21 @@ impl Store {
                 |row| row.get(0),
             )?)?;
         let binding = resolve_provider_run_binding(&identity, &m3, &execution, receipt.node_id)?;
+        let node = execution
+            .nodes
+            .iter()
+            .find(|node| node.node_id == receipt.node_id)
+            .ok_or(StoreError::RunNotFound)?;
+        let definition = execution
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.id == receipt.node_id)
+            .ok_or(StoreError::RunNotFound)?;
         if binding.launch_identity != selected
+            || node.state != GraphNodeState::Running
+            || node.owner.as_deref() != Some(plan.owner.as_str())
+            || definition.role_id != plan.role_id
             || binding.workspace_root != receipt.workspace_root
             || binding.prompt != receipt.prompt
             || execution
@@ -2212,6 +2235,26 @@ impl Store {
                 serde_json::to_string(&binding.launch_identity)?
             ],
         )?;
+        provider_launch::ProviderLaunchPlan {
+            version: 1,
+            execution_id: id,
+            node_id: command.node_id,
+            session_id,
+            run_id,
+            attempt,
+            role_id: execution
+                .graph
+                .nodes
+                .iter()
+                .find(|node| node.id == command.node_id)
+                .ok_or(StoreError::RunNotFound)?
+                .role_id,
+            owner: command.owner,
+            identity: binding.launch_identity.clone(),
+            workspace_root: binding.workspace_root.clone(),
+            prompt: binding.prompt.clone(),
+        }
+        .insert(&transaction)?;
         let event = insert_event(
             &transaction,
             "graph.node_run_started",
@@ -3205,6 +3248,30 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StoreError> {
         )?;
         transaction.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (10, ?1)",
+            [timestamp()],
+        )?;
+        transaction.commit()?;
+    }
+    if current < 11 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE provider_launch_plans (
+                run_id TEXT PRIMARY KEY NOT NULL,
+                plan_json TEXT NOT NULL,
+                plan_hash TEXT NOT NULL);
+             CREATE TRIGGER provider_launch_plans_no_replace
+                BEFORE INSERT ON provider_launch_plans
+                WHEN EXISTS(SELECT 1 FROM provider_launch_plans WHERE run_id=NEW.run_id) BEGIN
+                SELECT RAISE(ABORT, 'launch plans cannot be replaced'); END;
+             CREATE TRIGGER provider_launch_plans_immutable
+                BEFORE UPDATE ON provider_launch_plans BEGIN
+                SELECT RAISE(ABORT, 'launch plans are immutable'); END;
+             CREATE TRIGGER provider_launch_plans_no_delete
+                BEFORE DELETE ON provider_launch_plans BEGIN
+                SELECT RAISE(ABORT, 'launch plans are append only'); END;",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (11, ?1)",
             [timestamp()],
         )?;
         transaction.commit()?;
@@ -4748,6 +4815,7 @@ mod tests {
         connection
             .execute_batch(
                 "ALTER TABLE graph_node_runs DROP COLUMN launch_identity_json;
+                 DROP TABLE provider_launch_plans;
                  DROP TABLE credential_grants;
                  DELETE FROM schema_migrations WHERE version >= 9;",
             )
@@ -5106,6 +5174,7 @@ mod tests {
         fixture
             .execute_batch(
                 "DELETE FROM schema_migrations WHERE version >= 7;
+                 DROP TABLE provider_launch_plans;
                  DROP TABLE credential_grants;
                  DROP TABLE graph_node_outputs;
                  DROP INDEX graph_node_runs_current_attempt;
@@ -5144,6 +5213,7 @@ mod tests {
         fixture
             .execute_batch(
                 "DELETE FROM schema_migrations WHERE version >= 8;
+                 DROP TABLE provider_launch_plans;
                  DROP TABLE credential_grants;
                  DROP TABLE graph_node_outputs;
                  DROP TABLE graph_node_runs;

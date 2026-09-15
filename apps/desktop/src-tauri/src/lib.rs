@@ -885,6 +885,7 @@ fn project_m3(
 fn pet_state(state: bastet_core::GraphNodeState) -> &'static str {
     match state {
         bastet_core::GraphNodeState::Pending => "idle",
+        bastet_core::GraphNodeState::AwaitingApproval => "approval_required",
         bastet_core::GraphNodeState::Running => "working",
         bastet_core::GraphNodeState::Succeeded => "succeeded",
         bastet_core::GraphNodeState::Failed | bastet_core::GraphNodeState::Cancelled => "failed",
@@ -1287,6 +1288,14 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn staged_node_projects_approval_required_not_active_work() {
+        assert_eq!(
+            super::pet_state(bastet_core::GraphNodeState::AwaitingApproval),
+            "approval_required"
+        );
+    }
+
     use super::*;
 
     #[test]

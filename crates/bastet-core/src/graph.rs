@@ -33,6 +33,9 @@ pub struct WorkflowGraph {
 #[serde(rename_all = "snake_case")]
 pub enum GraphNodeState {
     Pending,
+    /// A scheduler has selected the node and allocated its provider run, but a
+    /// human approval is still required before that run may be launched.
+    AwaitingApproval,
     Running,
     Succeeded,
     Failed,
@@ -217,15 +220,7 @@ impl GraphExecution {
                     .nodes
                     .iter()
                     .any(|node| node.id == execution.node_id)
-                    || match execution.state {
-                        GraphNodeState::Running
-                        | GraphNodeState::Succeeded
-                        | GraphNodeState::Failed
-                        | GraphNodeState::Cancelled => execution.owner.is_none(),
-                        GraphNodeState::Pending
-                        | GraphNodeState::Blocked
-                        | GraphNodeState::Uncertain => execution.owner.is_some(),
-                    }
+                    || !execution_state_is_valid(execution)
             })
         {
             return Err(GraphError::InvalidExecution);
@@ -408,6 +403,81 @@ impl GraphExecution {
         Ok(())
     }
 
+    /// Records a scheduler's intent to launch a ready node, without launching
+    /// the provider run. The owner and run id are durable approval identity and
+    /// must be presented unchanged to activate or cancel this staging record.
+    pub fn stage_node(
+        &mut self,
+        node_id: GraphNodeId,
+        owner: &str,
+        run_id: RunId,
+    ) -> Result<(), GraphError> {
+        if owner.trim().is_empty() || self.run_id_is_in_use(run_id) {
+            return Err(GraphError::InvalidExecution);
+        }
+        if !self.dependencies_succeeded(node_id)? {
+            return Err(GraphError::InvalidExecution);
+        }
+        let execution = self.node_execution_mut(node_id)?;
+        if execution.state != GraphNodeState::Pending
+            || execution.owner.is_some()
+            || execution.run_id.is_some()
+        {
+            return Err(GraphError::InvalidExecution);
+        }
+        execution.state = GraphNodeState::AwaitingApproval;
+        execution.owner = Some(owner.into());
+        execution.run_id = Some(run_id);
+        execution.failure = None;
+        execution.revision += 1;
+        self.revision += 1;
+        Ok(())
+    }
+
+    /// Turns an approved staging record into an executable run. This is the
+    /// only transition out of `AwaitingApproval` other than explicit cancel.
+    pub fn activate_staged_node(
+        &mut self,
+        node_id: GraphNodeId,
+        owner: &str,
+        run_id: RunId,
+    ) -> Result<(), GraphError> {
+        let execution = self.node_execution_mut(node_id)?;
+        if execution.state != GraphNodeState::AwaitingApproval
+            || execution.owner.as_deref() != Some(owner)
+            || execution.run_id != Some(run_id)
+        {
+            return Err(GraphError::InvalidExecution);
+        }
+        execution.state = GraphNodeState::Running;
+        execution.revision += 1;
+        self.revision += 1;
+        Ok(())
+    }
+
+    /// Cancels a staged, never-launched run. Unlike normal terminal finishing,
+    /// this transition is intentionally available only from approval staging.
+    pub fn cancel_staged_node(
+        &mut self,
+        node_id: GraphNodeId,
+        owner: &str,
+        run_id: RunId,
+    ) -> Result<(), GraphError> {
+        let execution = self.node_execution_mut(node_id)?;
+        if execution.state != GraphNodeState::AwaitingApproval
+            || execution.owner.as_deref() != Some(owner)
+            || execution.run_id != Some(run_id)
+        {
+            return Err(GraphError::InvalidExecution);
+        }
+        execution.state = GraphNodeState::Cancelled;
+        execution.failure = None;
+        execution.revision += 1;
+        self.revision += 1;
+        self.block_dependents(node_id);
+        Ok(())
+    }
+
     pub fn bind_run(
         &mut self,
         node_id: GraphNodeId,
@@ -427,6 +497,35 @@ impl GraphExecution {
         }
         execution.run_id = Some(run_id);
         Ok(())
+    }
+
+    fn dependencies_succeeded(&self, node_id: GraphNodeId) -> Result<bool, GraphError> {
+        let definition = self
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .ok_or(GraphError::InvalidExecution)?;
+        Ok(definition.needs.iter().all(|dependency| {
+            self.nodes.iter().any(|execution| {
+                execution.node_id == *dependency && execution.state == GraphNodeState::Succeeded
+            })
+        }))
+    }
+
+    fn node_execution_mut(
+        &mut self,
+        node_id: GraphNodeId,
+    ) -> Result<&mut GraphNodeExecution, GraphError> {
+        self.nodes
+            .iter_mut()
+            .find(|node| node.node_id == node_id)
+            .ok_or(GraphError::InvalidExecution)
+    }
+
+    fn run_id_is_in_use(&self, run_id: RunId) -> bool {
+        self.nodes.iter().any(|node| node.run_id == Some(run_id))
+            || self.outputs.iter().any(|output| output.run_id == run_id)
     }
 
     pub fn complete(
@@ -597,6 +696,28 @@ impl GraphExecution {
     }
 }
 
+fn execution_state_is_valid(execution: &GraphNodeExecution) -> bool {
+    let has_owner = execution
+        .owner
+        .as_deref()
+        .is_some_and(|owner| !owner.trim().is_empty());
+    match execution.state {
+        // Preserve historical terminal evidence: a blocked run can retain its
+        // run id and sanitized failure after finish_terminal.
+        GraphNodeState::Pending | GraphNodeState::Blocked => execution.owner.is_none(),
+        GraphNodeState::AwaitingApproval => {
+            has_owner && execution.run_id.is_some() && execution.failure.is_none()
+        }
+        // `claim_node` is deliberately an accountless immediate path: a run id
+        // is attached later by `bind_run`, before the adapter is started.
+        GraphNodeState::Running => execution.owner.is_some(),
+        GraphNodeState::Succeeded | GraphNodeState::Failed | GraphNodeState::Cancelled => {
+            execution.owner.is_some()
+        }
+        GraphNodeState::Uncertain => execution.owner.is_none(),
+    }
+}
+
 fn output_hash(content: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(content.as_bytes()))
 }
@@ -719,6 +840,151 @@ mod tests {
     }
 
     #[test]
+    fn blocked_terminal_retains_run_evidence_and_remains_valid() {
+        let mut execution = GraphExecution::start(GraphRunId::new(), graph()).unwrap();
+        let node_id = execution.claim_ready("worker", 1).unwrap()[0];
+        let run_id = RunId::new();
+        execution.bind_run(node_id, "worker", run_id).unwrap();
+        let failure = AdapterFailure {
+            kind: crate::AdapterFailureKind::PermissionDenied,
+            message_key: "mvp.failure.permission".into(),
+            retryable: false,
+            provider_code: None,
+            redacted_detail: None,
+        };
+        execution
+            .finish_terminal(
+                node_id,
+                "worker",
+                GraphNodeState::Blocked,
+                Some(failure.clone()),
+            )
+            .unwrap();
+        execution.validate().unwrap();
+        let node = execution
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .unwrap();
+        assert_eq!(node.run_id, Some(run_id));
+        assert_eq!(node.failure, Some(failure));
+    }
+
+    #[test]
+    fn staged_node_activates_with_its_exact_owner_and_run_then_finishes() {
+        let mut execution = GraphExecution::start(GraphRunId::new(), graph()).unwrap();
+        let node_id = execution.graph.nodes[0].id;
+        let run_id = RunId::new();
+
+        execution.stage_node(node_id, "scheduler", run_id).unwrap();
+        let staged = &execution.nodes[0];
+        assert_eq!(staged.state, GraphNodeState::AwaitingApproval);
+        assert_eq!(staged.owner.as_deref(), Some("scheduler"));
+        assert_eq!(staged.run_id, Some(run_id));
+        assert!(execution
+            .claim_ready("worker", 2)
+            .unwrap()
+            .contains(&execution.graph.nodes[1].id));
+
+        execution
+            .activate_staged_node(node_id, "scheduler", run_id)
+            .unwrap();
+        execution.complete(node_id, "scheduler", true).unwrap();
+        assert_eq!(execution.nodes[0].state, GraphNodeState::Succeeded);
+        assert_eq!(execution.nodes[0].run_id, Some(run_id));
+        assert_eq!(execution.validate(), Ok(()));
+    }
+
+    #[test]
+    fn staged_node_cancels_without_launching_and_blocks_dependents() {
+        let mut execution = GraphExecution::start(GraphRunId::new(), graph()).unwrap();
+        let node_id = execution.graph.nodes[0].id;
+        let run_id = RunId::new();
+
+        execution.stage_node(node_id, "scheduler", run_id).unwrap();
+        execution
+            .cancel_staged_node(node_id, "scheduler", run_id)
+            .unwrap();
+        assert_eq!(execution.nodes[0].state, GraphNodeState::Cancelled);
+        assert_eq!(execution.nodes[0].owner.as_deref(), Some("scheduler"));
+        assert_eq!(execution.nodes[0].run_id, Some(run_id));
+        assert_eq!(execution.nodes[2].state, GraphNodeState::Blocked);
+        assert_eq!(execution.validate(), Ok(()));
+    }
+
+    #[test]
+    fn staging_rejects_illegal_transitions_and_identity_mismatches() {
+        let mut execution = GraphExecution::start(GraphRunId::new(), graph()).unwrap();
+        let node_id = execution.graph.nodes[0].id;
+        let run_id = RunId::new();
+
+        assert_eq!(
+            execution.activate_staged_node(node_id, "scheduler", run_id),
+            Err(GraphError::InvalidExecution)
+        );
+        assert_eq!(
+            execution.cancel_staged_node(node_id, "scheduler", run_id),
+            Err(GraphError::InvalidExecution)
+        );
+        execution.stage_node(node_id, "scheduler", run_id).unwrap();
+        assert_eq!(
+            execution.complete(node_id, "scheduler", true),
+            Err(GraphError::InvalidExecution)
+        );
+        assert_eq!(
+            execution.finish_terminal(node_id, "scheduler", GraphNodeState::Cancelled, None),
+            Err(GraphError::InvalidExecution)
+        );
+        assert_eq!(
+            execution.activate_staged_node(node_id, "other", run_id),
+            Err(GraphError::InvalidExecution)
+        );
+        assert_eq!(
+            execution.cancel_staged_node(node_id, "scheduler", RunId::new()),
+            Err(GraphError::InvalidExecution)
+        );
+        assert_eq!(
+            execution.stage_node(node_id, "scheduler", RunId::new()),
+            Err(GraphError::InvalidExecution)
+        );
+    }
+
+    #[test]
+    fn restart_reconciliation_preserves_staged_owner_and_run_identity() {
+        let mut execution = GraphExecution::start(GraphRunId::new(), graph()).unwrap();
+        let staged_id = execution.graph.nodes[0].id;
+        let running_id = execution.graph.nodes[1].id;
+        let staged_run = RunId::new();
+        execution
+            .stage_node(staged_id, "scheduler", staged_run)
+            .unwrap();
+        execution.claim_node(running_id, "worker").unwrap();
+        let running_run = RunId::new();
+        execution
+            .bind_run(running_id, "worker", running_run)
+            .unwrap();
+
+        assert_eq!(execution.reconcile_after_restart(), 1);
+        let staged = execution
+            .nodes
+            .iter()
+            .find(|node| node.node_id == staged_id)
+            .unwrap();
+        assert_eq!(staged.state, GraphNodeState::AwaitingApproval);
+        assert_eq!(staged.owner.as_deref(), Some("scheduler"));
+        assert_eq!(staged.run_id, Some(staged_run));
+        let running = execution
+            .nodes
+            .iter()
+            .find(|node| node.node_id == running_id)
+            .unwrap();
+        assert_eq!(running.state, GraphNodeState::Uncertain);
+        assert_eq!(running.owner, None);
+        assert_eq!(running.run_id, None);
+        assert_eq!(execution.validate(), Ok(()));
+    }
+
+    #[test]
     fn graph_rejects_cycle_and_implicit_join() {
         let mut invalid = graph();
         let join_id = invalid.nodes[2].id;
@@ -798,6 +1064,27 @@ mod tests {
         assert_eq!(execution.outputs.len(), 2);
         assert_eq!(execution.output(node_id).unwrap().run_id, succeeded_run);
         assert_eq!(execution.output(node_id).unwrap().markdown, "new final");
+    }
+
+    #[test]
+    fn staging_rejects_a_historical_output_run_id() {
+        let mut execution = GraphExecution::start(GraphRunId::new(), graph()).unwrap();
+        let node_id = execution.claim_ready("worker", 1).unwrap()[0];
+        let failed_run = RunId::new();
+        execution.bind_run(node_id, "worker", failed_run).unwrap();
+        execution.complete(node_id, "worker", false).unwrap();
+        execution
+            .record_output(
+                GraphNodeOutput::create(node_id, failed_run, "old partial".into()).unwrap(),
+            )
+            .unwrap();
+
+        execution.retry_failed(node_id).unwrap();
+        assert_eq!(
+            execution.stage_node(node_id, "scheduler", failed_run),
+            Err(GraphError::InvalidExecution)
+        );
+        assert_eq!(execution.nodes[0].state, GraphNodeState::Pending);
     }
 
     #[test]
