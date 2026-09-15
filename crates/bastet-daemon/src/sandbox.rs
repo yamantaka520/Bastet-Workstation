@@ -15,7 +15,11 @@ pub enum SandboxPlatform {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxProfile {
     pub workspace_root: PathBuf,
+    /// Explicit runtime/data mounts. No host-wide read permission is implied.
+    pub read_only_roots: Vec<PathBuf>,
     pub allow_workspace_write: bool,
+    /// Coarse network switch, not destination enforcement. Production must not
+    /// equate this with authorization for one provider endpoint.
     pub allow_network: bool,
 }
 
@@ -39,7 +43,10 @@ impl SandboxProfile {
         self.validate()?;
         let mut command = match platform {
             SandboxPlatform::MacosSeatbelt => {
-                if self.workspace_root.to_string_lossy().contains('\\') {
+                if self
+                    .read_paths()
+                    .any(|path| path.to_string_lossy().contains('\\'))
+                {
                     return Err(SandboxError::UnsafeWorkspace);
                 }
                 require_executable(Path::new("/usr/bin/sandbox-exec"), "sandbox-exec")?;
@@ -50,19 +57,15 @@ impl SandboxProfile {
             }
             SandboxPlatform::LinuxBubblewrap => {
                 require_executable(Path::new("/usr/bin/bwrap"), "bubblewrap")?;
-                let mut command = Command::new("/usr/bin/bwrap");
-                command.args(["--die-with-parent", "--new-session", "--ro-bind", "/", "/"]);
-                if self.allow_workspace_write {
-                    command
-                        .arg("--bind")
-                        .arg(&self.workspace_root)
-                        .arg(&self.workspace_root);
-                }
-                if !self.allow_network {
-                    command.arg("--unshare-net");
-                }
-                command.arg("--").arg(executable);
-                command
+                // Bubblewrap starts with an empty filesystem namespace. Never
+                // mount the host root, even read-only: that exposes secrets.
+                crate::sandbox_linux::launch_command(
+                    &self.workspace_root,
+                    &self.read_only_roots,
+                    self.allow_workspace_write,
+                    self.allow_network,
+                    executable,
+                )
             }
             SandboxPlatform::WindowsAppContainer => {
                 return Err(SandboxError::EnforcerUnavailable(
@@ -75,20 +78,50 @@ impl SandboxProfile {
     }
 
     fn validate(&self) -> Result<(), SandboxError> {
-        if !self.workspace_root.is_absolute() {
+        if self.read_paths().any(|path| !path.is_absolute()) {
             return Err(SandboxError::NonAbsoluteWorkspace);
         }
-        let root = self.workspace_root.to_string_lossy();
-        if root.contains(['\n', '\r', '"']) {
+        if self.read_paths().any(|path| {
+            path.parent().is_none()
+                || path
+                    .canonicalize()
+                    .ok()
+                    .is_some_and(|resolved| resolved.parent().is_none())
+                || path
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+                || path
+                    .to_str()
+                    .is_none_or(|root| root.contains(['\0', '\n', '\r', '"']))
+        }) {
             return Err(SandboxError::UnsafeWorkspace);
         }
         Ok(())
     }
 
+    fn read_paths(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.workspace_root.as_path())
+            .chain(self.read_only_roots.iter().map(PathBuf::as_path))
+    }
+
     fn macos_profile(&self) -> String {
         let mut profile = String::from(
-            "(version 1) (deny default) (allow process*) (allow sysctl-read) (allow mach-lookup) (allow file-read*)",
+            "(version 1) (deny default) (allow process*) (allow sysctl-read) (allow mach-lookup)",
         );
+        for root in self.read_paths() {
+            profile.push_str(&format!(
+                " (allow file-read* (subpath \"{}\"))",
+                root.display()
+            ));
+            // Runtime loaders open ancestor directories for openat traversal.
+            // Literal rules allow those directories, never their descendants.
+            for parent in root.ancestors().skip(1) {
+                profile.push_str(&format!(
+                    " (allow file-read* (literal \"{}\"))",
+                    parent.display()
+                ));
+            }
+        }
         if self.allow_workspace_write {
             profile.push_str(&format!(
                 " (allow file-write* (subpath \"{}\"))",
@@ -120,6 +153,7 @@ mod tests {
     fn platform_plans_fail_closed_and_never_use_prompt_level_controls() {
         let mac_profile = SandboxProfile {
             workspace_root: PathBuf::from("/workspace"),
+            read_only_roots: vec![],
             allow_workspace_write: true,
             allow_network: false,
         };
@@ -127,9 +161,11 @@ mod tests {
         assert!(mac.contains("deny default"));
         assert!(mac.contains("(subpath \"/workspace\")"));
         assert!(!mac.contains("allow network"));
+        assert!(!mac.contains("(allow file-read*)"));
         assert!(matches!(
             SandboxProfile {
                 workspace_root: std::env::current_dir().unwrap(),
+                read_only_roots: vec![],
                 allow_workspace_write: true,
                 allow_network: false,
             }
@@ -144,6 +180,107 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn macos_seatbelt_denies_undeclared_reads_including_workspace_symlinks() {
+        let directory = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let workspace_root = directory.path().canonicalize().unwrap();
+        let inside = workspace_root.join("inside");
+        let secret_fixture = outside.path().canonicalize().unwrap().join("outside");
+        std::fs::write(&inside, b"inside-fixture").unwrap();
+        std::fs::write(&secret_fixture, b"outside-fixture").unwrap();
+        let link = workspace_root.join("escape-link");
+        std::os::unix::fs::symlink(&secret_fixture, &link).unwrap();
+        let mut profile = SandboxProfile {
+            workspace_root,
+            read_only_roots: [
+                "/bin",
+                "/usr/bin",
+                "/usr/lib",
+                "/System/Library",
+                "/System/Volumes/Preboot/Cryptexes/OS",
+                "/System/Cryptexes/OS",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
+            allow_workspace_write: false,
+            allow_network: false,
+        };
+        let allowed = read_probe(&profile, &inside);
+        assert!(allowed.status.success());
+        assert_eq!(allowed.stdout, b"bastet-probe-started\ninside-fixture");
+        for path in [&secret_fixture, &link] {
+            let denied = read_probe(&profile, path);
+            assert!(!denied.status.success());
+            assert_eq!(denied.stdout, b"bastet-probe-started\n");
+        }
+        // Same target succeeds only after its explicit scope is granted.
+        profile.read_only_roots.push(secret_fixture.clone());
+        let allowed = read_probe(&profile, &secret_fixture);
+        assert!(allowed.status.success());
+        assert_eq!(allowed.stdout, b"bastet-probe-started\noutside-fixture");
+    }
+
+    #[test]
+    fn broad_relative_and_profile_injection_read_scopes_are_rejected() {
+        for root in [
+            "/",
+            "relative",
+            "/runtime/../",
+            "/runtime\n",
+            "/runtime\"",
+            "/runtime\0",
+        ] {
+            let profile = SandboxProfile {
+                workspace_root: std::env::current_dir().unwrap(),
+                read_only_roots: vec![PathBuf::from(root)],
+                allow_workspace_write: false,
+                allow_network: false,
+            };
+            assert!(profile.validate().is_err(), "{root:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cannot_disguise_a_host_root_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let link = directory.path().join("host-root");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        let profile = SandboxProfile {
+            workspace_root: directory.path().to_path_buf(),
+            read_only_roots: vec![link],
+            allow_workspace_write: false,
+            allow_network: false,
+        };
+        assert!(profile.validate().is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_probe(profile: &SandboxProfile, target: &Path) -> std::process::Output {
+        let output = profile
+            .launch_command(
+                SandboxPlatform::MacosSeatbelt,
+                Path::new("/bin/sh"),
+                &[
+                    "-c".into(),
+                    "printf 'bastet-probe-started\\n'; exec /bin/cat \"$1\"".into(),
+                    "bastet-read-probe".into(),
+                    target.display().to_string(),
+                ],
+            )
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(
+            output.stdout.starts_with(b"bastet-probe-started\n"),
+            "sandbox probe did not start"
+        );
+        output
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn macos_seatbelt_enforces_read_only_workspace() {
         let directory = tempdir().unwrap();
         let outside = tempdir().unwrap();
@@ -153,6 +290,17 @@ mod tests {
         let target = workspace_root.join("write-probe");
         let mut profile = SandboxProfile {
             workspace_root,
+            read_only_roots: [
+                "/bin",
+                "/usr/bin",
+                "/usr/lib",
+                "/System/Library",
+                "/System/Volumes/Preboot/Cryptexes/OS",
+                "/System/Cryptexes/OS",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
             allow_workspace_write: false,
             allow_network: false,
         };
@@ -197,8 +345,11 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(
-            output.stdout, b"bastet-probe-started\n",
-            "sandbox must actually start the probe, not merely return an error"
+            output.stdout,
+            b"bastet-probe-started\n",
+            "sandbox must actually start the probe, not merely return an error: {:?} {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
         );
         output
     }

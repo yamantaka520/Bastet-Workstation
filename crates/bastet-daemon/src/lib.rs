@@ -6,6 +6,7 @@ mod native_credentials;
 mod provider_executor;
 mod provider_launch;
 pub mod sandbox;
+mod sandbox_linux;
 mod staged_launches;
 
 use std::collections::HashMap;

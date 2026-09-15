@@ -29,6 +29,36 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 sandbox read-scope enforcement
+
+The previous profiles constrained writes but granted host-wide reads (Seatbelt
+`file-read*`, Bubblewrap read-only `/` mount). Profiles now require explicit
+read-only runtime/data paths in addition to the workspace. Host-root scope,
+root aliases, relative/traversal paths and profile-injection characters fail
+closed. macOS uses scoped file rules plus literal ancestor-directory access for
+runtime traversal; this permits directory traversal/listing, not descendant file
+contents. Linux constructs an empty namespace with only declared mounts, PID,
+IPC and UTS isolation; no host `/proc` or `/dev` is implicitly mounted.
+
+Real macOS synthetic probes verify inside-read success, outside and workspace
+symlink read denial, explicit read-grant success, and inside/outside write
+controls. The runtime fixture explicitly includes dyld Cryptex paths identified
+from Apple's installed `dyld-support.sb`; missing runtime permissions must not
+turn a failed process bootstrap into false denial evidence. Linux plan tests
+are not Linux native enforcement evidence; Windows AppContainer is still
+unavailable. These profiles remain unwired to production provider constructors.
+
+Before production integration, derive and persist exact runtime/data scopes,
+account for symlink/path replacement races, introduce an adapter launch-command
+seam, and prove cancellation/process-tree ownership through the wrapper. Network
+is still a coarse on/off switch (not destination restriction); macOS Mach IPC
+and process controls still need policy tightening. Do not claim the M2 sandbox
+gate is closed or use these primitives to enable unrestricted provider access.
+
+Local full-workspace tests pass (98 daemon tests; real-provider canaries ignored),
+as does workspace/all-target clippy with warnings denied. The preceding
+credential-preflight CI `34999718934` passed all ten jobs.
+
 ### 2026-09-16 provider authentication contract investigation
 
 [Credential integration evidence](CREDENTIAL_AUTH_INTEGRATION.md) records why
