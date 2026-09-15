@@ -36,3 +36,7 @@ keyring = { version = "=3.6.3", default-features = false, features = ["sync-secr
 [dev-dependencies]
 tempfile.workspace = true
 tower.workspace = true
+
+[[test]]
+name = "native_provider_io"
+harness = false

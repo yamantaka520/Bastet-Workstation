@@ -29,6 +29,24 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 native adapter pipe controls
+
+`bastet-daemon/tests/native_provider_io.rs` is a harness-free Rust executable
+which doubles as its own synthetic CLI child. Normal `cargo test --workspace`
+runs it on every supported OS; no shell, installed provider, login, or network
+is needed. The adapter launcher is injected but the actual child/stdin/stdout
+implementation is unchanged. Controls cover Codex blocked writes (deadline and
+cancellation), cancellation during initialize reply wait, Agy blocked startup
+writes (deadline and cancellation), and positive 512-KiB delivery/response through
+both adapters. Readiness/request markers ensure the child actually reached the
+target condition; sub-three-second completion cannot be explained by the child's
+30-second fallback exit. Successful responses occur only after payload checks.
+
+This replaces the Unix-only coverage gap for these specific adapter I/O paths
+once native CI passes. It does not supply Windows Job/AppContainer containment,
+real-provider compatibility, or production sandbox/credential/network binding.
+Those remain M2 requirements, not exemptions granted by synthetic tests.
+
 ### 2026-09-16 bounded stdout handoff and deferred notifications
 
 Both adapter stdout handoffs now enforce 128 queued items and 16 MiB of retained
