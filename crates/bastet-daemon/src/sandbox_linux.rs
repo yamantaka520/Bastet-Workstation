@@ -21,6 +21,7 @@ pub(super) fn launch_command(
 ) -> Command {
     let mut command = Command::new("/usr/bin/bwrap");
     command.args([
+        "--unshare-user",
         "--die-with-parent",
         "--new-session",
         "--unshare-pid",
@@ -79,6 +80,7 @@ mod tests {
 
         assert_eq!(command.get_program(), "/usr/bin/bwrap");
         for flag in [
+            "--unshare-user",
             "--die-with-parent",
             "--new-session",
             "--unshare-pid",
@@ -127,3 +129,9 @@ mod tests {
         assert!(!actual.iter().any(|arg| arg == "--dev"));
     }
 }
+
+// Compile fixtures on macOS too, but execute only through the explicit Linux
+// CI gate. Default tests never treat a missing native enforcer as a pass.
+#[cfg(all(test, unix))]
+#[path = "sandbox_linux_native.rs"]
+mod native_tests;

@@ -29,6 +29,24 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 explicit native Linux evidence gate
+
+CI now installs Bubblewrap and explicitly executes three ignored native Linux
+fixtures: read/write and symlink scope with positive controls, host-loopback
+network denial with a successful allowed control, and raw stdout EOF after
+terminating the outer wrapper while a descendant holds the pipe. The latter
+does not cancel the reader to manufacture EOF. All fixtures are synthetic and
+use no provider, credentials, or external network. Missing/unsupported native
+enforcement fails this explicit CI step rather than passing as a skipped test.
+The command now explicitly requires a user namespace (`--unshare-user`).
+
+These fixtures compile on macOS but their default ignored status supplies no
+Linux enforcement evidence. Native CI results are pending for this patch;
+production runtime/profile binding, destination-restricted networking and
+Windows tree containment remain separate open gates. M2 remains open.
+The preceding prerequisite-denial commit `b410705` passed all jobs in CI
+`35006850590`, including macOS, Ubuntu and Windows.
+
 ### 2026-09-16 online CLI prerequisite denial
 
 The production runner now rejects known-forbidden prerequisites before adapter
