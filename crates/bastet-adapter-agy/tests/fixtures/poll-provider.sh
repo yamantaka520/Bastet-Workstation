@@ -6,6 +6,10 @@ while [ "$#" -gt 0 ]; do
         *) shift ;;
     esac
 done
+# This case must happen before the shared request read below.
+case "$mode" in
+    never-read) exec sleep 30 ;;
+esac
 IFS= read -r request
 case "$mode" in
     done)

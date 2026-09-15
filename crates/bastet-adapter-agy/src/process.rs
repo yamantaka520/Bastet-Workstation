@@ -1,14 +1,15 @@
 use std::{
-    io::Write,
+    io,
     path::{Path, PathBuf},
-    process::{ChildStdin, Stdio},
+    process::Stdio,
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     time::{Duration, Instant},
 };
 
 use bastet_core::{
-    configure_adapter_process_environment, AdapterProcessLauncher, DirectAdapterProcessLauncher,
-    OwnedAdapterChild, ProcessOutputReader, RunId, WorkspaceEvidenceError, WorkspaceSnapshot,
+    configure_adapter_process_environment, encode_json_line, AdapterProcessLauncher,
+    DirectAdapterProcessLauncher, OwnedAdapterChild, ProcessInputWriter, ProcessOutputReader,
+    RunId, WorkspaceEvidenceError, WorkspaceSnapshot,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -45,7 +46,7 @@ pub enum AgyProcessError {
 
 pub struct AgyProcess {
     child: OwnedAdapterChild,
-    stdin: Option<ChildStdin>,
+    stdin: Option<ProcessInputWriter>,
     lines: Receiver<Result<String, ()>>,
     reader: ProcessOutputReader,
     stream: AgyRunStream,
@@ -72,6 +73,13 @@ impl AgyProcess {
         launcher: &dyn AdapterProcessLauncher,
     ) -> Result<Self, AgyProcessError> {
         validate_request(&executable, &request)?;
+        // Encode and bound the entire frame before a child exists. This keeps
+        // oversized or invalid requests from launching a provider at all.
+        let input_frame = encode_json_line(&json!({
+            "event":"user",
+            "message":{"content":request.prompt}
+        }))
+        .map_err(map_input_error)?;
         let before = if request.read_only {
             None
         } else {
@@ -124,28 +132,77 @@ impl AgyProcess {
         // initialization path below cleans it up through OwnedAdapterChild.
         let mut child =
             OwnedAdapterChild::spawn(&mut command).map_err(|_| AgyProcessError::Unavailable)?;
-        let mut stdin = child.take_stdin().ok_or(AgyProcessError::Unavailable)?;
-        let stdout = child.take_stdout().ok_or(AgyProcessError::Unavailable)?;
-        serde_json::to_writer(
-            &mut stdin,
-            &json!({"event":"user","message":{"content":request.prompt}}),
-        )
-        .map_err(|_| AgyProcessError::Unavailable)?;
-        stdin
-            .write_all(b"\n")
-            .and_then(|_| stdin.flush())
-            .map_err(|_| AgyProcessError::Unavailable)?;
+        let raw_stdin = match child.take_stdin() {
+            Some(stdin) => stdin,
+            None => return startup_failure(&mut child, None, None, AgyProcessError::Unavailable),
+        };
+        let mut stdin = match ProcessInputWriter::spawn(raw_stdin) {
+            Ok(stdin) => stdin,
+            Err(error) => return startup_failure(&mut child, None, None, map_input_error(error)),
+        };
+        let stdout = match child.take_stdout() {
+            Some(stdout) => stdout,
+            None => {
+                return startup_failure(
+                    &mut child,
+                    Some(&mut stdin),
+                    None,
+                    AgyProcessError::Unavailable,
+                )
+            }
+        };
 
         let (sender, lines) = mpsc::channel();
-        let reader = ProcessOutputReader::spawn(stdout, move |line| sender.send(line).is_ok())
-            .map_err(|_| AgyProcessError::Unavailable)?;
+        // Begin draining stdout before feeding stdin. Otherwise a provider
+        // which writes while receiving a large prompt can deadlock both pipes.
+        let mut reader =
+            match ProcessOutputReader::spawn(stdout, move |line| sender.send(line).is_ok()) {
+                Ok(reader) => reader,
+                Err(_) => {
+                    return startup_failure(
+                        &mut child,
+                        Some(&mut stdin),
+                        None,
+                        AgyProcessError::Unavailable,
+                    )
+                }
+            };
+        let write_deadline = Instant::now() + request.timeout;
+        if let Err(error) = stdin.write_frame(input_frame, write_deadline) {
+            return startup_failure(
+                &mut child,
+                Some(&mut stdin),
+                Some(&mut reader),
+                map_input_error(error),
+            );
+        }
         let mut stream = if let Some(conversation_id) = request.conversation_id {
-            AgyRunStream::resuming(request.run_id, conversation_id)?
+            match AgyRunStream::resuming(request.run_id, conversation_id) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    return startup_failure(
+                        &mut child,
+                        Some(&mut stdin),
+                        Some(&mut reader),
+                        AgyProcessError::Stream(error),
+                    )
+                }
+            }
         } else {
             AgyRunStream::new(request.run_id)
         };
         let pending = if is_resume {
-            Some(stream.recovery_started("locally-observed")?)
+            match stream.recovery_started("locally-observed") {
+                Ok(update) => Some(update),
+                Err(error) => {
+                    return startup_failure(
+                        &mut child,
+                        Some(&mut stdin),
+                        Some(&mut reader),
+                        AgyProcessError::Stream(error),
+                    )
+                }
+            }
         } else {
             None
         };
@@ -324,6 +381,34 @@ fn validate_request(executable: &Path, request: &AgyRunRequest) -> Result<(), Ag
     Ok(())
 }
 
+fn map_input_error(error: io::Error) -> AgyProcessError {
+    match error.kind() {
+        io::ErrorKind::InvalidInput => AgyProcessError::InvalidRequest,
+        io::ErrorKind::TimedOut => AgyProcessError::TimedOut,
+        _ => AgyProcessError::Unavailable,
+    }
+}
+
+/// Closes every acquired endpoint before terminating the exclusively owned
+/// child. Cleanup uncertainty is more important than the triggering error.
+fn startup_failure(
+    child: &mut OwnedAdapterChild,
+    stdin: Option<&mut ProcessInputWriter>,
+    reader: Option<&mut ProcessOutputReader>,
+    error: AgyProcessError,
+) -> Result<AgyProcess, AgyProcessError> {
+    if let Some(stdin) = stdin {
+        stdin.close();
+    }
+    if let Some(reader) = reader {
+        reader.close();
+    }
+    child
+        .shutdown(Duration::ZERO)
+        .map_err(|_| AgyProcessError::CleanupUncertain)?;
+    Err(error)
+}
+
 fn is_terminal(update: &AgyRunUpdate) -> bool {
     matches!(
         update,
@@ -475,6 +560,30 @@ mod tests {
     }
 
     #[test]
+    fn never_read_large_prompt_times_out_and_cleans_up() {
+        let root = tempfile::tempdir().unwrap();
+        let request = AgyRunRequest {
+            prompt: "x".repeat(512 * 1024),
+            timeout: Duration::from_secs(1),
+            ..fixture_request(&root, "never-read")
+        };
+        let executable =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/poll-provider.sh");
+        let started = Instant::now();
+
+        let result = AgyProcess::spawn(executable, request);
+        assert!(
+            matches!(result, Err(AgyProcessError::TimedOut)),
+            "unexpected never-read startup result: {:?}",
+            result.err()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a provider that never reads stdin must not block startup"
+        );
+    }
+
+    #[test]
     fn wrapper_launcher_receives_the_command_before_agy_arguments_are_applied() {
         let root = tempfile::tempdir().unwrap();
         let launcher = ShellWrapperLauncher {
@@ -491,8 +600,12 @@ mod tests {
 
         // The shell wrapper receives the fixture first; the post-launcher
         // `--model` argument makes that fixture emit this synthetic event.
-        process.stdin.as_mut().unwrap().write_all(b"go\n").unwrap();
-        process.stdin.as_mut().unwrap().flush().unwrap();
+        process
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_frame(b"go\n".to_vec(), Instant::now() + Duration::from_secs(1))
+            .unwrap();
         assert!(matches!(
             process.next_update("now").unwrap(),
             AgyRunUpdate::Lifecycle { event, .. } if event.state == NormalizedRunState::Running
@@ -508,9 +621,13 @@ mod tests {
             .poll_update("now", Duration::from_millis(5))
             .unwrap()
             .is_none());
-        let stdin = fixture.process.stdin.as_mut().unwrap();
-        stdin.write_all(b"go\n").unwrap();
-        stdin.flush().unwrap();
+        fixture
+            .process
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_frame(b"go\n".to_vec(), Instant::now() + Duration::from_secs(1))
+            .unwrap();
         let observed = fixture
             .process
             .poll_update("later", Duration::from_secs(10))
@@ -550,9 +667,13 @@ mod tests {
             matches!(fixture.process.next_update("started").unwrap(), AgyRunUpdate::Lifecycle { event, .. } if event.state == NormalizedRunState::Running)
         );
         let first_deadline = fixture.process.inactivity_deadline;
-        let stdin = fixture.process.stdin.as_mut().unwrap();
-        stdin.write_all(b"go\n").unwrap();
-        stdin.flush().unwrap();
+        fixture
+            .process
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_frame(b"go\n".to_vec(), Instant::now() + Duration::from_secs(1))
+            .unwrap();
         // Test the real pipe with generous inactivity headroom. Observation
         // retry semantics are tested deterministically above, not by assuming
         // the CI scheduler services two 200ms sleeps within a 350ms deadline.

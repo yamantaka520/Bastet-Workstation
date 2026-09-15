@@ -3950,12 +3950,38 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FixtureCompletionGate {
+        released: Mutex<bool>,
+        changed: std::sync::Condvar,
+    }
+
+    impl FixtureCompletionGate {
+        fn wait(&self) {
+            let (released, _) = self
+                .changed
+                .wait_timeout_while(
+                    self.released.lock().unwrap(),
+                    Duration::from_secs(10),
+                    |released| !*released,
+                )
+                .unwrap();
+            assert!(*released, "fixture completion gate was not released");
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.changed.notify_all();
+        }
+    }
+
     struct FixtureProviderRunner {
         cancel_codex: Option<bool>,
         delay: Duration,
         active: AtomicUsize,
         max_active: AtomicUsize,
         started: Mutex<Vec<(RunId, String)>>,
+        completion_gate: Option<Arc<FixtureCompletionGate>>,
     }
 
     impl FixtureProviderRunner {
@@ -3966,6 +3992,7 @@ mod tests {
                 active: AtomicUsize::new(0),
                 max_active: AtomicUsize::new(0),
                 started: Mutex::new(Vec::new()),
+                completion_gate: None,
             }
         }
 
@@ -4034,6 +4061,9 @@ mod tests {
                     Some(format!("# {} fixture output", receipt.adapter_kind)),
                 )
             };
+            if let Some(gate) = &self.completion_gate {
+                gate.wait();
+            }
             self.active.fetch_sub(1, Ordering::AcqRel);
             provider_executor::ProviderOutcome {
                 terminal_state,
@@ -4359,10 +4389,12 @@ mod tests {
     #[tokio::test]
     async fn rejected_provider_cancel_is_not_persisted_as_cancelling() {
         let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
-        let runner = Arc::new(FixtureProviderRunner::new(
-            Some(false),
-            Duration::from_millis(100),
-        ));
+        let gate = Arc::new(FixtureCompletionGate::default());
+        let mut fixture = FixtureProviderRunner::new(Some(false), Duration::from_millis(100));
+        // Neither sibling completion nor the rejected provider may advance
+        // the catalog revision while this test submits the cancel request.
+        fixture.completion_gate = Some(Arc::clone(&gate));
+        let runner = Arc::new(fixture);
         let (router, _registry, executor) = provider_router(store.clone(), runner.clone());
         let command = ExecuteReadyGraphCommand {
             expected_catalog_revision: store.catalog().unwrap().revision,
@@ -4404,6 +4436,7 @@ mod tests {
             )
             .await
             .unwrap();
+        gate.release();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         wait_until(|| !executor.has_active());
         let catalog = store.catalog().unwrap().catalog;

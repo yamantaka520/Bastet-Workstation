@@ -29,6 +29,45 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 bounded provider stdin
+
+Both adapters now use a shared single-flight stdin writer, with an absolute
+deadline and an 8 MiB encoded JSONL frame limit including the newline. Encoding
+uses a bounded sink with exact reservation; a zero-capacity handoff avoids a
+frame backlog. Unix writes are nonblocking; Windows repeats cancellation of the
+owned worker's synchronous I/O while closing. Timeout or write failure poisons
+the writer, so a partially delivered frame is never retried on the same pipe.
+Agy starts draining stdout before writing the prompt and reports startup cleanup
+failure instead of claiming a confirmed timeout. Codex requests spend one budget
+on both writing and awaiting the reply, including bounded interrupt requests;
+notifications also have a write deadline. Write failure forces child cleanup.
+
+Synthetic tests cover wire-size/escaping bounds, a native test-process fixture
+that never reads stdin, positive child completion, sticky writer failure, Agy
+startup timeout, and Codex request/notify/interrupt timeout. Native core fixtures
+are cross-platform (not Unix-only); Windows execution awaits the new CI run.
+No real provider, credential or external network is used.
+
+This does not yet provide immediate pre-initialization cancellation: the daemon
+only services cancellation after Running, and Agy rejects pre-init cancellation.
+Startup errors are still conservatively collapsed to Uncertain by the daemon;
+typed timeout persistence needs cleanup-aware handling throughout initialization.
+Total stdout queue bounds and Windows descendant Job containment also remain
+separate requirements. M2 is not complete.
+
+Independent review found no blocking writer-lifecycle issue, but retained three
+follow-ups: checked arithmetic for extreme public timeout values, native Windows
+adapter-level never-read fixtures (the core fixture already runs there), and a
+slow-successful-write test proving only the remaining RPC budget is available.
+
+Baseline `31ccb16` passed all three native Linux controls in CI `35008918353`
+(Ubuntu job `104515633612`, 3 passed, 0 ignored), with the distro bwrap profile,
+global AppArmor userns restriction enabled, and a non-root test process. macOS
+also passed. Overall CI failed the Windows rejected-cancel fixture (409 instead
+of 503): a sibling worker could finish between catalog revision capture and the
+cancel request. The fixture now holds both workers behind an explicit completion
+gate until the response arrives; production revision checks are unchanged.
+
 ### 2026-09-16 explicit native Linux evidence gate
 
 Diagnostic CI `35008473857`, Ubuntu job `104514119797`, confirmed the cause:

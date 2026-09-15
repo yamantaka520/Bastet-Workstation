@@ -1,8 +1,8 @@
 use std::{
     collections::VecDeque,
-    io::Write,
+    io,
     path::Path,
-    process::{ChildStdin, Stdio},
+    process::Stdio,
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     time::{Duration, Instant},
 };
@@ -11,13 +11,13 @@ use serde_json::{json, Value};
 
 use crate::{AppServerNotification, AppServerTransport, TransportError};
 use bastet_core::{
-    configure_adapter_process_environment, AdapterProcessLauncher, DirectAdapterProcessLauncher,
-    OwnedAdapterChild, ProcessOutputReader,
+    configure_adapter_process_environment, encode_json_line, AdapterProcessLauncher,
+    DirectAdapterProcessLauncher, OwnedAdapterChild, ProcessInputWriter, ProcessOutputReader,
 };
 
 pub struct StdioTransport {
     child: OwnedAdapterChild,
-    stdin: Option<ChildStdin>,
+    stdin: Option<ProcessInputWriter>,
     responses: Receiver<Result<Value, TransportError>>,
     pending_notifications: VecDeque<AppServerNotification>,
     reader: Option<ProcessOutputReader>,
@@ -51,7 +51,9 @@ impl StdioTransport {
             .stderr(Stdio::null());
         let mut child =
             OwnedAdapterChild::spawn(&mut command).map_err(|_| TransportError::Unavailable)?;
-        let stdin = child.take_stdin().ok_or(TransportError::Unavailable)?;
+        let stdin =
+            ProcessInputWriter::spawn(child.take_stdin().ok_or(TransportError::Unavailable)?)
+                .map_err(|_| TransportError::Unavailable)?;
         let stdout = child.take_stdout().ok_or(TransportError::Unavailable)?;
         let (sender, responses) = mpsc::channel();
         let reader = ProcessOutputReader::spawn(stdout, move |line| {
@@ -86,21 +88,33 @@ impl StdioTransport {
     /// terminal outcome must inspect this result.
     /// A prior failure remains an error on repeated close calls.
     pub fn close_checked(&mut self) -> std::io::Result<()> {
+        self.close_with_grace(self.timeout)
+    }
+
+    fn close_with_grace(&mut self, grace: Duration) -> std::io::Result<()> {
         self.stdin.take();
-        let result = self.child.shutdown(self.timeout);
+        let result = self.child.shutdown(grace);
         if let Some(mut reader) = self.reader.take() {
             reader.close();
         }
         result
     }
 
-    fn write_message(&mut self, message: &Value) -> Result<(), TransportError> {
+    fn write_message(&mut self, message: &Value, deadline: Instant) -> Result<(), TransportError> {
+        let frame = encode_json_line(message).map_err(|_| TransportError::ProtocolDrift)?;
         let stdin = self.stdin.as_mut().ok_or(TransportError::Unavailable)?;
-        serde_json::to_writer(&mut *stdin, message).map_err(|_| TransportError::ProtocolDrift)?;
-        stdin
-            .write_all(b"\n")
-            .map_err(|_| TransportError::Unavailable)?;
-        stdin.flush().map_err(|_| TransportError::Unavailable)
+        if let Err(error) = stdin.write_frame(frame, deadline) {
+            // A partially delivered JSON frame cannot be retried on this pipe.
+            // Force cleanup before returning; uncertainty overrides timeout.
+            self.close_with_grace(Duration::ZERO)
+                .map_err(|_| TransportError::Unavailable)?;
+            return Err(if error.kind() == io::ErrorKind::TimedOut {
+                TransportError::TimedOut
+            } else {
+                TransportError::Unavailable
+            });
+        }
+        Ok(())
     }
 
     fn receive_message(&mut self, deadline: Instant) -> Result<Value, TransportError> {
@@ -137,7 +151,10 @@ impl AppServerTransport for StdioTransport {
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
-        self.write_message(&json!({"method": method, "params": params}))
+        self.write_message(
+            &json!({"method": method, "params": params}),
+            Instant::now() + self.timeout,
+        )
     }
 
     fn next_notification(&mut self) -> Result<AppServerNotification, TransportError> {
@@ -208,12 +225,15 @@ impl StdioTransport {
             .next_request_id
             .checked_add(1)
             .ok_or(TransportError::ProtocolDrift)?;
-        self.write_message(&json!({
-            "method": method,
-            "id": request_id,
-            "params": params
-        }))?;
         let deadline = Instant::now() + max_wait;
+        self.write_message(
+            &json!({
+                "method": method,
+                "id": request_id,
+                "params": params
+            }),
+            deadline,
+        )?;
         loop {
             let message = match self.receive_message(deadline) {
                 Ok(message) => message,
@@ -480,6 +500,55 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn never_reading_provider_cannot_block_request_notify_or_interrupt_writes() {
+        struct NeverRead;
+        impl AdapterProcessLauncher for NeverRead {
+            fn command(&self, _: &Path) -> io::Result<Command> {
+                let mut command = Command::new("/bin/sh");
+                command.args([
+                    "-c",
+                    "printf '%s\\n' '{\"method\":\"fixture/ready\",\"params\":{}}'; exec /bin/sleep 30",
+                ]);
+                Ok(command)
+            }
+        }
+        for mode in 0..3 {
+            let mut transport = StdioTransport::spawn_with_launcher(
+                Path::new("/synthetic/not-a-provider"),
+                Duration::from_secs(5),
+                &NeverRead,
+            )
+            .unwrap();
+            assert_eq!(
+                transport.next_notification().unwrap().method,
+                "fixture/ready"
+            );
+            transport.timeout = Duration::from_millis(200);
+            let params = json!({"prompt": "x".repeat(2 * 1024 * 1024)});
+            let started = Instant::now();
+            let error = match mode {
+                0 => transport.request("fixture/request", params).unwrap_err(),
+                1 => transport.notify("fixture/notify", params).unwrap_err(),
+                _ => transport
+                    .request_with_timeout("turn/interrupt", params, Duration::from_millis(100))
+                    .unwrap_err(),
+            };
+            assert_eq!(error, TransportError::TimedOut);
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert!(
+                transport.stdin.is_none(),
+                "partial frame must poison transport"
+            );
+            assert_eq!(
+                transport.notify("after-timeout", json!({})),
+                Err(TransportError::Unavailable)
+            );
+            transport.close_checked().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn checked_close_retains_a_cleanup_failure() {
         const MARKER: &str = "BASTET_TEST_CODEX_FOREIGN_REAPER";
         if std::env::var_os(MARKER).is_none() {
@@ -549,11 +618,13 @@ mod tests {
     ) -> (StdioTransport, Sender<Result<Value, TransportError>>) {
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", "sleep 1"])
+            .args(["-c", "exec /bin/sleep 30"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
         let mut child = OwnedAdapterChild::spawn(&mut command).unwrap();
-        let stdin = child.take_stdin();
+        let stdin = child
+            .take_stdin()
+            .map(|stdin| ProcessInputWriter::spawn(stdin).unwrap());
         let _stdout = child.take_stdout();
         let (sender, responses) = mpsc::channel();
         (
@@ -628,7 +699,7 @@ mod tests {
         let (mut transport, sender) = clock_transport(Duration::from_secs(10));
         assert_eq!(
             transport
-                .request_with_timeout("turn/interrupt", json!({}), Duration::ZERO)
+                .request_with_timeout("turn/interrupt", json!({}), Duration::from_secs(1))
                 .unwrap_err(),
             TransportError::TimedOut
         );
