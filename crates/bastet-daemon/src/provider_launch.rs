@@ -19,9 +19,82 @@ pub(super) struct ProviderLaunchPlan {
     pub identity: bastet_protocol::ProviderLaunchIdentity,
     pub workspace_root: String,
     pub prompt: String,
+    /// Missing in v1: retain historical checksums but never infer authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<LaunchPolicySnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct LaunchPolicySnapshot {
+    pub project: bastet_core::ScopedPolicy,
+    pub role: bastet_core::ScopedPolicy,
+}
+
+impl LaunchPolicySnapshot {
+    pub(super) fn capture(
+        catalog: &IdentityCatalog,
+        project_id: bastet_core::ProjectId,
+        role_id: bastet_core::RoleId,
+    ) -> Result<Self, StoreError> {
+        let project = catalog
+            .projects
+            .iter()
+            .find(|value| {
+                value.metadata.id == project_id
+                    && value.metadata.lifecycle == bastet_core::EntityLifecycle::Active
+            })
+            .ok_or_else(|| {
+                StoreError::InvalidRunState("launch project policy unavailable".into())
+            })?;
+        let role = catalog
+            .roles
+            .iter()
+            .find(|value| {
+                value.metadata.id == role_id
+                    && value.metadata.lifecycle == bastet_core::EntityLifecycle::Active
+            })
+            .ok_or_else(|| StoreError::InvalidRunState("launch role policy unavailable".into()))?;
+        let snapshot = Self {
+            project: project.policy.clone(),
+            role: role.policy.clone(),
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    fn validate(&self) -> Result<(), StoreError> {
+        if self.project.layer != bastet_core::PolicyLayer::Project
+            || self.role.layer != bastet_core::PolicyLayer::RoleOrAgent
+        {
+            return Err(StoreError::InvalidRunState(
+                "launch policy layers invalid".into(),
+            ));
+        }
+        self.project.restrict(self.role.clone()).map_err(|_| {
+            StoreError::InvalidRunState("launch role policy exceeds project ceiling".into())
+        })?;
+        Ok(())
+    }
 }
 
 impl ProviderLaunchPlan {
+    pub(super) fn validate_current_policy(
+        &self,
+        catalog: &IdentityCatalog,
+    ) -> Result<(), StoreError> {
+        let saved = self.policy.as_ref().ok_or_else(|| {
+            StoreError::InvalidRunState("legacy launch has no saved policy authority".into())
+        })?;
+        if self.version != 2
+            || *saved
+                != LaunchPolicySnapshot::capture(catalog, self.identity.project_id, self.role_id)?
+        {
+            return Err(StoreError::InvalidRunState("launch policy changed".into()));
+        }
+        Ok(())
+    }
+
     pub(super) fn hash(&self) -> Result<String, StoreError> {
         Ok(format!(
             "sha256:{:x}",
@@ -52,10 +125,14 @@ impl ProviderLaunchPlan {
         let (json, hash) =
             row.ok_or_else(|| StoreError::InvalidRunState("launch plan unavailable".into()))?;
         let plan: Self = serde_json::from_str(&json)?;
-        if plan.version != 1 || plan.run_id != run_id || plan.hash()? != hash {
+        let version_valid = matches!((plan.version, &plan.policy), (1, None) | (2, Some(_)));
+        if !version_valid || plan.run_id != run_id || plan.hash()? != hash {
             return Err(StoreError::InvalidRunState(
                 "launch plan integrity check failed".into(),
             ));
+        }
+        if let Some(policy) = &plan.policy {
+            policy.validate()?;
         }
         let ledger: Option<(String, String, u64)> = connection
             .query_row(
@@ -96,6 +173,105 @@ impl ProviderLaunchPlan {
 mod tests {
     use super::*;
     use crate::tests::{begin_fixture_node, provider_execution_fixture};
+
+    #[test]
+    fn saved_policy_is_hashed_and_current_policy_drift_blocks_dispatch() {
+        let (_directory, _workspace, store, id) = provider_execution_fixture();
+        let receipt = begin_fixture_node(&store, id);
+        let plan = ProviderLaunchPlan::load(&store.connection().unwrap(), receipt.run_id).unwrap();
+        assert_eq!(plan.version, 2);
+        let mut changed = plan.clone();
+        changed.policy.as_mut().unwrap().role.ceiling.network = bastet_core::PermissionLevel::Deny;
+        assert_ne!(changed.hash().unwrap(), plan.hash().unwrap());
+        let mut catalog = store.catalog().unwrap();
+        catalog
+            .catalog
+            .roles
+            .iter_mut()
+            .find(|role| role.metadata.id == plan.role_id)
+            .unwrap()
+            .policy = changed.policy.unwrap().role;
+        store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: catalog.revision,
+                catalog: catalog.catalog,
+            })
+            .unwrap();
+        let before = store.events_after(0).unwrap();
+        assert!(store.preflight_provider_launch(&receipt).is_err());
+        assert_eq!(store.events_after(0).unwrap(), before);
+        assert_eq!(
+            ProviderLaunchPlan::load(&store.connection().unwrap(), receipt.run_id).unwrap(),
+            plan
+        );
+    }
+
+    #[test]
+    fn legacy_plan_remains_readable_but_has_no_inferred_policy_authority() {
+        let (_directory, _workspace, store, id) = provider_execution_fixture();
+        let receipt = begin_fixture_node(&store, id);
+        let connection = store.connection().unwrap();
+        let mut legacy = ProviderLaunchPlan::load(&connection, receipt.run_id).unwrap();
+        legacy.version = 1;
+        legacy.policy = None;
+        let json = serde_json::to_string(&legacy).unwrap();
+        assert!(!json.contains("\"policy\""));
+        // Historical fixture, not a supported mutation of live launch plans.
+        connection
+            .execute_batch("DROP TRIGGER provider_launch_plans_immutable;")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE provider_launch_plans SET plan_json=?1,plan_hash=?2 WHERE run_id=?3",
+                params![
+                    json,
+                    legacy.hash().unwrap(),
+                    receipt.run_id.value().to_string()
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            ProviderLaunchPlan::load(&connection, receipt.run_id).unwrap(),
+            legacy
+        );
+        drop(connection);
+        assert!(store.preflight_provider_launch(&receipt).is_err());
+    }
+
+    #[test]
+    fn role_expansion_beyond_project_rolls_back_launch_creation() {
+        let (_directory, _workspace, store, id) = provider_execution_fixture();
+        let mut catalog = store.catalog().unwrap();
+        for project in &mut catalog.catalog.projects {
+            project.policy.ceiling.network = bastet_core::PermissionLevel::Deny;
+        }
+        for role in &mut catalog.catalog.roles {
+            role.policy.ceiling.network = bastet_core::PermissionLevel::Use;
+        }
+        store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: catalog.revision,
+                catalog: catalog.catalog,
+            })
+            .unwrap();
+        let catalog = store.catalog().unwrap();
+        let graph = store.graph_execution(id).unwrap();
+        let events = store.events_after(0).unwrap();
+        assert!(store
+            .begin_graph_node_run(
+                id,
+                BeginGraphNodeRunCommand {
+                    expected_catalog_revision: catalog.revision,
+                    expected_graph_revision: graph.revision,
+                    node_id: graph.nodes[0].node_id,
+                    owner: "fixture".into()
+                }
+            )
+            .is_err());
+        assert_eq!(store.catalog().unwrap(), catalog);
+        assert_eq!(store.graph_execution(id).unwrap(), graph);
+        assert_eq!(store.events_after(0).unwrap(), events);
+    }
 
     #[test]
     fn exact_plan_survives_restart_without_reauthorizing_interrupted_work() {

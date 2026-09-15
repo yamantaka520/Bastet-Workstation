@@ -137,6 +137,7 @@ pub(super) fn validate_current_catalog(
             .ok_or(StoreError::CredentialGrantRejected)?;
         let current_binding = resolve_provider_run_binding(&catalog, &m3, &graph, definition.id)?;
         let plan = provider_launch::ProviderLaunchPlan::load(transaction, run.metadata.id)?;
+        plan.validate_current_policy(&catalog)?;
         if selected != current_binding.launch_identity
             || plan.identity != selected
             || plan.execution_id != graph.id

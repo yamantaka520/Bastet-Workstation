@@ -507,6 +507,42 @@ mod tests {
     }
 
     #[test]
+    fn policy_drift_after_approval_blocks_consumption_and_lookup() {
+        let (_directory, _workspace, store, id) = fixture();
+        let mut catalog = store.catalog().unwrap();
+        let role_id = store.approval(id).unwrap().request.action.role_id.unwrap();
+        catalog
+            .catalog
+            .roles
+            .iter_mut()
+            .find(|role| role.metadata.id == role_id)
+            .unwrap()
+            .policy
+            .ceiling
+            .network = bastet_core::PermissionLevel::Deny;
+        store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: catalog.revision,
+                catalog: catalog.catalog,
+            })
+            .unwrap();
+        let before = store.events_after(0).unwrap();
+        let reader = Reader {
+            store: store.clone(),
+            id,
+            calls: AtomicUsize::new(0),
+            fail: false,
+        };
+        assert!(matches!(
+            store.prepare_staged_credentials(id, &reader),
+            Err(BrokerError::Authorization)
+        ));
+        assert_eq!(reader.calls.load(Ordering::SeqCst), 0);
+        assert!(store.credential_grant(id).unwrap().consumed_at_ms.is_none());
+        assert_eq!(store.events_after(0).unwrap(), before);
+    }
+
+    #[test]
     fn consumption_commits_before_one_exact_lookup_and_never_leaks_into_journal() {
         let (_directory, _workspace, store, id) = fixture();
         let reader = Reader {

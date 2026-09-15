@@ -612,6 +612,7 @@ fn current_role_policy(
     catalog: &IdentityCatalog,
     plan: &provider_launch::ProviderLaunchPlan,
 ) -> Result<ScopedPolicy, StoreError> {
+    plan.validate_current_policy(catalog)?;
     let role = catalog
         .roles
         .iter()
@@ -835,42 +836,139 @@ mod tests {
 
     #[test]
     fn live_authority_drift_rejects_approve_but_cannot_block_deny() {
-        let (_directory, _workspace, store, execution_id, receipt, request) = staged_fixture();
-        let mut snapshot = store.catalog().unwrap();
-        let role_id = request.action.role_id.unwrap();
-        snapshot
-            .catalog
-            .roles
-            .iter_mut()
-            .find(|role| role.metadata.id == role_id)
-            .unwrap()
-            .policy
-            .ceiling
-            .credential = PermissionLevel::Deny;
-        store
-            .replace_catalog(ReplaceCatalogCommand {
-                expected_revision: snapshot.revision,
-                catalog: snapshot.catalog,
-            })
-            .unwrap();
+        for field in ["credential", "network", "filesystem"] {
+            let (_directory, _workspace, store, execution_id, receipt, request) = staged_fixture();
+            let mut snapshot = store.catalog().unwrap();
+            let role_id = request.action.role_id.unwrap();
+            let ceiling = &mut snapshot
+                .catalog
+                .roles
+                .iter_mut()
+                .find(|role| role.metadata.id == role_id)
+                .unwrap()
+                .policy
+                .ceiling;
+            match field {
+                "credential" => ceiling.credential = PermissionLevel::Deny,
+                "network" => ceiling.network = PermissionLevel::Deny,
+                _ => ceiling.filesystem = PermissionLevel::Deny,
+            }
+            store
+                .replace_catalog(ReplaceCatalogCommand {
+                    expected_revision: snapshot.revision,
+                    catalog: snapshot.catalog,
+                })
+                .unwrap();
 
-        assert!(store
+            assert!(store
+                .decide_approval(DecideApprovalCommand {
+                    decision: ApprovalDecision {
+                        request_id: request.id,
+                        request_hash: request.request_hash.clone(),
+                        kind: ApprovalDecisionKind::Approve,
+                        decided_at_ms: 0,
+                        actor: "fixture-human".into(),
+                    },
+                    credential_scope_acknowledged: true,
+                })
+                .is_err());
+            store
+                .decide_approval(DecideApprovalCommand {
+                    decision: ApprovalDecision {
+                        request_id: request.id,
+                        request_hash: request.request_hash,
+                        kind: ApprovalDecisionKind::Deny,
+                        decided_at_ms: 0,
+                        actor: "fixture-human".into(),
+                    },
+                    credential_scope_acknowledged: false,
+                })
+                .unwrap();
+            let run = store
+                .catalog()
+                .unwrap()
+                .catalog
+                .runs
+                .into_iter()
+                .find(|run| run.metadata.id == receipt.run_id)
+                .unwrap();
+            assert_eq!(run.state, NormalizedRunState::Cancelled);
+            assert!(run.started_at.is_none());
+            assert_no_provider_evidence(&store, execution_id);
+        }
+    }
+
+    #[test]
+    fn legacy_policyless_staging_survives_restart_and_can_be_denied_not_approved() {
+        let (directory, _workspace, store, execution_id, receipt, request) = staged_fixture();
+        let catalog = store.catalog().unwrap().catalog;
+        let connection = store.connection().unwrap();
+        let mut plan =
+            provider_launch::ProviderLaunchPlan::load(&connection, receipt.run_id).unwrap();
+        plan.version = 1;
+        plan.policy = None;
+        let role = catalog
+            .roles
+            .iter()
+            .find(|role| role.metadata.id == plan.role_id)
+            .unwrap();
+        let legacy_request = ApprovalRequest::create(
+            request.id,
+            request.created_at_ms,
+            request.expires_at_ms,
+            approval_action(&plan).unwrap(),
+            &role.policy,
+        )
+        .unwrap();
+        // Build an internally consistent historical fixture; live plan edits
+        // remain forbidden by the production immutable-table trigger.
+        connection
+            .execute_batch("DROP TRIGGER provider_launch_plans_immutable;")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE provider_launch_plans SET plan_json=?1,plan_hash=?2 WHERE run_id=?3",
+                params![
+                    serde_json::to_string(&plan).unwrap(),
+                    plan.hash().unwrap(),
+                    receipt.run_id.value().to_string()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE approval_requests SET request_json=?1,request_hash=?2 WHERE request_id=?3",
+                params![
+                    serde_json::to_string(&legacy_request).unwrap(),
+                    legacy_request.request_hash,
+                    request.id.value().to_string()
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        drop(store);
+        let restored = Store::open(directory.path().join("provider-execution.db")).unwrap();
+        assert_eq!(
+            restored.approval(request.id).unwrap().staged_launch_state,
+            Some(bastet_protocol::StagedLaunchState::AwaitingApproval)
+        );
+        assert!(restored
             .decide_approval(DecideApprovalCommand {
                 decision: ApprovalDecision {
                     request_id: request.id,
-                    request_hash: request.request_hash.clone(),
+                    request_hash: legacy_request.request_hash.clone(),
                     kind: ApprovalDecisionKind::Approve,
                     decided_at_ms: 0,
-                    actor: "fixture-human".into(),
+                    actor: "fixture-human".into()
                 },
-                credential_scope_acknowledged: true,
+                credential_scope_acknowledged: true
             })
             .is_err());
-        store
+        restored
             .decide_approval(DecideApprovalCommand {
                 decision: ApprovalDecision {
                     request_id: request.id,
-                    request_hash: request.request_hash,
+                    request_hash: legacy_request.request_hash,
                     kind: ApprovalDecisionKind::Deny,
                     decided_at_ms: 0,
                     actor: "fixture-human".into(),
@@ -878,17 +976,11 @@ mod tests {
                 credential_scope_acknowledged: false,
             })
             .unwrap();
-        let run = store
-            .catalog()
-            .unwrap()
-            .catalog
-            .runs
-            .into_iter()
-            .find(|run| run.metadata.id == receipt.run_id)
-            .unwrap();
-        assert_eq!(run.state, NormalizedRunState::Cancelled);
-        assert!(run.started_at.is_none());
-        assert_no_provider_evidence(&store, execution_id);
+        assert_no_provider_evidence(&restored, execution_id);
+        assert_eq!(
+            restored.approval(request.id).unwrap().staged_launch_state,
+            Some(bastet_protocol::StagedLaunchState::Cancelled)
+        );
     }
 
     #[test]

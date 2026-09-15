@@ -508,11 +508,27 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn close_is_bounded_when_a_descendant_keeps_stdout_open() {
-        let directory = tempfile::tempdir().unwrap();
-        let provider = directory.path().join("provider");
-        for ending in ["cat >/dev/null", "exit 0"] {
-            write_executable(&provider, &format!("#!/bin/sh\nsleep 30 &\nprintf '{{\"method\":\"fixture/ready\",\"params\":{{}}}}\\n'\n{ending}\n"));
-            let mut transport = StdioTransport::spawn(&provider, Duration::from_secs(30)).unwrap();
+        struct FixtureLauncher(&'static str);
+        impl AdapterProcessLauncher for FixtureLauncher {
+            fn command(&self, executable: &Path) -> std::io::Result<Command> {
+                let mut command = Command::new(executable);
+                command
+                    .arg(
+                        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/held-stdout.sh"),
+                    )
+                    .arg(self.0);
+                Ok(command)
+            }
+        }
+        // Do not rewrite and exec the same temporary script between cases.
+        // A stable shell/read-only fixture separates spawn from file writers.
+        for mode in ["live", "exited"] {
+            let mut transport = StdioTransport::spawn_with_launcher(
+                Path::new("/bin/sh"),
+                Duration::from_secs(30),
+                &FixtureLauncher(mode),
+            )
+            .unwrap();
             assert_eq!(
                 transport
                     .poll_notification(Duration::from_secs(2))
@@ -522,7 +538,7 @@ mod tests {
                 "fixture/ready"
             );
             let started = Instant::now();
-            transport.close();
+            transport.close_checked().unwrap();
             assert!(started.elapsed() < Duration::from_secs(2));
         }
     }

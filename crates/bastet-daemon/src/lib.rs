@@ -2121,6 +2121,7 @@ impl Store {
                 |row| row.get(0),
             )?)?;
         let binding = resolve_provider_run_binding(&identity, &m3, &execution, receipt.node_id)?;
+        plan.validate_current_policy(&identity)?;
         let node = execution
             .nodes
             .iter()
@@ -2267,7 +2268,7 @@ impl Store {
             ],
         )?;
         let plan = provider_launch::ProviderLaunchPlan {
-            version: 1,
+            version: 2,
             execution_id: id,
             node_id: command.node_id,
             session_id,
@@ -2284,6 +2285,17 @@ impl Store {
             identity: binding.launch_identity.clone(),
             workspace_root: binding.workspace_root.clone(),
             prompt: binding.prompt.clone(),
+            policy: Some(provider_launch::LaunchPolicySnapshot::capture(
+                &identity,
+                binding.project_id,
+                execution
+                    .graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == command.node_id)
+                    .ok_or(StoreError::RunNotFound)?
+                    .role_id,
+            )?),
         };
         plan.insert(&transaction)?;
         if staged {

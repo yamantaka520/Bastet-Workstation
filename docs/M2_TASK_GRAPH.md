@@ -29,6 +29,35 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 immutable Project/Role policy snapshot
+
+New launch-plan format v2 includes exact Project and Role `ScopedPolicy` values
+in its immutable JSON/checksum. Capture requires active entities, correct policy
+layers, and a Role ceiling no broader than its Project. The creation transaction
+rolls back graph/run/journal changes when capture fails. Direct-run preflight,
+staged approval, and credential consumption revalidate exact saved policy values;
+even a reduction requires a new launch intent instead of silently replacing the
+policy covered by the approval's plan hash. Non-credential policy drift also
+blocks credential consumption before any native lookup.
+
+Legacy v1 plans retain their original field serialization/checksum and remain
+readable for recovery and cancellation. They have no inferred policy authority:
+they cannot pass execution preflight or staged approval/consumption. A historical
+staged fixture survives restart and can be denied without provider evidence.
+No database backfill manufactures policy from today's mutable catalog.
+
+This is policy-intent binding, not OS enforcement. Workstation/SingleRun policy
+derivation, executable/runtime read paths, network destinations, process-tree
+containment, and final production sandbox launch selection still need integration.
+The current compatibility provider path must not be described as sandboxed.
+
+Local full-workspace tests pass (daemon 104), with formatting and all-target
+workspace clippy. Prior CI `35004522989` failed its Ubuntu stdout-descendant test
+at spawn (`Unavailable`), before cleanup assertions; the underlying OS error was
+not retained, so its cause is not proven. The fixture now uses stable `/bin/sh`
+with a committed read-only script instead of rewriting/executing one temporary
+path between cases. Its focused local test passes; Linux proof awaits new CI.
+
 ### 2026-09-16 cleanup failure propagation
 
 Cleanup errors are now sticky in the owned-child boundary. Agy returns a
