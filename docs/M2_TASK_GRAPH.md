@@ -29,6 +29,42 @@ verification status; it does not add scope.
 
 ## Status
 
+### 2026-09-16 selected-account approval coordinator
+
+The production execute-ready route now stages selected-account attempts instead
+of starting workers. Schema 12 binds a server-derived five-minute credential
+approval to the saved exact launch plan and Run. Run/Session/graph/plan/request/
+staging ledger and journal commit together; the Run is AwaitingApproval with no
+invented start time. Approve atomically issues the unspent grant and marks the
+intent ready; **no broker, native credential read or selected-account dispatch is
+enabled**. The legacy internal grant consumer rejects staged intents until an
+atomic broker/dispatch claim is implemented. Accountless compatibility execution
+is unchanged; the low-level manual begin endpoint does not authorize execution.
+
+Deny, grant revocation, explicit run cancellation and expiry terminate the
+unlaunched exact attempt without a controller, cost or output. The production
+daemon sweeps expiry every second, as well as on restart/readiness and approval
+listing. Safe cancellation/recovery use immutable structural identity, not
+current authority: account or policy drift blocks approval, but does not prevent
+discarding an obsolete intent. Unlaunched intents survive restart, while
+already-started provider AwaitingApproval becomes Uncertain and prevents graceful
+shutdown from pretending the provider stopped. Desktop exposes cancellation for
+unstarted approval waits and five-locale exact-run/no-login/no-start copy.
+Approval records expose an optional typed staged state, so approved-ready and
+cancelled intents no longer appear to require approval; cancelled cards offer
+no dead decision buttons. Legacy credential approvals do not acquire staged
+copy or status by inference. Decision failures surface localized feedback.
+
+Local full-workspace tests pass (including 75 daemon library tests and native
+Seatbelt probe); real-provider canaries remain ignored. Frontend state/locale
+tests (22 passing), production build and warnings-denied workspace Clippy also
+pass. These results are not proof of real-provider authentication.
+
+The preceding `c2c0fca` CI run `34995009338` passed all ten jobs. This does not
+establish CI evidence for this newer coordinator. Native broker/dispatch,
+production OS sandbox, setup/auth configuration and real-provider M2 gates remain
+open; no M2 or M3 completion is claimed.
+
 ### 2026-09-16 exact launch plans and prelaunch graph primitives
 
 Schema 11 saves an append-only, versioned full launch plan in the same transaction

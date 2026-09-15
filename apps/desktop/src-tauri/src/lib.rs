@@ -61,13 +61,13 @@ struct RunProjection {
     can_cancel: bool,
 }
 
-fn run_can_cancel(state: bastet_core::NormalizedRunState) -> bool {
-    // Provider startup/handshake is not yet interruptible. Do not advertise
-    // cancellation until there is a confirmed provider run to interrupt.
+fn run_can_cancel(state: bastet_core::NormalizedRunState, has_started: bool) -> bool {
+    // Prelaunch intent cancellation needs no provider interrupt. Once startup
+    // begins, cancellation waits for an interruptible provider run.
     matches!(
         state,
         bastet_core::NormalizedRunState::Running | bastet_core::NormalizedRunState::Recovering
-    )
+    ) || (state == bastet_core::NormalizedRunState::AwaitingApproval && !has_started)
 }
 
 #[derive(Serialize)]
@@ -104,6 +104,7 @@ struct JoinedDraftProjection {
 #[derive(Serialize)]
 struct GraphNodeProjection {
     execution_id: String,
+    run_id: Option<String>,
     node_id: String,
     failure_kind: Option<&'static str>,
     title: String,
@@ -853,6 +854,7 @@ fn project_m3(
                     .find(|definition| definition.id == node.node_id)?;
                 Some(GraphNodeProjection {
                     execution_id: execution.id.value().to_string(),
+                    run_id: node.run_id.map(|run_id| run_id.value().to_string()),
                     node_id: node.node_id.value().to_string(),
                     failure_kind: node
                         .failure
@@ -905,7 +907,7 @@ async fn work_projection(client: State<'_, DaemonClient>) -> Result<WorkProjecti
             .runs
             .into_iter()
             .map(|run| {
-                let can_cancel = run_can_cancel(run.state);
+                let can_cancel = run_can_cancel(run.state, run.started_at.is_some());
                 RunProjection {
                     run_id: run.metadata.id.value().to_string(),
                     session_id: run.session_id.value().to_string(),
@@ -1301,12 +1303,14 @@ mod tests {
     #[test]
     fn cancellation_is_not_advertised_during_uninterruptible_startup() {
         use bastet_core::NormalizedRunState::*;
-        assert!(run_can_cancel(Running));
-        assert!(run_can_cancel(Recovering));
+        assert!(run_can_cancel(Running, true));
+        assert!(run_can_cancel(Recovering, true));
+        assert!(run_can_cancel(AwaitingApproval, false));
+        assert!(!run_can_cancel(AwaitingApproval, true));
         for state in [
             Starting, Cancelling, Succeeded, Failed, Cancelled, Blocked, Uncertain,
         ] {
-            assert!(!run_can_cancel(state));
+            assert!(!run_can_cancel(state, true));
         }
     }
 

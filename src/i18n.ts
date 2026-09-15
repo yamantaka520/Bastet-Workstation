@@ -42,6 +42,65 @@ const messages: Record<Locale, Partial<Record<MessageKey, string>>> = {
   ko: { ...en, milestone: "M3 Office 수직 슬라이스", navigation: "기본 탐색", office: "오피스", agents: "Agents 및 모델", approvals: "승인 센터", diagnostics: "진단", officeHelp: "적용 전에 접근성 설명이 있는 모든 Pet 상태를 미리 봅니다.", builtinPet: "내장 Pet 카탈로그", applyPet: "Pet 적용", rollbackPet: "Pet 롤백", applied: "적용됨", notApplied: "적용 안 됨", rooms: "방", meetings: "회의", documents: "문서", costs: "비용 기록", noApprovals: "대기 중이거나 최근 승인이 없습니다.", sessionsAndRuns: "세션 및 실행", sessions: "세션", revision: "리비전", noRuns: "실행이 없습니다.", cancel: "취소", cancelRejected: "공급자가 취소 요청을 수락하지 않았습니다.", approve: "승인", deny: "거부", approved: "승인됨", denied: "거부됨" },
 };
 export function translate(locale: Locale, key: MessageKey): string { return lifecycleLocales[locale]?.[key as keyof typeof lifecycleLocales.en] ?? approvalLocales[locale]?.[key as keyof typeof approval] ?? deliveryLocales[locale]?.[key as keyof typeof delivery] ?? workflowLocales[locale]?.[key as WorkflowKey] ?? messages[locale]?.[key] ?? messages.en[key] ?? `[missing:${key}]`; }
+const stagedCredentialRequestCopy = {
+  en: {
+    "credential.use": "Use bound credential for one staged run",
+    "provider.authentication": "This staged run needs permission to use the displayed provider credential.",
+    "credential.single_run": "Approval grants permission for this exact run only; it does not sign in to the provider or start execution.",
+    credentialScopeNote: "Approving grants one exact-run permission to use the displayed credential reference before the expiry above. It does not prove provider login or start execution. An approved staged run waits until the credential broker and dispatch are available.",
+  },
+  "zh-Hant": {
+    "credential.use": "為單次暫存執行使用繫結憑證",
+    "provider.authentication": "此暫存執行需要允許使用所顯示的供應商憑證。",
+    "credential.single_run": "核准只授予這個精確執行的權限；不會登入供應商，也不會開始執行。",
+    credentialScopeNote: "核准只允許在上述到期時間前，為這個精確執行使用所顯示的憑證參照一次。它不代表已登入供應商，也不會開始執行。已核准的暫存執行會等待憑證代理與派送可用。",
+  },
+  "zh-Hans": {
+    "credential.use": "为一次暂存运行使用绑定凭据",
+    "provider.authentication": "此暂存运行需要获准使用所显示的提供方凭据。",
+    "credential.single_run": "批准只授予这一次精确运行的权限；不会登录提供方，也不会开始运行。",
+    credentialScopeNote: "批准仅允许在上述到期前为这一次精确运行使用所显示的凭据引用一次。它不代表已登录提供方，也不会开始运行。已批准的暂存运行会等待凭据代理和派发可用。",
+  },
+  ja: {
+    "credential.use": "単一のステージ済み実行でバインド済み認証情報を使用",
+    "provider.authentication": "このステージ済み実行には、表示されたプロバイダー認証情報を使用する許可が必要です。",
+    "credential.single_run": "承認はこの正確な実行に限った権限です。プロバイダーへのログインや実行開始は行いません。",
+    credentialScopeNote: "承認により、上記の有効期限まで表示された認証情報の参照をこの正確な実行で一度だけ使用できます。プロバイダーへのログイン済みを示すものでも、実行を開始するものでもありません。承認済みのステージ済み実行は、認証情報ブローカーとディスパッチが利用可能になるまで待機します。",
+  },
+  ko: {
+    "credential.use": "단일 스테이징 실행에 바인딩된 자격 증명 사용",
+    "provider.authentication": "이 스테이징 실행에는 표시된 제공자 자격 증명을 사용할 권한이 필요합니다.",
+    "credential.single_run": "승인은 이 정확한 실행에만 권한을 부여합니다. 제공자 로그인이나 실행 시작은 하지 않습니다.",
+    credentialScopeNote: "승인은 위 만료 시각 전까지 표시된 자격 증명 참조를 이 정확한 실행에 한 번 사용할 권한만 부여합니다. 제공자 로그인이 증명되거나 실행이 시작되는 것은 아닙니다. 승인된 스테이징 실행은 자격 증명 브로커와 디스패치가 사용 가능해질 때까지 대기합니다.",
+  },
+} as const;
+
+export function translateStagedCredentialRequest(locale: Locale, value: string): string {
+  switch (value) {
+    case "credential.use":
+    case "provider.authentication":
+    case "credential.single_run":
+      return stagedCredentialRequestCopy[locale][value];
+    default:
+      return value;
+  }
+}
+
+export function stagedCredentialScopeNote(locale: Locale): string {
+  return stagedCredentialRequestCopy[locale].credentialScopeNote;
+}
+
+export function stagedLaunchLabel(locale: Locale, state: string): string {
+  const labels = {
+    en: ["Awaiting approval", "Approved — awaiting dispatch", "Cancelled before execution"],
+    "zh-Hant": ["等待核准", "已核准，等待派送", "已於執行前取消"],
+    "zh-Hans": ["等待批准", "已批准，等待派发", "已在运行前取消"],
+    ja: ["承認待ち", "承認済み — 実行開始待ち", "実行前にキャンセル済み"],
+    ko: ["승인 대기", "승인됨 — 실행 대기", "실행 전에 취소됨"],
+  };
+  const index = state === "awaiting_approval" ? 0 : state === "ready" ? 1 : state === "cancelled" ? 2 : -1;
+  return index < 0 ? state : labels[locale][index];
+}
 const failureKeyByIdentifier: Record<string, Extract<MessageKey, `failure${string}`>> = {
   provider_unavailable: "failureProviderUnavailable", "mvp.failure.provider_unavailable": "failureProviderUnavailable",
   provider_timeout: "failureProviderTimeout", "mvp.failure.provider_timeout": "failureProviderTimeout",

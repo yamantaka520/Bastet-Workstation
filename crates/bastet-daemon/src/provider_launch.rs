@@ -22,7 +22,7 @@ pub(super) struct ProviderLaunchPlan {
 }
 
 impl ProviderLaunchPlan {
-    fn hash(&self) -> Result<String, StoreError> {
+    pub(super) fn hash(&self) -> Result<String, StoreError> {
         Ok(format!(
             "sha256:{:x}",
             Sha256::digest(serde_json::to_vec(self)?)
@@ -210,7 +210,7 @@ mod tests {
             .connection()
             .unwrap()
             .execute_batch(
-                "DROP TABLE provider_launch_plans; DELETE FROM schema_migrations WHERE version=11;",
+                "DROP TABLE staged_provider_launches; DROP TABLE provider_launch_plans; DELETE FROM schema_migrations WHERE version>=11;",
             )
             .unwrap();
         drop(store);

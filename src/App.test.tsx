@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import { hasExplicitWorkflowTranslation, locales, translate, workflowKeys } from "./i18n";
+import { hasExplicitWorkflowTranslation, locales, stagedCredentialScopeNote, stagedLaunchLabel, translate, translateStagedCredentialRequest, workflowKeys } from "./i18n";
 
 const { invokeMock, listenMock } = vi.hoisted(() => ({ invokeMock: vi.fn(), listenMock: vi.fn() }));
 
@@ -111,10 +111,69 @@ describe("M1 shell", () => {
     expect(screen.getByText("未知")).toBeInTheDocument();
     expect(screen.queryByText("unexpected")).not.toBeInTheDocument();
     expect(screen.getAllByText("credential-ref-3")).toHaveLength(2);
-    expect(screen.getByText(/不會驗證或登入供應商/)).toBeInTheDocument();
+    expect(screen.getByText(translate("zh-Hant", "credentialScopeNote"))).toBeInTheDocument();
+    expect(screen.queryByText(stagedCredentialScopeNote("zh-Hant"))).not.toBeInTheDocument();
     expect(screen.queryByText("Single-use credential approval")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "核准" }));
     expect(invokeMock).toHaveBeenCalledWith("decide_approval", { requestId: "approval-1", requestHash: "immutable-hash", kind: "approve", decidedAtMs: expect.any(Number), credentialScopeAcknowledged: true });
+  });
+
+  it("localizes known staged credential request keys in every locale and preserves unknown request copy", async () => {
+    invokeMock.mockImplementation((command: string) => command === "approval_center_snapshot"
+      ? Promise.resolve({ protocol_version: 1, records: [{ request: {
+        id: "approval-staged", request_hash: "staged-hash", expires_at_ms: 1_800_000_000_000,
+        action: { action_key: "credential.use", reason_key: "provider.authentication", consequence_key: "credential.single_run", risk: "high", agent_instance_id: "agent-1", requested_policy: { layer: "single_run", ceiling: {} }, scope: { project_id: "project-1", filesystem_roots: [], data_scopes: [], network_destinations: [], credential_reference_ids: [], credential_binding: { agent_provider_id: "provider-1", account_id: "account-1", adapter_kind: "codex_cli", provider_identity: "Example Provider", credential_reference_id: "credential-ref-1", backend: "macos_keychain", service: "example.service", account_label: "Work account", capability_key: "provider.chat" } },
+        },
+      }, decision: null, staged_launch_state: "awaiting_approval" }, { request: {
+        id: "approval-unknown", request_hash: "unknown-hash", expires_at_ms: 1_800_000_000_000,
+        action: { action_key: "constructor", reason_key: "toString", consequence_key: "__proto__", risk: "low", agent_instance_id: "agent-2", requested_policy: { layer: "single_run", ceiling: {} }, scope: { project_id: "project-2", filesystem_roots: [], data_scopes: [], network_destinations: [], credential_reference_ids: [] },
+        },
+      }, decision: null }] })
+      : defaultInvoke(command));
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "核准中心" }));
+    await screen.findByText(translateStagedCredentialRequest("zh-Hant", "provider.authentication"));
+    for (const locale of locales) {
+      fireEvent.change(screen.getByLabelText("Language"), { target: { value: locale } });
+      for (const key of ["credential.use", "provider.authentication", "credential.single_run"]) {
+        expect(screen.getByText(translateStagedCredentialRequest(locale, key))).toBeInTheDocument();
+        expect(screen.queryByText(key)).not.toBeInTheDocument();
+      }
+      expect(screen.getByText(stagedCredentialScopeNote(locale))).toBeInTheDocument();
+      for (const value of ["constructor", "toString", "__proto__"]) expect(screen.getByText(value)).toBeInTheDocument();
+    }
+  });
+
+  it.each(["awaiting_approval", "ready", "cancelled"] as const)("projects exact staged %s status in approval and run views", async (state) => {
+    const record = { staged_launch_state: state, decision: state === "ready" ? { kind: "approve" } : null,
+      request: { id: "staged", request_hash: "hash", expires_at_ms: 1_800_000_000_000,
+        action: { action_key: "credential.use", reason_key: "provider.authentication", consequence_key: "credential.single_run", risk: "high", agent_instance_id: "agent",
+          scope: { project_id: "project", run_id: "run-staged", filesystem_roots: [], data_scopes: [], network_destinations: [], credential_reference_ids: [] } } } };
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "approval_center_snapshot") return Promise.resolve({ protocol_version: 1, records: [record] });
+      if (command === "work_projection") return Promise.resolve({ revision: 1, sessions: 1, runs: [{ run_id: "run-staged", session_id: "session", state: "awaitingapproval", can_cancel: state !== "cancelled" }] });
+      if (command === "m3_projection") return defaultInvoke(command).then((base) => ({ ...base, graph_nodes: [{ execution_id: "graph", node_id: "node", run_id: "run-staged", title: "Staged node", state: "awaitingapproval", pet_state: "approval_required" }] }));
+      return defaultInvoke(command);
+    });
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "核准中心" }));
+    await screen.findByText(stagedLaunchLabel("zh-Hant", state));
+    for (const locale of locales) {
+      fireEvent.change(screen.getByLabelText("Language"), { target: { value: locale } });
+      expect(screen.getByText(stagedLaunchLabel(locale, state))).toBeInTheDocument();
+      if (state !== "awaiting_approval") {
+        expect(screen.queryByRole("button", { name: translate(locale, "approve") })).not.toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: translate(locale, "deny") })).not.toBeInTheDocument();
+      }
+    }
+    fireEvent.change(screen.getByLabelText("Language"), { target: { value: "zh-Hant" } });
+    fireEvent.click(screen.getByRole("button", { name: "Agents 與模型" }));
+    expect(screen.getByText(new RegExp(stagedLaunchLabel("zh-Hant", state)))).toBeInTheDocument();
+    expect(screen.queryByText(/awaitingapproval/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "辦公室" }));
+    expect(screen.getAllByText(new RegExp(stagedLaunchLabel("zh-Hant", state))).length).toBeGreaterThan(0);
+    expect(screen.getByText(/Staged node/).closest("li")).not.toHaveTextContent("approval_required");
   });
 
   it("does not acknowledge a credential scope for a legacy approval without a binding", async () => {

@@ -270,7 +270,15 @@ fn validate_run_timing(run: &Run) -> Result<(), CatalogError> {
         run.state,
         NormalizedRunState::Cancelled | NormalizedRunState::Failed | NormalizedRunState::Succeeded
     );
-    let active = !matches!(run.state, NormalizedRunState::Starting);
+    // Approval may precede dispatch; cancellation may terminate that intent
+    // without inventing a provider start time. Daemon dispatch ledgers establish
+    // whether an AwaitingApproval run is prelaunch or already executing.
+    let active = !matches!(
+        run.state,
+        NormalizedRunState::Starting
+            | NormalizedRunState::AwaitingApproval
+            | NormalizedRunState::Cancelled
+    );
     if (active && run.started_at.is_none()) || (terminal && run.finished_at.is_none()) {
         return Err(CatalogError::InvalidRunTiming { state: run.state });
     }
@@ -532,5 +540,19 @@ mod tests {
         catalog.runs[0].started_at = Some("2026-09-03T00:00:01Z".into());
         catalog.runs[0].finished_at = Some("2026-09-03T00:00:02Z".into());
         catalog.validate().unwrap();
+    }
+
+    #[test]
+    fn prelaunch_approval_and_cancellation_do_not_invent_start_time() {
+        let mut catalog = fixture();
+        catalog.runs[0].state = NormalizedRunState::AwaitingApproval;
+        catalog.runs[0].started_at = None;
+        catalog.validate().unwrap();
+        catalog.runs[0].state = NormalizedRunState::Cancelled;
+        assert!(catalog.validate().is_err());
+        catalog.runs[0].finished_at = Some("2026-09-16T00:00:00Z".into());
+        catalog.validate().unwrap();
+        catalog.runs[0].state = NormalizedRunState::Succeeded;
+        assert!(catalog.validate().is_err());
     }
 }

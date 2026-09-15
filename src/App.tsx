@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { locales, type Locale, translate, translateFailure } from "./i18n";
+import { locales, type Locale, stagedCredentialScopeNote, stagedLaunchLabel, translate, translateFailure, translateStagedCredentialRequest } from "./i18n";
 import "./styles.css";
 
 type ConnectionState = "connecting" | "ready" | "offline";
@@ -12,13 +12,13 @@ type ApprovalScope = { project_id: string; run_id?: string | null; filesystem_ro
 type PolicyCeiling = { filesystem?: string | null; network?: string | null; process?: string | null; device?: string | null; credential?: string | null; persistent_approval?: boolean | null };
 type ScopedPolicy = { layer?: string | null; ceiling?: PolicyCeiling | null };
 type ApprovalAction = { agent_instance_id: string; role_id?: string | null; action_key: string; reason_key: string; consequence_key: string; risk: string; requested_policy?: ScopedPolicy | null; scope: ApprovalScope };
-type ApprovalRecord = { request: { id: string; request_hash: string; expires_at_ms: number; action: ApprovalAction }; decision: { kind: "approve" | "deny" } | null };
+type ApprovalRecord = { staged_launch_state?: "awaiting_approval" | "ready" | "cancelled" | null; request: { id: string; request_hash: string; expires_at_ms: number; action: ApprovalAction }; decision: { kind: "approve" | "deny" } | null };
 type ApprovalList = { protocol_version: number; records: ApprovalRecord[] };
 type AgentStatus = { adapter_kind: string; display_name: string; installed: boolean; version: string | null; authenticated: boolean | null; model_count: number | null; models: string[]; reasoning_controls: string[]; operations: string[]; error_key: string | null };
 type AgentCenterSnapshot = { agents: AgentStatus[] };
 type WorkProjection = { revision: number; sessions: number; runs: { run_id: string; session_id: string; state: string; can_cancel: boolean }[] };
 type PetProfile = { metadata: { id: string }; name: string; version: number; states: { state_key: string; accessible_label_key: string }[] };
-type M3Projection = { revision: number; pet_profiles: PetProfile[]; pet_assignments: number; rooms: number; meetings: number; documents: number; costs: number; graph_nodes: { execution_id: string; node_id: string; title: string; state: string; pet_state: string; failure_kind?: string | null; failure_message_key?: string | null }[]; awaiting_meetings: { meeting_id: string; summary: string }[]; joined_drafts: { execution_id: string; title: string; markdown: string }[]; missing_output_execution_id: string | null; document_versions: { project_id: string; artifact_id: string; version_id: string; title: string; markdown: string; content_hash: string; accepted: boolean; workspace_file?: string | null }[]; knowledge_deliveries: { delivery_id: string; target: string; preview: string; state: string }[] };
+type M3Projection = { revision: number; pet_profiles: PetProfile[]; pet_assignments: number; rooms: number; meetings: number; documents: number; costs: number; graph_nodes: { execution_id: string; node_id: string; run_id?: string | null; title: string; state: string; pet_state: string; failure_kind?: string | null; failure_message_key?: string | null }[]; awaiting_meetings: { meeting_id: string; summary: string }[]; joined_drafts: { execution_id: string; title: string; markdown: string }[]; missing_output_execution_id: string | null; document_versions: { project_id: string; artifact_id: string; version_id: string; title: string; markdown: string; content_hash: string; accepted: boolean; workspace_file?: string | null }[]; knowledge_deliveries: { delivery_id: string; target: string; preview: string; state: string }[] };
 type View = "office" | "agents" | "approvals" | "diagnostics";
 
 function PolicyDetails({ policy, locale }: { policy: ScopedPolicy | null | undefined; locale: Locale }) {
@@ -28,7 +28,7 @@ function PolicyDetails({ policy, locale }: { policy: ScopedPolicy | null | undef
   return <dl><dt>{translate(locale, "policyLayer")}</dt><dd>{layer}</dd><dt>{translate(locale, "filesystem")}</dt><dd>{permission(policy?.ceiling?.filesystem)}</dd><dt>{translate(locale, "network")}</dt><dd>{permission(policy?.ceiling?.network)}</dd><dt>{translate(locale, "process")}</dt><dd>{permission(policy?.ceiling?.process)}</dd><dt>{translate(locale, "device")}</dt><dd>{permission(policy?.ceiling?.device)}</dd><dt>{translate(locale, "credential")}</dt><dd>{permission(policy?.ceiling?.credential)}</dd><dt>{translate(locale, "persistentApproval")}</dt><dd>{persistent}</dd></dl>;
 }
 
-function ApprovalDetails({ action, locale }: { action: ApprovalAction; locale: Locale }) {
+function ApprovalDetails({ action, locale, staged }: { action: ApprovalAction; locale: Locale; staged?: boolean }) {
   const detail = (label: Parameters<typeof translate>[1], value: string | string[] | null | undefined) => {
     if (value == null) return null;
     return <><dt>{translate(locale, label)}</dt><dd>{Array.isArray(value) ? value.join(" · ") || translate(locale, "none") : value}</dd></>;
@@ -43,7 +43,7 @@ function ApprovalDetails({ action, locale }: { action: ApprovalAction; locale: L
     <dl>{detail("project", action.scope.project_id)}{detail("run", action.scope.run_id ?? translate(locale, "none"))}{detail("filesystemRoots", action.scope.filesystem_roots)}{detail("dataScopes", action.scope.data_scopes)}{detail("networkDestinations", action.scope.network_destinations)}{detail("credentialReferences", action.scope.credential_reference_ids)}{detail("destination", action.scope.destination ?? translate(locale, "none"))}</dl>
     {binding && <section className="credential-binding" aria-label={translate(locale, "credentialBinding")}>
       <h4>{translate(locale, "singleUseCredential")}</h4>
-      <p>{translate(locale, "credentialScopeNote")}</p>
+      <p>{staged ? stagedCredentialScopeNote(locale) : translate(locale, "credentialScopeNote")}</p>
       <dl>{detail("agentProvider", binding.agent_provider_id)}{detail("providerIdentity", binding.provider_identity)}{detail("adapter", binding.adapter_kind)}{detail("account", binding.account_id)}{detail("accountLabel", binding.account_label)}{detail("credentialReference", binding.credential_reference_id)}{detail("capability", binding.capability_key)}{detail("backend", binding.backend)}{detail("service", binding.service)}</dl>
     </section>}
   </>;
@@ -117,9 +117,16 @@ export function App() {
   }, []);
 
   const changeAutostart = async (enabled: boolean) => { if (enabled) await enable(); else await disable(); setAutostart(await isEnabled()); };
+  const displayRunState = (runId: string | null | undefined, fallback: string) => {
+    const staged = approvals.find((record) => runId && record.request.action.scope.run_id === runId && record.staged_launch_state)?.staged_launch_state;
+    return staged ? stagedLaunchLabel(locale, staged) : fallback;
+  };
+  const requestCopy = (record: ApprovalRecord, key: string) => record.staged_launch_state ? translateStagedCredentialRequest(locale, key) : key;
   const decide = async (record: ApprovalRecord, kind: "approve" | "deny") => {
-    await invoke("decide_approval", { requestId: record.request.id, requestHash: record.request.request_hash, kind, decidedAtMs: Date.now(), credentialScopeAcknowledged: Boolean(record.request.action.scope.credential_binding) });
-    await reconnect();
+    setActionError(false); setActionBusy(true);
+    try { await invoke("decide_approval", { requestId: record.request.id, requestHash: record.request.request_hash, kind, decidedAtMs: Date.now(), credentialScopeAcknowledged: Boolean(record.request.action.scope.credential_binding) }); }
+    catch { setActionError(true); }
+    finally { setActionBusy(false); await reconnect(); }
   };
   const cancelRun = async (runId: string) => {
     if (cancelRequests.current.has(runId)) return;
@@ -229,7 +236,7 @@ export function App() {
       {m3.missing_output_execution_id && <section><p>{translate(locale, "retryMissingOutputHelp")}</p><button type="button" disabled={actionBusy} onClick={() => void retryMissingGraphOutputs()}>{translate(locale, "retryMissingOutputs")}</button></section>}
       {m3.document_versions.map((document) => { const workspaceFile = workspaceFiles[document.version_id] ?? document.workspace_file; return <article key={document.version_id}><h3>{document.title}</h3><pre>{document.markdown}</pre><code>{document.content_hash}</code>{workspaceFile && <p>{translate(locale, "workspaceFile")}: <code>{workspaceFile}</code></p>}{document.accepted ? <><p>{translate(locale, "approved")}</p><div className="actions"><button type="button" onClick={() => void exportDocument(document)}>{translate(locale, "exportDocument")}</button><button type="button" onClick={() => void prepareKnowledge(document, "agent_memory_os")}>{translate(locale, "prepareMemory")}</button><button type="button" onClick={() => void prepareKnowledge(document, "bastet_mind")}>{translate(locale, "prepareMind")}</button></div></> : <button type="button" onClick={() => void acceptDocument(document)}>{translate(locale, "acceptDocument")}</button>}</article>; })}
       {m3.knowledge_deliveries.length > 0 && <section aria-labelledby="delivery-heading"><h3 id="delivery-heading">{translate(locale, "knowledgeDeliveries")}</h3><ul>{m3.knowledge_deliveries.map((delivery) => <li key={delivery.delivery_id}>{delivery.target} — {translate(locale, delivery.state === "delivered" ? "delivered" : "prepared")} {delivery.state === "prepared" && <button type="button" disabled={actionBusy} onClick={() => void deliverKnowledge(delivery.delivery_id)}>{translate(locale, "deliverNow")}</button>}</li>)}</ul></section>}
-      {m3.graph_nodes.length > 0 && <ul>{m3.graph_nodes.map((node) => <li key={`${node.execution_id}-${node.node_id}`}><span aria-hidden="true">🐈</span> {node.title} — {node.state} <span className="sr-only">{node.pet_state}</span>{node.state === "failed" && <><p role="alert">{translateFailure(node.failure_kind, node.failure_message_key, locale)}</p><p>{translate(locale, "retryFailedNodeHelp")}</p><button type="button" disabled={actionBusy} onClick={() => void retryFailedNode(node)}>{translate(locale, "retryFailedNode")}</button></>}</li>)}</ul>}</section>}
+      {m3.graph_nodes.length > 0 && <ul>{m3.graph_nodes.map((node) => <li key={`${node.execution_id}-${node.node_id}`}><span aria-hidden="true">🐈</span> {node.title} — {displayRunState(node.run_id, node.state)} <span className="sr-only">{displayRunState(node.run_id, node.pet_state)}</span>{node.state === "failed" && <><p role="alert">{translateFailure(node.failure_kind, node.failure_message_key, locale)}</p><p>{translate(locale, "retryFailedNodeHelp")}</p><button type="button" disabled={actionBusy} onClick={() => void retryFailedNode(node)}>{translate(locale, "retryFailedNode")}</button></>}</li>)}</ul>}</section>}
 
     {view === "agents" && <section aria-labelledby="agents-heading"><h2 id="agents-heading">{translate(locale, "agents")}</h2><p>{translate(locale, "agentHelp")}</p>
       <div className="card-grid">{agents.map((agent) => <article key={agent.adapter_kind}><h3>{agent.display_name}</h3><span className="badge">{translate(locale, agent.installed ? "installed" : "notInstalled")}</span>
@@ -237,15 +244,16 @@ export function App() {
           <dt>{translate(locale, "models")}</dt><dd>{agent.model_count ?? translate(locale, "unknown")}</dd><dt>{translate(locale, "reasoning")}</dt><dd>{agent.reasoning_controls.join(" · ") || translate(locale, "unknown")}</dd>
           <dt>{translate(locale, "runControl")}</dt><dd>{agent.operations.join(" · ") || translate(locale, "unavailable")}</dd></dl></article>)}</div>
       <h3>{translate(locale, "sessionsAndRuns")}</h3><p>{translate(locale, "sessions")}: {work.sessions} · {translate(locale, "revision")}: {work.revision}</p>
-      {work.runs.length === 0 ? <p>{translate(locale, "noRuns")}</p> : <ul>{work.runs.map((run) => <li key={run.run_id}><code>{run.run_id}</code> — {run.state} {run.can_cancel && <button type="button" disabled={pendingCancels.includes(run.run_id)} onClick={() => void cancelRun(run.run_id)}>{translate(locale, "cancel")}</button>}</li>)}</ul>}</section>}
+      {work.runs.length === 0 ? <p>{translate(locale, "noRuns")}</p> : <ul>{work.runs.map((run) => <li key={run.run_id}><code>{run.run_id}</code> — {displayRunState(run.run_id, run.state)} {run.can_cancel && <button type="button" disabled={pendingCancels.includes(run.run_id)} onClick={() => void cancelRun(run.run_id)}>{translate(locale, "cancel")}</button>}</li>)}</ul>}</section>}
 
     {view === "approvals" && <section aria-labelledby="approvals-heading"><h2 id="approvals-heading">{translate(locale, "approvals")}</h2><p>{translate(locale, "approvalHelp")}</p>
-      {approvals.length === 0 ? <p>{translate(locale, "noApprovals")}</p> : approvals.map((record) => <article key={record.request.id} className="approval-card"><h3>{record.request.action.action_key}</h3>
-        <p>{record.request.action.reason_key}</p><p>{record.request.action.consequence_key}</p><dl><dt>{translate(locale, "risk")}</dt><dd>{record.request.action.risk}</dd>
+      {approvals.length === 0 ? <p>{translate(locale, "noApprovals")}</p> : approvals.map((record) => <article key={record.request.id} className="approval-card"><h3>{requestCopy(record, record.request.action.action_key)}</h3>
+        <p>{requestCopy(record, record.request.action.reason_key)}</p><p>{requestCopy(record, record.request.action.consequence_key)}</p><dl><dt>{translate(locale, "risk")}</dt><dd>{record.request.action.risk}</dd>
           <dt>{translate(locale, "expires")}</dt><dd>{new Date(record.request.expires_at_ms).toLocaleString(locale)}</dd></dl>
-        <ApprovalDetails action={record.request.action} locale={locale} />
-        {record.decision ? <strong>{translate(locale, record.decision.kind === "approve" ? "approved" : "denied")}</strong> : <div className="actions">
-          <button type="button" onClick={() => void decide(record, "deny")}>{translate(locale, "deny")}</button><button type="button" className="primary" onClick={() => void decide(record, "approve")}>{translate(locale, "approve")}</button></div>}</article>)}</section>}
+        <ApprovalDetails action={record.request.action} locale={locale} staged={Boolean(record.staged_launch_state)} />
+        {record.staged_launch_state && <p role="status">{stagedLaunchLabel(locale, record.staged_launch_state)}</p>}
+        {record.staged_launch_state === "cancelled" ? null : record.decision ? <strong>{translate(locale, record.decision.kind === "approve" ? "approved" : "denied")}</strong> : <div className="actions">
+          <button type="button" disabled={actionBusy} onClick={() => void decide(record, "deny")}>{translate(locale, "deny")}</button><button type="button" className="primary" disabled={actionBusy} onClick={() => void decide(record, "approve")}>{translate(locale, "approve")}</button></div>}</article>)}</section>}
 
     {view === "diagnostics" && <section aria-labelledby="diagnostics-heading"><h2 id="diagnostics-heading">{translate(locale, "diagnostics")}</h2>
       <label className="preference"><input type="checkbox" checked={autostart} onChange={(event) => void changeAutostart(event.target.checked)} />{translate(locale, "autostart")}</label>

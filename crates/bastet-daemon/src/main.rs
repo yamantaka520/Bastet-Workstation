@@ -18,6 +18,8 @@ async fn main() -> anyhow::Result<()> {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let signal_store = store.clone();
     let mut ctrl_c_available = true;
+    let mut approval_expiry = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut expiry_failure_reported = false;
     #[cfg(unix)]
     let mut terminate_signal =
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
@@ -43,6 +45,16 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(not(unix))]
             let terminate = std::future::pending::<bool>();
             tokio::select! {
+                _ = approval_expiry.tick() => {
+                    let expiry_store = signal_store.clone();
+                    let result = tokio::task::spawn_blocking(move || expiry_store.expire_staged_launches()).await;
+                    if matches!(result, Ok(Ok(()))) {
+                        expiry_failure_reported = false;
+                    } else if !expiry_failure_reported {
+                        eprintln!("staged approval expiry reconciliation unavailable");
+                        expiry_failure_reported = true;
+                    }
+                }
                 result = shutdown_rx.changed() => {
                     if result.is_err() || *shutdown_rx.borrow() {
                         break;

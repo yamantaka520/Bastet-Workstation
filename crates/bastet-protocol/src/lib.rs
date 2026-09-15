@@ -371,6 +371,17 @@ pub struct ApprovalRecord {
     pub protocol_version: u32,
     pub request: ApprovalRequest,
     pub decision: Option<ApprovalDecision>,
+    /// Durable launch status, absent for ordinary/legacy approval records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_launch_state: Option<StagedLaunchState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StagedLaunchState {
+    AwaitingApproval,
+    Ready,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

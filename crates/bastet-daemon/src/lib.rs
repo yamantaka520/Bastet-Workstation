@@ -4,6 +4,7 @@ mod credential_grants;
 mod provider_executor;
 mod provider_launch;
 pub mod sandbox;
+mod staged_launches;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -43,7 +44,7 @@ use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 11;
+const SCHEMA_VERSION: u32 = 12;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -316,6 +317,12 @@ async fn cancel_run(
     if path_id != command.run_id {
         return Err(StoreError::RunNotFound.into());
     }
+    if let Some(receipt) = state
+        .store
+        .cancel_staged_run(path_id, command.expected_catalog_revision)?
+    {
+        return Ok(Json(receipt));
+    }
     state
         .store
         .preflight_provider_cancel(path_id, command.expected_catalog_revision)?;
@@ -412,6 +419,16 @@ async fn execute_ready_graph(
     let mut run_ids = Vec::with_capacity(receipts.len());
     for receipt in receipts {
         let run_id = receipt.run_id;
+        if receipt
+            .launch_identity
+            .as_ref()
+            .is_some_and(|identity| identity.account.is_some())
+        {
+            // Selected-account work is a durable waiting intent, not a worker.
+            // No grant is consumed until a native broker and dispatch claim exist.
+            run_ids.push(run_id);
+            continue;
+        }
         if executor.start(receipt.clone()).is_err() {
             executor.persist_start_failure(&receipt);
             continue;
@@ -751,6 +768,7 @@ impl Store {
             insert_event(&transaction, "daemon.recovery_started", "{}")?;
             reconcile_catalog_for_recovery(&transaction)?;
             reconcile_graphs_for_recovery(&transaction)?;
+            staged_launches::expire(&transaction, credential_grants::now_ms()?)?;
             transaction.commit()?;
         }
         Ok(Self {
@@ -2191,10 +2209,15 @@ impl Store {
                 "provider launch inputs changed".into(),
             ));
         }
-        execution.claim_node(command.node_id, &command.owner)?;
+        let staged = expected_binding.is_some() && binding.launch_identity.account.is_some();
         let session_id = bastet_core::SessionId::new();
         let run_id = RunId::new();
-        execution.bind_run(command.node_id, &command.owner, run_id)?;
+        if staged {
+            execution.stage_node(command.node_id, &command.owner, run_id)?;
+        } else {
+            execution.claim_node(command.node_id, &command.owner)?;
+            execution.bind_run(command.node_id, &command.owner, run_id)?;
+        }
         let attempt: u64 = transaction.query_row(
             "SELECT COALESCE(MAX(attempt), 0) + 1 FROM graph_node_runs
              WHERE execution_id=?1 AND node_id=?2",
@@ -2211,8 +2234,12 @@ impl Store {
             metadata: entity_metadata(run_id, "graph_node_run"),
             session_id,
             model_id: binding.model_id,
-            state: bastet_core::NormalizedRunState::Starting,
-            started_at: Some(timestamp()),
+            state: if staged {
+                bastet_core::NormalizedRunState::AwaitingApproval
+            } else {
+                bastet_core::NormalizedRunState::Starting
+            },
+            started_at: if staged { None } else { Some(timestamp()) },
             finished_at: None,
         });
         identity.validate()?;
@@ -2235,7 +2262,7 @@ impl Store {
                 serde_json::to_string(&binding.launch_identity)?
             ],
         )?;
-        provider_launch::ProviderLaunchPlan {
+        let plan = provider_launch::ProviderLaunchPlan {
             version: 1,
             execution_id: id,
             node_id: command.node_id,
@@ -2253,11 +2280,18 @@ impl Store {
             identity: binding.launch_identity.clone(),
             workspace_root: binding.workspace_root.clone(),
             prompt: binding.prompt.clone(),
+        };
+        plan.insert(&transaction)?;
+        if staged {
+            staged_launches::stage(&transaction, &plan)?;
         }
-        .insert(&transaction)?;
         let event = insert_event(
             &transaction,
-            "graph.node_run_started",
+            if staged {
+                "graph.node_run_staged"
+            } else {
+                "graph.node_run_started"
+            },
             &serde_json::json!({"execution_id": id, "node_id": command.node_id, "run_id": run_id})
                 .to_string(),
         )?;
@@ -2709,15 +2743,17 @@ impl Store {
     }
 
     pub fn approval(&self, request_id: ApprovalRequestId) -> Result<ApprovalRecord, StoreError> {
+        self.expire_staged_launches()?;
         let connection = self.connection()?;
-        let result: Option<(String, Option<String>)> = connection
+        let result: Option<(String, Option<String>, Option<String>)> = connection
             .query_row(
-                "SELECT request_json, decision_json FROM approval_requests WHERE request_id = ?1",
+                "SELECT a.request_json, a.decision_json, s.state FROM approval_requests a LEFT JOIN staged_provider_launches s USING(request_id) WHERE a.request_id = ?1",
                 [request_id.value().to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let (request_json, decision_json) = result.ok_or(StoreError::ApprovalNotFound)?;
+        let (request_json, decision_json, staged_state) =
+            result.ok_or(StoreError::ApprovalNotFound)?;
         let request = serde_json::from_str(&request_json)?;
         let decision = decision_json
             .map(|value| serde_json::from_str(&value))
@@ -2726,23 +2762,34 @@ impl Store {
             protocol_version: PROTOCOL_VERSION,
             request,
             decision,
+            staged_launch_state: staged_state
+                .map(|state| serde_json::from_value(serde_json::Value::String(state)))
+                .transpose()?,
         })
     }
 
     pub fn approvals(&self) -> Result<ApprovalList, StoreError> {
+        self.expire_staged_launches()?;
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT request_json, decision_json FROM approval_requests ORDER BY rowid DESC",
+            "SELECT a.request_json, a.decision_json, s.state FROM approval_requests a LEFT JOIN staged_provider_launches s USING(request_id) ORDER BY a.rowid DESC",
         )?;
         let records = statement
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })?
             .map(|row| {
-                let (request_json, decision_json) = row?;
+                let (request_json, decision_json, staged_state) = row?;
                 Ok(ApprovalRecord {
                     protocol_version: PROTOCOL_VERSION,
                     request: serde_json::from_str(&request_json)?,
+                    staged_launch_state: staged_state
+                        .map(|state| serde_json::from_value(serde_json::Value::String(state)))
+                        .transpose()?,
                     decision: decision_json
                         .map(|value| serde_json::from_str(&value))
                         .transpose()?,
@@ -2805,6 +2852,7 @@ impl Store {
         {
             credential_grants::issue(&transaction, &request, &command.decision)?;
         }
+        staged_launches::on_decision(&transaction, &request, command.decision.kind)?;
         let event = insert_event(
             &transaction,
             match command.decision.kind {
@@ -2822,7 +2870,68 @@ impl Store {
     }
 
     pub fn mark_ready(&self) -> Result<EventEnvelope, StoreError> {
+        self.expire_staged_launches()?;
         self.transition(DaemonLifecycle::Ready, "daemon.ready", "{}")
+    }
+
+    /// Reconcile expired prelaunch intents without accessing a provider.
+    pub fn expire_staged_launches(&self) -> Result<(), StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        staged_launches::expire(&transaction, credential_grants::now_ms()?)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn cancel_staged_run(
+        &self,
+        run_id: RunId,
+        expected_revision: u64,
+    ) -> Result<Option<CancelRunReceipt>, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let request_id: Option<String> = transaction.query_row(
+            "SELECT request_id FROM staged_provider_launches WHERE run_id=?1 AND state IN ('awaiting_approval','ready')",
+            [run_id.value().to_string()], |row| row.get(0),
+        ).optional()?;
+        let Some(request_id) = request_id else {
+            return Ok(None);
+        };
+        let actual: u64 = transaction.query_row(
+            "SELECT revision FROM identity_catalog WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if actual != expected_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: expected_revision,
+                actual,
+            });
+        }
+        let request_id =
+            Uuid::parse_str(&request_id).map_err(|_| StoreError::CredentialGrantRejected)?;
+        staged_launches::cancel_for_request(
+            &transaction,
+            ApprovalRequestId::from_bytes(*request_id.as_bytes()),
+            "cancelled",
+        )?;
+        let catalog_revision = transaction.query_row(
+            "SELECT revision FROM identity_catalog WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let event = insert_event(
+            &transaction,
+            "run.staged_cancelled",
+            &serde_json::json!({"run_id":run_id}).to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(Some(CancelRunReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            run_id,
+            catalog_revision,
+            event_sequence: event.sequence,
+        }))
     }
 
     pub fn checkpoint(&self, command: CheckpointCommand) -> Result<CheckpointReceipt, StoreError> {
@@ -2928,6 +3037,8 @@ impl Store {
                         | bastet_core::NormalizedRunState::Recovering
                 ) || (run.state == bastet_core::NormalizedRunState::Starting
                     && run.started_at.is_some())
+                    || (run.state == bastet_core::NormalizedRunState::AwaitingApproval
+                        && run.started_at.is_some())
             }) {
                 return Err(StoreError::ProviderRunsActive);
             }
@@ -3272,6 +3383,26 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StoreError> {
         )?;
         transaction.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (11, ?1)",
+            [timestamp()],
+        )?;
+        transaction.commit()?;
+    }
+    if current < 12 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE staged_provider_launches (
+                run_id TEXT PRIMARY KEY NOT NULL,
+                request_id TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL CHECK(state IN ('awaiting_approval','ready','cancelled')),
+                staged_at_ms INTEGER NOT NULL CHECK(staged_at_ms >= 0),
+                finished_at_ms INTEGER,
+                cancel_reason TEXT,
+                CHECK((state='cancelled') = (finished_at_ms IS NOT NULL)),
+                CHECK((state='cancelled') = (cancel_reason IS NOT NULL)),
+                CHECK(finished_at_ms IS NULL OR finished_at_ms >= staged_at_ms));",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (12, ?1)",
             [timestamp()],
         )?;
         transaction.commit()?;
@@ -3627,6 +3758,12 @@ fn reconcile_catalog_for_recovery(
     let updated_at = timestamp();
     let mut changed = 0_u64;
     for run in &mut catalog.runs {
+        if run.state == bastet_core::NormalizedRunState::AwaitingApproval
+            && run.started_at.is_none()
+        {
+            staged_launches::validate_staged_run(transaction, run)?;
+            continue;
+        }
         if matches!(
             run.state,
             bastet_core::NormalizedRunState::Starting if run.started_at.is_some()
@@ -3635,6 +3772,7 @@ fn reconcile_catalog_for_recovery(
             bastet_core::NormalizedRunState::Running
                 | bastet_core::NormalizedRunState::Cancelling
                 | bastet_core::NormalizedRunState::Recovering
+                | bastet_core::NormalizedRunState::AwaitingApproval
         ) {
             run.state = bastet_core::NormalizedRunState::Uncertain;
             run.metadata.revision = run
@@ -4350,6 +4488,159 @@ mod tests {
         assert!(store.catalog().unwrap().catalog.runs.is_empty());
     }
 
+    #[tokio::test]
+    async fn selected_account_execution_stages_and_cancels_without_provider_worker() {
+        let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
+        let graph = store.graph_execution(execution_id).unwrap();
+        for node in graph.nodes.iter().take(2) {
+            attach_selected_account(&store, execution_id, node.node_id);
+        }
+        let mut catalog = store.catalog().unwrap();
+        for project in &mut catalog.catalog.projects {
+            project.policy.ceiling.credential = bastet_core::PermissionLevel::Use;
+        }
+        for role in &mut catalog.catalog.roles {
+            role.policy.ceiling.credential = bastet_core::PermissionLevel::Use;
+        }
+        store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: catalog.revision,
+                catalog: catalog.catalog,
+            })
+            .unwrap();
+        let runner = Arc::new(FixtureProviderRunner::new(None, Duration::from_millis(1)));
+        let (router, registry, executor) = provider_router(store.clone(), runner.clone());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post(format!("/v1/graphs/{}/execute-ready", execution_id.value()))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&ExecuteReadyGraphCommand {
+                            expected_catalog_revision: store.catalog().unwrap().revision,
+                            expected_graph_revision: graph.revision,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let receipt: ExecuteReadyGraphReceipt = serde_json::from_slice(&body).unwrap();
+        assert_eq!(receipt.run_ids.len(), 2);
+        assert!(runner.started().is_empty());
+        assert!(!executor.has_active());
+        assert_eq!(store.approvals().unwrap().records.len(), 2);
+        let request = store.approvals().unwrap().records[0].request.clone();
+        assert_eq!(
+            store.approval(request.id).unwrap().staged_launch_state,
+            Some(bastet_protocol::StagedLaunchState::AwaitingApproval)
+        );
+        store
+            .decide_approval(DecideApprovalCommand {
+                decision: bastet_core::ApprovalDecision {
+                    request_id: request.id,
+                    request_hash: request.request_hash.clone(),
+                    kind: bastet_core::ApprovalDecisionKind::Approve,
+                    actor: "fixture-human".into(),
+                    decided_at_ms: 0,
+                },
+                credential_scope_acknowledged: true,
+            })
+            .unwrap();
+        assert!(store
+            .credential_grant(request.id)
+            .unwrap()
+            .consumed_at_ms
+            .is_none());
+        assert_eq!(
+            store.approval(request.id).unwrap().staged_launch_state,
+            Some(bastet_protocol::StagedLaunchState::Ready)
+        );
+        assert!(store
+            .consume_credential_grant(request.id, &request.action)
+            .is_err());
+        let run_id = request.action.scope.run_id.unwrap();
+        let mut changed = store.catalog().unwrap();
+        for role in &mut changed.catalog.roles {
+            role.policy.ceiling.credential = bastet_core::PermissionLevel::Deny;
+        }
+        let account_id = request
+            .action
+            .scope
+            .credential_binding
+            .as_ref()
+            .unwrap()
+            .account_id;
+        changed
+            .catalog
+            .accounts
+            .iter_mut()
+            .find(|account| account.metadata.id == account_id)
+            .unwrap()
+            .provider_identity = "changed-before-explicit-cancel".into();
+        store
+            .replace_catalog(ReplaceCatalogCommand {
+                expected_revision: changed.revision,
+                catalog: changed.catalog,
+            })
+            .unwrap();
+        assert!(registry.cancel(run_id).is_err());
+        let response = router
+            .oneshot(
+                Request::post(format!("/v1/runs/{}/cancel", run_id.value()))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&bastet_protocol::CancelRunCommand {
+                            run_id,
+                            expected_catalog_revision: store.catalog().unwrap().revision,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let catalog = store.catalog().unwrap();
+        let run = catalog
+            .catalog
+            .runs
+            .iter()
+            .find(|run| run.metadata.id == run_id)
+            .unwrap();
+        assert_eq!(run.state, bastet_core::NormalizedRunState::Cancelled);
+        assert_eq!(
+            store.approval(request.id).unwrap().staged_launch_state,
+            Some(bastet_protocol::StagedLaunchState::Cancelled)
+        );
+        assert!(run.started_at.is_none());
+        assert!(run.finished_at.is_some());
+        assert!(runner.started().is_empty());
+        assert!(store
+            .m3_catalog()
+            .unwrap()
+            .catalog
+            .deliverables
+            .costs
+            .is_empty());
+        assert!(store
+            .graph_execution(execution_id)
+            .unwrap()
+            .outputs
+            .is_empty());
+        store
+            .shutdown(CheckpointCommand {
+                expected_revision: store.snapshot().unwrap().revision,
+                reason: "unlaunched intents do not block shutdown".into(),
+            })
+            .unwrap();
+    }
+
     #[test]
     fn provider_begin_rejects_launch_inputs_changed_after_selection() {
         let (_directory, _workspace, store, execution_id) = provider_execution_fixture();
@@ -4815,6 +5106,7 @@ mod tests {
         connection
             .execute_batch(
                 "ALTER TABLE graph_node_runs DROP COLUMN launch_identity_json;
+                 DROP TABLE staged_provider_launches;
                  DROP TABLE provider_launch_plans;
                  DROP TABLE credential_grants;
                  DELETE FROM schema_migrations WHERE version >= 9;",
@@ -4967,6 +5259,51 @@ mod tests {
             .unwrap()
             .run_id
             .is_none());
+    }
+
+    #[test]
+    fn midrun_approval_is_interrupted_work_not_preserved_prelaunch_intent() {
+        let (directory, _workspace, store, execution_id) = provider_execution_fixture();
+        let receipt = begin_fixture_node(&store, execution_id);
+        let mut catalog = store.catalog().unwrap().catalog;
+        let run = catalog
+            .runs
+            .iter_mut()
+            .find(|run| run.metadata.id == receipt.run_id)
+            .unwrap();
+        run.state = bastet_core::NormalizedRunState::AwaitingApproval;
+        assert!(run.started_at.is_some());
+        catalog.validate().unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE identity_catalog SET catalog_json=?1 WHERE singleton=1",
+                [serde_json::to_string(&catalog).unwrap()],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.shutdown(CheckpointCommand {
+                expected_revision: store.snapshot().unwrap().revision,
+                reason: "already started provider awaits approval".into(),
+            }),
+            Err(StoreError::ProviderRunsActive)
+        ));
+        drop(store);
+        let restored = Store::open(directory.path().join("provider-execution.db")).unwrap();
+        assert_eq!(
+            restored
+                .catalog()
+                .unwrap()
+                .catalog
+                .runs
+                .iter()
+                .find(|run| run.metadata.id == receipt.run_id)
+                .unwrap()
+                .state,
+            bastet_core::NormalizedRunState::Uncertain
+        );
+        assert!(restored.preflight_provider_launch(&receipt).is_err());
     }
 
     fn metadata<I>(id: I) -> EntityMetadata<I> {
@@ -5174,6 +5511,7 @@ mod tests {
         fixture
             .execute_batch(
                 "DELETE FROM schema_migrations WHERE version >= 7;
+                 DROP TABLE staged_provider_launches;
                  DROP TABLE provider_launch_plans;
                  DROP TABLE credential_grants;
                  DROP TABLE graph_node_outputs;
@@ -5213,6 +5551,7 @@ mod tests {
         fixture
             .execute_batch(
                 "DELETE FROM schema_migrations WHERE version >= 8;
+                 DROP TABLE staged_provider_launches;
                  DROP TABLE provider_launch_plans;
                  DROP TABLE credential_grants;
                  DROP TABLE graph_node_outputs;

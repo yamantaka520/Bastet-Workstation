@@ -44,7 +44,26 @@ pub(super) fn validate_current_catalog(
         .iter()
         .find(|run| Some(run.metadata.id) == request.action.scope.run_id)
         .ok_or(StoreError::CredentialGrantRejected)?;
-    if run.state != bastet_core::NormalizedRunState::Starting || run.finished_at.is_some() {
+    let staged: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT request_id, state FROM staged_provider_launches WHERE run_id=?1",
+            [run.metadata.id.value().to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let awaiting = staged.as_ref().is_some_and(|(id, state)| {
+        id == &request.id.value().to_string()
+            && matches!(state.as_str(), "awaiting_approval" | "ready")
+    });
+    if run.finished_at.is_some()
+        || if staged.is_some() {
+            !awaiting
+                || run.state != bastet_core::NormalizedRunState::AwaitingApproval
+                || run.started_at.is_some()
+        } else {
+            run.state != bastet_core::NormalizedRunState::Starting
+        }
+    {
         return Err(StoreError::CredentialGrantRejected);
     }
     let role_id = request
@@ -103,7 +122,12 @@ pub(super) fn validate_current_catalog(
             .ok_or(StoreError::CredentialGrantRejected)?;
         if definition.role_id != role_id
             || current.run_id != Some(run.metadata.id)
-            || current.state != GraphNodeState::Running
+            || current.state
+                != if awaiting {
+                    GraphNodeState::AwaitingApproval
+                } else {
+                    GraphNodeState::Running
+                }
         {
             return Err(StoreError::CredentialGrantRejected);
         }
@@ -223,6 +247,16 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut record = load(&transaction, id)?;
+        // Approval is not dispatch. The future broker must claim the exact
+        // durable launch atomically with consumption, not use this legacy path.
+        let staged: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM staged_provider_launches WHERE request_id=?1)",
+            [id.value().to_string()],
+            |row| row.get(0),
+        )?;
+        if staged {
+            return Err(StoreError::CredentialGrantRejected);
+        }
         let now = now_ms()?;
         validate_time(&record.request, now)?;
         if &record.request.action != action
@@ -288,6 +322,7 @@ impl Store {
             return Err(StoreError::CredentialGrantRejected);
         }
         // Actor is retained with the grant, not copied into the general journal.
+        staged_launches::cancel_for_request(&transaction, id, "revoked")?;
         insert_event(
             &transaction,
             "credential.grant_revoked",
@@ -730,7 +765,7 @@ mod tests {
             let connection = store.connection().unwrap();
             connection.execute("UPDATE approval_requests SET request_hash = ?1, request_json = ?2, decision_json = ?3 WHERE request_id = ?4",
                 params![legacy.request_hash, serde_json::to_string(&legacy).unwrap(), serde_json::to_string(&decision).unwrap(), legacy.id.value().to_string()]).unwrap();
-            connection.execute_batch("DROP TABLE provider_launch_plans; DROP TABLE credential_grants; DELETE FROM schema_migrations WHERE version >= 10;").unwrap();
+            connection.execute_batch("DROP TABLE staged_provider_launches; DROP TABLE provider_launch_plans; DROP TABLE credential_grants; DELETE FROM schema_migrations WHERE version >= 10;").unwrap();
         }
         drop(store);
         let upgraded = Store::open(directory.path().join("grants.db")).unwrap();
