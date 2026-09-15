@@ -31,6 +31,15 @@ verification status; it does not add scope.
 
 ### 2026-09-16 explicit native Linux evidence gate
 
+CI `35007990375` executed all three native tests and failed before fixture
+bootstrap: Bubblewrap reported `loopback: Failed RTM_NEWADDR: Operation not
+permitted`. No Linux deny or cleanup claim is established. A failure-only CI
+diagnostic step now collects package/kernel versions, the runner's AppArmor
+context, namespace settings, exact bwrap profiles and filtered kernel denials.
+AppArmor capability restriction is a hypothesis, not yet proven by these logs.
+Diagnostics do not alter host policy or run tests as root; the gate stays red
+until normal-user enforcement actually passes.
+
 CI now installs Bubblewrap and explicitly executes three ignored native Linux
 fixtures: read/write and symlink scope with positive controls, host-loopback
 network denial with a successful allowed control, and raw stdout EOF after

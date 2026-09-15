@@ -79,8 +79,27 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - name: Verify native Linux sandbox controls and cleanup
+        id: native_linux_sandbox
         if: runner.os == 'Linux'
         run: cargo test -p bastet-daemon --lib sandbox_linux::native_tests --locked -- --ignored
+      - name: Diagnose native Linux sandbox bootstrap failure
+        if: failure() && runner.os == 'Linux' && steps.native_linux_sandbox.outcome == 'failure'
+        # Read-only diagnostics. Do not disable AppArmor, grant host capabilities,
+        # run the fixtures as root, or convert the failed gate into a pass.
+        run: |
+          uname -r
+          dpkg-query -W bubblewrap apparmor
+          id
+          cat /proc/self/attr/current
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces || true
+          for profile in /etc/apparmor.d/bwrap /etc/apparmor.d/bwrap-userns-restrict; do
+            if test -f "$profile"; then
+              printf '%s\n' "$profile"
+              cat "$profile"
+            fi
+          done
+          sudo aa-status --filter.profiles='bwrap|unprivileged_userns' || true
+          sudo journalctl -k --since '10 minutes ago' --no-pager --grep='apparmor.*(bwrap|userns|net_admin)' || true
       - name: Build desktop with target-specific daemon sidecar
         run: pnpm tauri build --debug --no-bundle
       - name: Smoke compiled daemon lifecycle and recovery
